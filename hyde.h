@@ -1344,22 +1344,74 @@ class InlineParser {
       ++end;
     }
 
-    // Skip attributes and find closing
+    // Skip attributes and find closing - must follow HTML tag syntax
+    // After tag name, expect whitespace, /, or >
     while (end < text_.size()) {
-      if (text_[end] == '"' || text_[end] == '\'') {
-        char quote = text_[end];
-        ++end;
-        while (end < text_.size() && text_[end] != quote) {
-          ++end;
-        }
-        if (end < text_.size()) ++end;
-      } else if (text_[end] == '>') {
+      char c = text_[end];
+      if (c == '>') {
         pos_ = end + 1;
         return HtmlInline(std::string(text_.substr(start, pos_ - start)));
-      } else if (text_[end] == '<') {
-        break;  // Invalid
-      } else {
+      } else if (c == '/') {
+        // Self-closing: must be followed by >
+        if (end + 1 < text_.size() && text_[end + 1] == '>') {
+          pos_ = end + 2;
+          return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+        }
+        return std::nullopt;  // / not followed by >
+      } else if (c == ' ' || c == '\t' || c == '\n') {
         ++end;
+      } else if (std::isalpha(static_cast<unsigned char>(c)) || c == '_' ||
+                 c == ':') {
+        // Start of attribute name
+        ++end;
+        while (end < text_.size()) {
+          char ac = text_[end];
+          if (std::isalnum(static_cast<unsigned char>(ac)) || ac == '_' ||
+              ac == ':' || ac == '.' || ac == '-') {
+            ++end;
+          } else {
+            break;
+          }
+        }
+        // Optional attribute value
+        // Skip whitespace
+        while (end < text_.size() &&
+               (text_[end] == ' ' || text_[end] == '\t' || text_[end] == '\n')) {
+          ++end;
+        }
+        if (end < text_.size() && text_[end] == '=') {
+          ++end;
+          // Skip whitespace
+          while (
+              end < text_.size() &&
+              (text_[end] == ' ' || text_[end] == '\t' || text_[end] == '\n')) {
+            ++end;
+          }
+          if (end >= text_.size()) return std::nullopt;
+          if (text_[end] == '"' || text_[end] == '\'') {
+            char quote = text_[end];
+            ++end;
+            while (end < text_.size() && text_[end] != quote) {
+              ++end;
+            }
+            if (end >= text_.size()) return std::nullopt;
+            ++end;
+          } else {
+            // Unquoted value - no spaces, quotes, =, <, >, or `
+            while (end < text_.size()) {
+              char vc = text_[end];
+              if (vc == ' ' || vc == '\t' || vc == '\n' || vc == '"' ||
+                  vc == '\'' || vc == '=' || vc == '<' || vc == '>' ||
+                  vc == '`') {
+                break;
+              }
+              ++end;
+            }
+          }
+        }
+      } else {
+        // Invalid character in tag
+        return std::nullopt;
       }
     }
 
@@ -1685,86 +1737,201 @@ class BlockParser {
     if (!AtEnd()) ++line_idx_;
   }
 
+  // Helper to find closing bracket accounting for escapes
+  size_t FindClosingBracket(std::string_view s, size_t start) {
+    for (size_t i = start; i < s.size(); ++i) {
+      if (s[i] == '\\' && i + 1 < s.size()) {
+        ++i;  // Skip escaped character
+      } else if (s[i] == ']') {
+        return i;
+      }
+    }
+    return std::string_view::npos;
+  }
+
+  // Helper to parse destination with balanced parentheses
+  std::pair<std::string, size_t> ParseLinkDestination(std::string_view s) {
+    if (s.empty()) return {"", 0};
+
+    if (s[0] == '<') {
+      // Angle-bracket destination
+      for (size_t i = 1; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+          ++i;
+        } else if (s[i] == '>') {
+          return {std::string(s.substr(1, i - 1)), i + 1};
+        } else if (s[i] == '<' || s[i] == '\n') {
+          return {"", 0};
+        }
+      }
+      return {"", 0};
+    }
+
+    // Regular destination with balanced parentheses
+    int paren_depth = 0;
+    size_t end = 0;
+    while (end < s.size()) {
+      char c = s[end];
+      if (c == '\\' && end + 1 < s.size()) {
+        end += 2;
+      } else if (c == '(') {
+        ++paren_depth;
+        ++end;
+      } else if (c == ')') {
+        if (paren_depth == 0) break;
+        --paren_depth;
+        ++end;
+      } else if (detail::IsUnicodeWhitespace(c) || c < 0x20) {
+        break;
+      } else {
+        ++end;
+      }
+    }
+    if (paren_depth != 0) return {"", 0};
+    return {std::string(s.substr(0, end)), end};
+  }
+
   void ExtractLinkReferences(Document& doc) {
-    // This is a simplified version - full implementation would handle
-    // multi-line definitions
     while (!AtEnd()) {
       std::string_view line = CurrentLine();
+      int indent = detail::CountIndent(line);
 
-      // Skip indented lines
-      if (detail::CountIndent(line) >= 4) {
+      // Skip indented lines (4+ spaces)
+      if (indent >= 4) {
         Advance();
         continue;
       }
 
-      // Try to parse link reference definition
       auto trimmed = detail::TrimLeft(line);
-      if (trimmed.starts_with('[')) {
-        size_t close_bracket = trimmed.find(']');
-        if (close_bracket != std::string_view::npos &&
-            close_bracket + 1 < trimmed.size() &&
-            trimmed[close_bracket + 1] == ':') {
-          std::string label(trimmed.substr(1, close_bracket - 1));
-          std::string normalized = detail::NormalizeLinkLabel(label);
+      if (!trimmed.starts_with('[')) {
+        Advance();
+        continue;
+      }
 
-          if (!normalized.empty() &&
-              doc.link_references.find(normalized) ==
-                  doc.link_references.end()) {
-            // Parse destination and title
-            auto rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
+      // Find closing bracket (handling escapes)
+      size_t close_bracket = FindClosingBracket(trimmed, 1);
+      if (close_bracket == std::string_view::npos ||
+          close_bracket + 1 >= trimmed.size() ||
+          trimmed[close_bracket + 1] != ':') {
+        Advance();
+        continue;
+      }
 
-            std::string destination;
-            std::string title;
+      std::string label(trimmed.substr(1, close_bracket - 1));
+      std::string normalized = detail::NormalizeLinkLabel(label);
+      if (normalized.empty()) {
+        Advance();
+        continue;
+      }
 
-            if (!rest.empty() && rest[0] == '<') {
-              size_t close_angle = rest.find('>');
-              if (close_angle != std::string_view::npos) {
-                destination = detail::DecodeEscapesAndEntities(
-                    rest.substr(1, close_angle - 1));
-                rest = detail::TrimLeft(rest.substr(close_angle + 1));
-              }
-            } else {
-              size_t end_pos = 0;
-              while (end_pos < rest.size() &&
-                     !detail::IsUnicodeWhitespace(rest[end_pos])) {
-                if (rest[end_pos] == '\\' && end_pos + 1 < rest.size()) {
-                  ++end_pos;
-                }
-                ++end_pos;
-              }
-              destination =
-                  detail::DecodeEscapesAndEntities(rest.substr(0, end_pos));
-              rest = detail::TrimLeft(rest.substr(end_pos));
-            }
+      // Get rest of first line after ':'
+      std::string_view rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
+      size_t start_line = line_idx_;
+      Advance();
 
-            // Parse optional title
-            if (!rest.empty() &&
-                (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
-              char close_char = rest[0] == '(' ? ')' : rest[0];
-              size_t title_start = 1;
-              size_t title_end = title_start;
-              while (title_end < rest.size() && rest[title_end] != close_char) {
-                if (rest[title_end] == '\\' && title_end + 1 < rest.size()) {
-                  ++title_end;
-                }
-                ++title_end;
-              }
-              if (title_end < rest.size()) {
-                title = detail::DecodeEscapesAndEntities(
-                    rest.substr(title_start, title_end - title_start));
-              }
-            }
+      // Destination might be on next line
+      if (rest.empty() || detail::IsBlankLine(rest)) {
+        if (AtEnd()) {
+          line_idx_ = start_line;
+          Advance();
+          continue;
+        }
+        std::string_view next_line = CurrentLine();
+        if (detail::IsBlankLine(next_line) || detail::CountIndent(next_line) < 1) {
+          line_idx_ = start_line;
+          Advance();
+          continue;
+        }
+        rest = detail::TrimLeft(next_line);
+        Advance();
+      }
 
-            if (!destination.empty()) {
-              doc.link_references[normalized] = {detail::EncodeUrl(destination),
-                                                 title};
-            }
-          }
+      // Parse destination
+      auto [dest_raw, dest_len] = ParseLinkDestination(rest);
+      if (dest_raw.empty() && dest_len == 0 && !rest.empty() && rest[0] != '<') {
+        line_idx_ = start_line;
+        Advance();
+        continue;
+      }
+      std::string destination = detail::DecodeEscapesAndEntities(dest_raw);
+      rest = detail::TrimLeft(rest.substr(dest_len));
+
+      // Parse optional title (may be on same line or next line)
+      std::string title;
+      bool title_valid = true;
+
+      if (rest.empty() && !AtEnd()) {
+        std::string_view next_line = CurrentLine();
+        if (!detail::IsBlankLine(next_line) && detail::CountIndent(next_line) >= 1) {
+          rest = detail::TrimLeft(next_line);
+          Advance();
         }
       }
 
-      Advance();
+      if (!rest.empty() && (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
+        char open_char = rest[0];
+        char close_char = (open_char == '(') ? ')' : open_char;
+        std::string title_content;
+        size_t i = 1;
+
+        // Title can span multiple lines
+        while (title_valid) {
+          while (i < rest.size()) {
+            if (rest[i] == '\\' && i + 1 < rest.size()) {
+              title_content += rest[i];
+              title_content += rest[i + 1];
+              i += 2;
+            } else if (rest[i] == close_char) {
+              // Found closing - rest must be whitespace only
+              auto after = detail::TrimLeft(rest.substr(i + 1));
+              if (!after.empty()) {
+                title_valid = false;
+              } else {
+                title = detail::DecodeEscapesAndEntities(title_content);
+              }
+              goto title_done;
+            } else if (rest[i] == '\n') {
+              title_content += rest[i];
+              ++i;
+            } else {
+              title_content += rest[i];
+              ++i;
+            }
+          }
+          // Continue to next line
+          if (AtEnd()) {
+            title_valid = false;
+            break;
+          }
+          std::string_view next_line = CurrentLine();
+          if (detail::IsBlankLine(next_line)) {
+            title_valid = false;
+            break;
+          }
+          title_content += '\n';
+          rest = next_line;
+          i = 0;
+          Advance();
+        }
+      title_done:;
+      } else if (!rest.empty()) {
+        // Non-whitespace after destination with no title
+        title_valid = false;
+      }
+
+      if (!title_valid || destination.empty()) {
+        line_idx_ = start_line;
+        Advance();
+        continue;
+      }
+
+      // Only add if not already defined
+      if (doc.link_references.find(normalized) == doc.link_references.end()) {
+        doc.link_references[normalized] = {detail::EncodeUrl(destination), title};
+      }
     }
+    // Reset for block parsing
+    line_idx_ = 0;
   }
 
   void ParseBlocks(std::vector<BlockNode>& blocks) {
@@ -1832,59 +1999,97 @@ class BlockParser {
     auto trimmed = detail::TrimLeft(line);
     if (!trimmed.starts_with('[')) return false;
 
-    size_t close_bracket = trimmed.find(']');
+    size_t close_bracket = FindClosingBracket(trimmed, 1);
     if (close_bracket == std::string_view::npos ||
         close_bracket + 1 >= trimmed.size() ||
         trimmed[close_bracket + 1] != ':') {
       return false;
     }
 
-    // Verify there's a valid destination
-    auto rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
-    if (rest.empty()) return false;
+    std::string label(trimmed.substr(1, close_bracket - 1));
+    std::string normalized = detail::NormalizeLinkLabel(label);
+    if (normalized.empty()) return false;
 
-    std::string destination;
-    if (rest[0] == '<') {
-      size_t close_angle = rest.find('>');
-      if (close_angle == std::string_view::npos) return false;
-      destination = std::string(rest.substr(1, close_angle - 1));
-      rest = detail::TrimLeft(rest.substr(close_angle + 1));
-    } else {
-      size_t end_pos = 0;
-      while (end_pos < rest.size() &&
-             !detail::IsUnicodeWhitespace(rest[end_pos])) {
-        if (rest[end_pos] == '\\' && end_pos + 1 < rest.size()) {
-          ++end_pos;
-        }
-        ++end_pos;
+    std::string_view rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
+    size_t start_line = line_idx_;
+    Advance();
+
+    // Destination might be on next line
+    if (rest.empty() || detail::IsBlankLine(rest)) {
+      if (AtEnd()) {
+        line_idx_ = start_line;
+        return false;
       }
-      if (end_pos == 0) return false;
-      destination = std::string(rest.substr(0, end_pos));
-      rest = detail::TrimLeft(rest.substr(end_pos));
+      std::string_view next_line = CurrentLine();
+      if (detail::IsBlankLine(next_line) || detail::CountIndent(next_line) < 1) {
+        line_idx_ = start_line;
+        return false;
+      }
+      rest = detail::TrimLeft(next_line);
+      Advance();
     }
 
-    // Check optional title
-    if (!rest.empty()) {
-      if (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(') {
-        char close_char = rest[0] == '(' ? ')' : rest[0];
-        size_t title_end = 1;
-        while (title_end < rest.size() && rest[title_end] != close_char) {
-          if (rest[title_end] == '\\' && title_end + 1 < rest.size()) {
-            ++title_end;
+    // Parse destination
+    auto [dest_raw, dest_len] = ParseLinkDestination(rest);
+    if (dest_raw.empty() && dest_len == 0 && !rest.empty() && rest[0] != '<') {
+      line_idx_ = start_line;
+      return false;
+    }
+    rest = detail::TrimLeft(rest.substr(dest_len));
+
+    // Parse optional title (may be on next line)
+    bool title_valid = true;
+
+    if (rest.empty() && !AtEnd()) {
+      std::string_view next_line = CurrentLine();
+      if (!detail::IsBlankLine(next_line) && detail::CountIndent(next_line) >= 1) {
+        rest = detail::TrimLeft(next_line);
+        Advance();
+      }
+    }
+
+    if (!rest.empty() && (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
+      char open_char = rest[0];
+      char close_char = (open_char == '(') ? ')' : open_char;
+      size_t i = 1;
+
+      while (title_valid) {
+        while (i < rest.size()) {
+          if (rest[i] == '\\' && i + 1 < rest.size()) {
+            i += 2;
+          } else if (rest[i] == close_char) {
+            auto after = detail::TrimLeft(rest.substr(i + 1));
+            if (!after.empty()) {
+              title_valid = false;
+            }
+            goto skip_title_done;
+          } else {
+            ++i;
           }
-          ++title_end;
         }
-        if (title_end >= rest.size()) return false;
-        rest = detail::TrimLeft(rest.substr(title_end + 1));
+        if (AtEnd()) {
+          title_valid = false;
+          break;
+        }
+        std::string_view next_line = CurrentLine();
+        if (detail::IsBlankLine(next_line)) {
+          title_valid = false;
+          break;
+        }
+        rest = next_line;
+        i = 0;
+        Advance();
       }
+    skip_title_done:;
+    } else if (!rest.empty()) {
+      title_valid = false;
     }
 
-    // Rest of line must be empty or whitespace only
-    if (!rest.empty() && !detail::IsBlankLine(rest)) {
+    if (!title_valid) {
+      line_idx_ = start_line;
       return false;
     }
 
-    Advance();
     return true;
   }
 

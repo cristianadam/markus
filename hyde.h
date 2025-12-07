@@ -262,8 +262,11 @@ inline bool IsAsciiPunctuation(char c) {
 }
 
 // Check if a character is Unicode whitespace (simplified)
+// Includes ASCII whitespace and common Unicode whitespace chars
 inline bool IsUnicodeWhitespace(char c) {
-  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+  unsigned char uc = static_cast<unsigned char>(c);
+  return uc == ' ' || uc == '\t' || uc == '\n' || uc == '\r' || uc == '\f' ||
+         uc == 0xA0;  // NO-BREAK SPACE (first byte of UTF-8 for many spaces)
 }
 
 // Normalize a link label (case-fold and collapse whitespace)
@@ -2185,8 +2188,9 @@ class BlockParser {
     }
 
     // Type 7: Other HTML tags (not interrupted by blank line same as type 6)
+    // Must be a complete tag followed only by whitespace
     if (block_type == 0) {
-      // Check for opening or closing tag followed by whitespace or end
+      // Check for opening or closing tag
       bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
       size_t tag_start = is_closing ? 2 : 1;
 
@@ -2200,18 +2204,40 @@ class BlockParser {
         }
 
         // Check that this is not a URI scheme (no colon after tag name)
-        // Autolinks like <https://...> should not be treated as HTML blocks
         if (tag_end < trimmed.size() && trimmed[tag_end] == ':') {
           // Looks like a URI scheme, not an HTML tag
         } else {
-          // Must end with > or have attributes
+          // Find the closing > of this tag
           size_t search_pos = tag_end;
-          while (search_pos < trimmed.size() && trimmed[search_pos] != '>') {
+          bool in_quote = false;
+          char quote_char = 0;
+          while (search_pos < trimmed.size()) {
+            char c = trimmed[search_pos];
+            if (in_quote) {
+              if (c == quote_char) in_quote = false;
+            } else {
+              if (c == '"' || c == '\'') {
+                in_quote = true;
+                quote_char = c;
+              } else if (c == '>') {
+                break;
+              }
+            }
             ++search_pos;
           }
 
           if (search_pos < trimmed.size() && trimmed[search_pos] == '>') {
-            block_type = 7;
+            // Check that rest of line is only whitespace
+            bool only_whitespace = true;
+            for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {
+              if (trimmed[j] != ' ' && trimmed[j] != '\t') {
+                only_whitespace = false;
+                break;
+              }
+            }
+            if (only_whitespace) {
+              block_type = 7;
+            }
           }
         }
       }
@@ -2755,9 +2781,28 @@ class BlockParser {
             break;
           }
         }
-        if (trimmed.starts_with(">") ||
-            trimmed.starts_with("```") || trimmed.starts_with("~~~")) {
+        if (trimmed.starts_with(">")) {
           break;
+        }
+        // Fenced code block: must be at least 3 fence chars, and for backticks,
+        // the info string cannot contain backticks
+        if (trimmed.size() >= 3 &&
+            (trimmed[0] == '`' || trimmed[0] == '~')) {
+          char fence_char = trimmed[0];
+          size_t fence_len = 0;
+          while (fence_len < trimmed.size() && trimmed[fence_len] == fence_char) {
+            ++fence_len;
+          }
+          if (fence_len >= 3) {
+            // For backticks, check that info string doesn't contain backticks
+            if (fence_char == '~') {
+              break;
+            }
+            auto info = detail::Trim(trimmed.substr(fence_len));
+            if (info.find('`') == std::string_view::npos) {
+              break;
+            }
+          }
         }
 
         // Check for thematic break

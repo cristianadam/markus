@@ -4,7 +4,9 @@
       "Bash(bazel build:*)",
       "Bash(bazel test:*)",
       "Bash(./run_tests.sh:*)",
-      "Bash(timeout 2 bazel-bin/main:*)"
+      "Bash(timeout 2 bazel-bin/main:*)",
+      "Bash(bazel-bin/main)",
+      "Bash(xxd:*)"
     ],
     "deny": [],
     "ask": []

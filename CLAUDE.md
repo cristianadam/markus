@@ -1,0 +1,3 @@
+Single header markdown file implemented in hyde.h using C++20 with no 
+external dependencies, implemented in GoogleStyle, adhering to CommonMark spec,
+and tested via GoogleTest. The file `main.cc` runs the hyde.h library.

@@ -1,1 +1,0 @@
-bazel build main && python3 commonmark-spec/test/spec_tests.py --program bazel-out/aarch64-fastbuild/bin/main -s commonmark-spec/spec.txt

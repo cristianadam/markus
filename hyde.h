@@ -852,6 +852,16 @@ class InlineParser {
           result.push_back(std::move(*code_span));
           continue;
         }
+        // Code span didn't match - add the entire backtick run as text
+        // and skip past it to avoid trying shorter runs
+        size_t backtick_count = 0;
+        while (pos_ + backtick_count < text_.size() &&
+               text_[pos_ + backtick_count] == '`') {
+          ++backtick_count;
+        }
+        pending_text += std::string(backtick_count, '`');
+        pos_ += backtick_count;
+        continue;
       }
 
       // Check for autolink
@@ -1999,24 +2009,37 @@ class BlockParser {
 
     // Collect code content
     std::string content;
+    bool found_closing = false;
     while (!AtEnd()) {
       std::string_view code_line = CurrentLine();
-      auto code_trimmed = detail::TrimLeft(code_line);
 
-      // Check for closing fence
-      if (code_trimmed.size() >= fence_length &&
-          code_trimmed.substr(0, fence_length) ==
-              std::string(fence_length, fence_char)) {
-        bool is_closing = true;
-        for (size_t j = fence_length; j < code_trimmed.size(); ++j) {
-          if (code_trimmed[j] != ' ' && code_trimmed[j] != '\t') {
-            is_closing = false;
+      // Check for closing fence - must be indented < 4 spaces
+      int close_indent = detail::CountIndent(code_line);
+      if (close_indent < 4) {
+        auto code_trimmed = detail::TrimLeft(code_line);
+
+        // Count fence characters at start
+        size_t close_fence_len = 0;
+        while (close_fence_len < code_trimmed.size() &&
+               code_trimmed[close_fence_len] == fence_char) {
+          ++close_fence_len;
+        }
+
+        // Closing fence must be at least as long as opening fence
+        if (close_fence_len >= fence_length) {
+          // Rest of line must be only whitespace
+          bool is_closing = true;
+          for (size_t j = close_fence_len; j < code_trimmed.size(); ++j) {
+            if (code_trimmed[j] != ' ' && code_trimmed[j] != '\t') {
+              is_closing = false;
+              break;
+            }
+          }
+          if (is_closing) {
+            Advance();
+            found_closing = true;
             break;
           }
-        }
-        if (is_closing) {
-          Advance();
-          break;
         }
       }
 
@@ -2028,6 +2051,12 @@ class BlockParser {
       }
       content += '\n';
       Advance();
+    }
+
+    // If unclosed, remove the trailing newline that was added for the last line
+    // (CommonMark spec: unclosed blocks don't include final newline)
+    if (!found_closing && !content.empty() && content.back() == '\n') {
+      content.pop_back();
     }
 
     CodeBlock block;
@@ -2627,6 +2656,10 @@ class BlockParser {
       int code_indent = detail::CountIndent(code_line);
 
       if (detail::IsBlankLine(code_line)) {
+        // Blank lines within code blocks preserve whitespace beyond 4 spaces
+        if (code_indent >= 4) {
+          content += detail::RemoveIndent(code_line, 4);
+        }
         content += '\n';
         Advance();
         continue;
@@ -2674,33 +2707,55 @@ class BlockParser {
       if (!para_lines.empty() && indent < 4) {
         if (!trimmed.empty() && (trimmed[0] == '=' || trimmed[0] == '-')) {
           char underline_char = trimmed[0];
-          bool valid_underline = true;
-          for (char ch : trimmed) {
-            if (ch != underline_char && ch != ' ' && ch != '\t') {
-              valid_underline = false;
-              break;
-            }
+          // Find where underline chars end
+          size_t underline_end = 0;
+          while (underline_end < trimmed.size() &&
+                 trimmed[underline_end] == underline_char) {
+            ++underline_end;
           }
-          if (valid_underline) {
-            Advance();
-
-            Heading heading;
-            heading.level = (underline_char == '=') ? 1 : 2;
-
-            std::string heading_content;
-            for (size_t j = 0; j < para_lines.size(); ++j) {
-              if (j > 0) heading_content += '\n';
-              heading_content += para_lines[j];
+          // Must have at least one underline char
+          if (underline_end > 0) {
+            // Rest must be only whitespace (no mixed chars like "= =")
+            bool valid_underline = true;
+            for (size_t j = underline_end; j < trimmed.size(); ++j) {
+              if (trimmed[j] != ' ' && trimmed[j] != '\t') {
+                valid_underline = false;
+                break;
+              }
             }
-            heading.raw_content = heading_content;
-            return heading;
+            if (valid_underline) {
+              Advance();
+
+              Heading heading;
+              heading.level = (underline_char == '=') ? 1 : 2;
+
+              std::string heading_content;
+              for (size_t j = 0; j < para_lines.size(); ++j) {
+                if (j > 0) heading_content += '\n';
+                heading_content += para_lines[j];
+              }
+              heading.raw_content = heading_content;
+              return heading;
+            }
           }
         }
       }
 
       // Check for block-level interrupts
       if (indent < 4) {
-        if (trimmed.starts_with("#") || trimmed.starts_with(">") ||
+        // ATX heading: must be #, ##, etc. followed by space or end of line
+        if (trimmed.starts_with("#")) {
+          size_t hash_count = 0;
+          while (hash_count < trimmed.size() && trimmed[hash_count] == '#') {
+            ++hash_count;
+          }
+          if (hash_count <= 6 &&
+              (hash_count >= trimmed.size() ||
+               trimmed[hash_count] == ' ' || trimmed[hash_count] == '\t')) {
+            break;
+          }
+        }
+        if (trimmed.starts_with(">") ||
             trimmed.starts_with("```") || trimmed.starts_with("~~~")) {
           break;
         }

@@ -415,6 +415,114 @@ inline std::string RemoveIndent(std::string_view line, int n) {
   return result;
 }
 
+// Remove blockquote prefix (> and optional following space) with proper tab handling
+// Returns the remaining content with proper indentation preserved
+inline std::string RemoveBlockQuotePrefix(std::string_view line) {
+  size_t i = 0;
+  int column = 0;
+
+  // Skip leading whitespace (up to 3 spaces)
+  while (i < line.size() && column < 3) {
+    if (line[i] == ' ') {
+      ++column;
+      ++i;
+    } else if (line[i] == '\t') {
+      int next_col = (column / 4 + 1) * 4;
+      if (next_col <= 3) {
+        column = next_col;
+        ++i;
+      } else {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+
+  // Check for >
+  if (i >= line.size() || line[i] != '>') {
+    return std::string(line);
+  }
+  ++i;
+  ++column;
+
+  // Handle optional space after > (can be partial tab)
+  int content_start_column = column;
+  if (i < line.size()) {
+    if (line[i] == ' ') {
+      ++i;
+      content_start_column = column + 1;
+    } else if (line[i] == '\t') {
+      // Tab after > - consume part of the tab as the "optional space"
+      // The remaining virtual spaces stay as indentation
+      int tab_end = (column / 4 + 1) * 4;
+      int spaces_from_tab = tab_end - column;
+      // Consume one space's worth, rest becomes leading indent
+      ++i;
+      content_start_column = tab_end;
+      // The remaining (spaces_from_tab - 1) spaces become content indent
+      std::string result;
+      for (int j = 0; j < spaces_from_tab - 1; ++j) {
+        result += ' ';
+      }
+      // Expand remaining tabs in the content
+      int col = content_start_column;
+      while (i < line.size()) {
+        if (line[i] == '\t') {
+          int next_col = (col / 4 + 1) * 4;
+          for (int k = 0; k < next_col - col; ++k) {
+            result += ' ';
+          }
+          col = next_col;
+        } else {
+          result += line[i];
+          ++col;
+        }
+        ++i;
+      }
+      return result;
+    }
+  }
+
+  // Expand any remaining tabs in content
+  std::string result;
+  int col = content_start_column;
+  while (i < line.size()) {
+    if (line[i] == '\t') {
+      int next_col = (col / 4 + 1) * 4;
+      for (int k = 0; k < next_col - col; ++k) {
+        result += ' ';
+      }
+      col = next_col;
+    } else {
+      result += line[i];
+      ++col;
+    }
+    ++i;
+  }
+  return result;
+}
+
+// Expand tabs to spaces (tab stops every 4 columns)
+inline std::string ExpandTabs(std::string_view line) {
+  std::string result;
+  int column = 0;
+  for (char c : line) {
+    if (c == '\t') {
+      int next_col = (column / 4 + 1) * 4;
+      int spaces = next_col - column;
+      for (int j = 0; j < spaces; ++j) {
+        result += ' ';
+      }
+      column = next_col;
+    } else {
+      result += c;
+      ++column;
+    }
+  }
+  return result;
+}
+
 // Check if line is blank (only whitespace)
 inline bool IsBlankLine(std::string_view line) {
   for (char c : line) {
@@ -463,7 +571,188 @@ inline std::vector<std::string> SplitLines(std::string_view input) {
   return lines;
 }
 
-// Decode backslash escapes and HTML entities
+// Convert a Unicode code point to UTF-8
+inline std::string CodePointToUtf8(uint32_t cp) {
+  std::string result;
+  if (cp == 0) {
+    // Null character becomes replacement character
+    result = "\xEF\xBF\xBD";
+  } else if (cp < 0x80) {
+    result += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    result += static_cast<char>(0xC0 | (cp >> 6));
+    result += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    result += static_cast<char>(0xE0 | (cp >> 12));
+    result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    result += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x110000) {
+    result += static_cast<char>(0xF0 | (cp >> 18));
+    result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    result += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    // Invalid code point - use replacement character
+    result = "\xEF\xBF\xBD";
+  }
+  return result;
+}
+
+// HTML named entity map (common entities from CommonMark spec)
+inline std::string LookupHtmlEntity(std::string_view name) {
+  // This is a subset - full CommonMark compliance requires all HTML5 entities
+  static const std::unordered_map<std::string, std::string> entities = {
+      {"nbsp", "\xC2\xA0"},
+      {"amp", "&"},
+      {"lt", "<"},
+      {"gt", ">"},
+      {"quot", "\""},
+      {"apos", "'"},
+      {"copy", "\xC2\xA9"},
+      {"reg", "\xC2\xAE"},
+      {"AElig", "\xC3\x86"},
+      {"Dcaron", "\xC4\x8E"},
+      {"frac34", "\xC2\xBE"},
+      {"HilbertSpace", "\xE2\x84\x8B"},
+      {"DifferentialD", "\xE2\x85\x86"},
+      {"ClockwiseContourIntegral", "\xE2\x88\xB2"},
+      {"ngE", "\xE2\x89\xA7\xCC\xB8"},
+      {"ouml", "\xC3\xB6"},
+      {"Ouml", "\xC3\x96"},
+      {"auml", "\xC3\xA4"},
+      {"Auml", "\xC3\x84"},
+      {"uuml", "\xC3\xBC"},
+      {"Uuml", "\xC3\x9C"},
+      {"szlig", "\xC3\x9F"},
+      {"euro", "\xE2\x82\xAC"},
+      {"pound", "\xC2\xA3"},
+      {"yen", "\xC2\xA5"},
+      {"cent", "\xC2\xA2"},
+      {"deg", "\xC2\xB0"},
+      {"plusmn", "\xC2\xB1"},
+      {"times", "\xC3\x97"},
+      {"divide", "\xC3\xB7"},
+      {"frac12", "\xC2\xBD"},
+      {"frac14", "\xC2\xBC"},
+      {"para", "\xC2\xB6"},
+      {"sect", "\xC2\xA7"},
+      {"dagger", "\xE2\x80\xA0"},
+      {"Dagger", "\xE2\x80\xA1"},
+      {"bull", "\xE2\x80\xA2"},
+      {"hellip", "\xE2\x80\xA6"},
+      {"ndash", "\xE2\x80\x93"},
+      {"mdash", "\xE2\x80\x94"},
+      {"lsquo", "\xE2\x80\x98"},
+      {"rsquo", "\xE2\x80\x99"},
+      {"ldquo", "\xE2\x80\x9C"},
+      {"rdquo", "\xE2\x80\x9D"},
+      {"laquo", "\xC2\xAB"},
+      {"raquo", "\xC2\xBB"},
+      {"trade", "\xE2\x84\xA2"},
+      {"larr", "\xE2\x86\x90"},
+      {"rarr", "\xE2\x86\x92"},
+      {"uarr", "\xE2\x86\x91"},
+      {"darr", "\xE2\x86\x93"},
+      {"harr", "\xE2\x86\x94"},
+      {"spades", "\xE2\x99\xA0"},
+      {"clubs", "\xE2\x99\xA3"},
+      {"hearts", "\xE2\x99\xA5"},
+      {"diams", "\xE2\x99\xA6"},
+  };
+
+  std::string name_str(name);
+  auto it = entities.find(name_str);
+  if (it != entities.end()) {
+    return it->second;
+  }
+  return "";
+}
+
+// Decode HTML entities (named, decimal, hex) and backslash escapes
+inline std::string DecodeEscapesAndEntities(std::string_view text) {
+  std::string result;
+  result.reserve(text.size());
+
+  for (size_t i = 0; i < text.size(); ++i) {
+    // Backslash escape
+    if (text[i] == '\\' && i + 1 < text.size() &&
+        IsAsciiPunctuation(text[i + 1])) {
+      result += text[++i];
+      continue;
+    }
+
+    // HTML entity
+    if (text[i] == '&' && i + 1 < text.size()) {
+      size_t start = i + 1;
+
+      // Numeric character reference
+      if (text[start] == '#') {
+        size_t num_start = start + 1;
+        bool is_hex = false;
+
+        if (num_start < text.size() &&
+            (text[num_start] == 'x' || text[num_start] == 'X')) {
+          is_hex = true;
+          ++num_start;
+        }
+
+        size_t num_end = num_start;
+        if (is_hex) {
+          while (num_end < text.size() &&
+                 std::isxdigit(static_cast<unsigned char>(text[num_end]))) {
+            ++num_end;
+          }
+        } else {
+          while (num_end < text.size() &&
+                 std::isdigit(static_cast<unsigned char>(text[num_end]))) {
+            ++num_end;
+          }
+        }
+
+        if (num_end > num_start && num_end < text.size() &&
+            text[num_end] == ';') {
+          std::string num_str(text.substr(num_start, num_end - num_start));
+          try {
+            uint32_t code_point;
+            if (is_hex) {
+              code_point = static_cast<uint32_t>(std::stoul(num_str, nullptr, 16));
+            } else {
+              code_point = static_cast<uint32_t>(std::stoul(num_str, nullptr, 10));
+            }
+            result += CodePointToUtf8(code_point);
+            i = num_end;
+            continue;
+          } catch (...) {
+            // Invalid number, treat as literal
+          }
+        }
+      } else {
+        // Named entity
+        size_t name_end = start;
+        while (name_end < text.size() &&
+               std::isalnum(static_cast<unsigned char>(text[name_end]))) {
+          ++name_end;
+        }
+
+        if (name_end > start && name_end < text.size() &&
+            text[name_end] == ';') {
+          std::string entity = LookupHtmlEntity(text.substr(start, name_end - start));
+          if (!entity.empty()) {
+            result += entity;
+            i = name_end;
+            continue;
+          }
+        }
+      }
+    }
+
+    result += text[i];
+  }
+
+  return result;
+}
+
+// Decode backslash escapes only (no entities)
 inline std::string DecodeEscapes(std::string_view text) {
   std::string result;
   result.reserve(text.size());
@@ -542,6 +831,15 @@ class InlineParser {
           flush_text();
           result.push_back(HardBreak{});
           pos_ += 2;
+          continue;
+        }
+      }
+
+      // Check for HTML entity or numeric character reference
+      if (c == '&' && pos_ + 1 < text_.size()) {
+        auto entity_result = TryParseEntity();
+        if (entity_result) {
+          pending_text += *entity_result;
           continue;
         }
       }
@@ -857,6 +1155,75 @@ class InlineParser {
     return std::nullopt;
   }
 
+  std::optional<std::string> TryParseEntity() {
+    if (pos_ >= text_.size() || text_[pos_] != '&') return std::nullopt;
+
+    size_t start = pos_ + 1;
+
+    // Numeric character reference
+    if (start < text_.size() && text_[start] == '#') {
+      size_t num_start = start + 1;
+      bool is_hex = false;
+
+      if (num_start < text_.size() &&
+          (text_[num_start] == 'x' || text_[num_start] == 'X')) {
+        is_hex = true;
+        ++num_start;
+      }
+
+      size_t num_end = num_start;
+      if (is_hex) {
+        while (num_end < text_.size() &&
+               std::isxdigit(static_cast<unsigned char>(text_[num_end]))) {
+          ++num_end;
+        }
+      } else {
+        while (num_end < text_.size() &&
+               std::isdigit(static_cast<unsigned char>(text_[num_end]))) {
+          ++num_end;
+        }
+      }
+
+      if (num_end > num_start && num_end < text_.size() &&
+          text_[num_end] == ';') {
+        std::string num_str(text_.substr(num_start, num_end - num_start));
+        try {
+          uint32_t code_point;
+          if (is_hex) {
+            code_point =
+                static_cast<uint32_t>(std::stoul(num_str, nullptr, 16));
+          } else {
+            code_point =
+                static_cast<uint32_t>(std::stoul(num_str, nullptr, 10));
+          }
+          pos_ = num_end + 1;
+          return detail::CodePointToUtf8(code_point);
+        } catch (...) {
+          // Invalid number, treat as literal
+        }
+      }
+    } else if (start < text_.size()) {
+      // Named entity
+      size_t name_end = start;
+      while (name_end < text_.size() &&
+             std::isalnum(static_cast<unsigned char>(text_[name_end]))) {
+        ++name_end;
+      }
+
+      if (name_end > start && name_end < text_.size() &&
+          text_[name_end] == ';') {
+        std::string entity =
+            detail::LookupHtmlEntity(text_.substr(start, name_end - start));
+        if (!entity.empty()) {
+          pos_ = name_end + 1;
+          return entity;
+        }
+      }
+    }
+
+    return std::nullopt;
+  }
+
   std::optional<HtmlInline> TryParseHtmlInline() {
     if (pos_ >= text_.size() || text_[pos_] != '<') return std::nullopt;
 
@@ -958,8 +1325,8 @@ class InlineParser {
           ++pos_;
         }
         if (pos_ >= text_.size() || text_[pos_] != '>') return std::nullopt;
-        destination =
-            detail::DecodeEscapes(text_.substr(dest_start, pos_ - dest_start));
+        destination = detail::DecodeEscapesAndEntities(
+            text_.substr(dest_start, pos_ - dest_start));
         ++pos_;
       } else if (pos_ < text_.size() && text_[pos_] != ')') {
         // Regular destination
@@ -977,8 +1344,8 @@ class InlineParser {
           }
           ++pos_;
         }
-        destination =
-            detail::DecodeEscapes(text_.substr(dest_start, pos_ - dest_start));
+        destination = detail::DecodeEscapesAndEntities(
+            text_.substr(dest_start, pos_ - dest_start));
       }
 
       SkipWhitespace();
@@ -996,8 +1363,8 @@ class InlineParser {
           ++pos_;
         }
         if (pos_ >= text_.size()) return std::nullopt;
-        title =
-            detail::DecodeEscapes(text_.substr(title_start, pos_ - title_start));
+        title = detail::DecodeEscapesAndEntities(
+            text_.substr(title_start, pos_ - title_start));
         ++pos_;
         SkipWhitespace();
       }
@@ -1287,7 +1654,8 @@ class BlockParser {
             if (!rest.empty() && rest[0] == '<') {
               size_t close_angle = rest.find('>');
               if (close_angle != std::string_view::npos) {
-                destination = std::string(rest.substr(1, close_angle - 1));
+                destination = detail::DecodeEscapesAndEntities(
+                    rest.substr(1, close_angle - 1));
                 rest = detail::TrimLeft(rest.substr(close_angle + 1));
               }
             } else {
@@ -1299,7 +1667,8 @@ class BlockParser {
                 }
                 ++end_pos;
               }
-              destination = detail::DecodeEscapes(rest.substr(0, end_pos));
+              destination =
+                  detail::DecodeEscapesAndEntities(rest.substr(0, end_pos));
               rest = detail::TrimLeft(rest.substr(end_pos));
             }
 
@@ -1316,7 +1685,7 @@ class BlockParser {
                 ++title_end;
               }
               if (title_end < rest.size()) {
-                title = detail::DecodeEscapes(
+                title = detail::DecodeEscapesAndEntities(
                     rest.substr(title_start, title_end - title_start));
               }
             }
@@ -1502,6 +1871,8 @@ class BlockParser {
     if (fence_char == '`' && info_string.find('`') != std::string::npos) {
       return std::nullopt;
     }
+    // Decode backslash escapes in info string
+    info_string = detail::DecodeEscapes(info_string);
 
     Advance();
 
@@ -1751,11 +2122,8 @@ class BlockParser {
       auto bq_trimmed = detail::TrimLeft(bq_line);
 
       if (bq_trimmed.starts_with(">")) {
-        // Remove > and optional space
-        std::string bq_content(bq_trimmed.substr(1));
-        if (!bq_content.empty() && bq_content[0] == ' ') {
-          bq_content = bq_content.substr(1);
-        }
+        // Remove > and optional space with proper tab handling
+        std::string bq_content = detail::RemoveBlockQuotePrefix(bq_line);
         quote_lines.push_back(bq_content);
         Advance();
       } else if (!bq_trimmed.empty() && !quote_lines.empty()) {
@@ -1923,25 +2291,60 @@ class BlockParser {
         ListItem item;
         std::vector<std::string> item_lines;
 
-        // Get first line content
+        // Get first line content with proper tab handling
+        // Expand tabs in the original line, then extract content after marker
+        std::string expanded_line = detail::ExpandTabs(item_line);
+        std::string_view expanded_trimmed = detail::TrimLeft(expanded_line);
+
         std::string first_content;
         if (is_ordered) {
           size_t num_end = 0;
           while (
-              num_end < item_trimmed.size() &&
-              std::isdigit(static_cast<unsigned char>(item_trimmed[num_end]))) {
+              num_end < expanded_trimmed.size() &&
+              std::isdigit(
+                  static_cast<unsigned char>(expanded_trimmed[num_end]))) {
             ++num_end;
           }
-          first_content = std::string(item_trimmed.substr(num_end + 2));
+          // Skip number, delimiter, and required space
+          size_t skip = num_end + 1;  // number + delimiter
+          if (skip < expanded_trimmed.size() &&
+              expanded_trimmed[skip] == ' ') {
+            ++skip;
+          }
+          first_content = std::string(expanded_trimmed.substr(skip));
         } else {
-          first_content = std::string(item_trimmed.substr(2));
+          // Skip bullet and required space
+          size_t skip = 1;  // bullet
+          if (skip < expanded_trimmed.size() &&
+              expanded_trimmed[skip] == ' ') {
+            ++skip;
+          }
+          first_content = std::string(expanded_trimmed.substr(skip));
         }
         item_lines.push_back(first_content);
         Advance();
         had_blank_line = false;
 
+        // Calculate required indent based on content start position
+        // For `-\tfoo`, the content starts at column 4, so required_indent is 4
+        int expanded_item_indent = detail::CountIndent(expanded_line);
+        int content_start = expanded_item_indent;
+        if (is_ordered) {
+          size_t num_end = 0;
+          while (num_end < expanded_trimmed.size() &&
+                 std::isdigit(
+                     static_cast<unsigned char>(expanded_trimmed[num_end]))) {
+            ++num_end;
+          }
+          content_start += static_cast<int>(num_end) + 1;  // +1 for delimiter
+        } else {
+          content_start += 1;  // +1 for bullet
+        }
+        // Add the space after marker
+        content_start += 1;
+
         // Collect continuation lines
-        int required_indent = item_indent + marker_width;
+        int required_indent = content_start;
         while (!AtEnd()) {
           std::string_view cont_line = CurrentLine();
 
@@ -1952,8 +2355,10 @@ class BlockParser {
             continue;
           }
 
-          int cont_indent = detail::CountIndent(cont_line);
-          auto cont_trimmed = detail::TrimLeft(cont_line);
+          // Expand tabs for proper indent calculation
+          std::string expanded_cont = detail::ExpandTabs(cont_line);
+          int cont_indent = detail::CountIndent(expanded_cont);
+          auto cont_trimmed = detail::TrimLeft(expanded_cont);
 
           // Check for new list item (same type)
           bool is_another_item = false;
@@ -1972,8 +2377,7 @@ class BlockParser {
               }
             } else if (!is_ordered && !cont_trimmed.empty() &&
                        cont_trimmed[0] == bullet_char &&
-                       cont_trimmed.size() >= 2 &&
-                       (cont_trimmed[1] == ' ' || cont_trimmed[1] == '\t')) {
+                       cont_trimmed.size() >= 2 && cont_trimmed[1] == ' ') {
               is_another_item = true;
             }
           }
@@ -2000,7 +2404,7 @@ class BlockParser {
                 for (char ch : cont_trimmed) {
                   if (ch == first) {
                     ++count;
-                  } else if (ch != ' ' && ch != '\t') {
+                  } else if (ch != ' ') {
                     valid_break = false;
                     break;
                   }
@@ -2019,9 +2423,9 @@ class BlockParser {
               break;
             }
           } else {
-            // Properly indented continuation
+            // Properly indented continuation - remove required_indent spaces
             std::string dedented =
-                detail::RemoveIndent(cont_line, required_indent);
+                detail::RemoveIndent(expanded_cont, required_indent);
             item_lines.push_back(dedented);
             Advance();
             had_blank_line = false;

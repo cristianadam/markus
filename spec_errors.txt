@@ -1,0 +1,93 @@
+xample 4 (lines 382-393) Tabs
+  - foo
+
+	bar
+
+--- expected HTML
++++ actual HTML
+@@ -1 +1 @@
+-<ul><li><p>foo</p><p>bar</p></li></ul>
++<ul><li>foo bar</li></ul>
+
+Example 5 (lines 395-407) Tabs
+- foo
+
+		bar
+
+--- expected HTML
++++ actual HTML
+@@ -1,2 +1,2 @@
+-<ul><li><p>foo</p><pre><code>  bar
++<ul><li>foo<pre><code>  bar
+ </code></pre></li></ul>
+
+Example 9 (lines 448-464) Tabs
+ - foo
+   - bar
+	 - baz
+
+--- expected HTML
++++ actual HTML
+@@ -1 +1 @@
+-<ul><li>foo<ul><li>bar<ul><li>baz</li></ul></li></ul></li></ul>
++<ul><li>foo</li><li>bar<ul><li>baz</li></ul></li></ul>
+
+Example 20 (lines 580-584) Backslash escapes
+<https://example.com?find=\*>
+
+--- expected HTML
++++ actual HTML
+@@ -1 +1 @@
+-<p><a href="https://example.com?find=%5C*">https://example.com?find=\*</a></p>
++<https: example.com?find="\*"> 
+
+Example 23 (lines 604-610) Backslash escapes
+[foo]
+
+[foo]: /bar\* "ti\*tle"
+
+--- expected HTML
++++ actual HTML
+@@ -1 +1 @@
+-<p><a href="/bar*" title="ti*tle">foo</a></p>
++<p>[foo]</p><p>[foo]: /bar* &quot;ti*tle&quot;</p>
+
+Example 28 (lines 690-700) Entity and numeric character references
+&nbsp &x; &#; &#x;
+&#87654321;
+&#abcdef0;
+&ThisIsNotDefined; &hi?;
+
+--- expected HTML
++++ actual HTML
+@@ -1 +1 @@
+-<p>&amp;nbsp &amp;x; &amp;#; &amp;#x; &amp;#87654321; &amp;#abcdef0; &amp;ThisIsNotDefined; &amp;hi?;</p>
++<p>&amp;nbsp &amp;x; &amp;#; &amp;#x; � &amp;#abcdef0; &amp;ThisIsNotDefined; &amp;hi?;</p>
+
+Example 33 (lines 742-748) Entity and numeric character references
+[foo]
+
+[foo]: /f&ouml;&ouml; "f&ouml;&ouml;"
+
+--- expected HTML
++++ actual HTML
+@@ -1 +1 @@
+-<p><a href="/f%C3%B6%C3%B6" title="föö">foo</a></p>
++<p>[foo]</p><p>[foo]: /föö &quot;föö&quot;</p>
+
+Example 34 (lines 751-758) Entity and numeric character references
+``` f&ouml;&ouml;
+foo
+```
+
+--- expected HTML
++++ actual HTML
+@@ -1,2 +1,2 @@
+-<pre><code class="language-föö">foo
++<pre><code class="language-f&amp;ouml;&amp;ouml;">foo
+ </code></pre>
+
+Example 60 (lines 1066-1078) Thematic breaks
+* Foo
+* * *
+* Bar

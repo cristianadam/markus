@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bazel build:*)",
+      "Bash(bazel test:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

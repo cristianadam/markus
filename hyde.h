@@ -981,6 +981,55 @@ class InlineParser {
             continue;
           }
 
+          // Try shortcut reference link: [foo] with no following () or []
+          // Look up the text inside brackets as a reference label
+          std::string label_text;
+          for (size_t i = opener->pos + 1; i < result.size(); ++i) {
+            std::visit(
+                [&label_text](auto&& arg) {
+                  using T = std::decay_t<decltype(arg)>;
+                  if constexpr (std::is_same_v<T, Text>) {
+                    label_text += arg.content;
+                  }
+                },
+                result[i]);
+          }
+
+          auto ref_result = LookupReference(label_text);
+          if (ref_result) {
+            bool is_image = (opener->delimiter == '!');
+
+            std::vector<InlineNode> link_content;
+            for (size_t i = opener->pos + 1; i < result.size(); ++i) {
+              link_content.push_back(std::move(result[i]));
+            }
+
+            result.resize(opener->pos);
+
+            if (is_image) {
+              Image img;
+              img.destination = std::move(ref_result->first);
+              img.title = std::move(ref_result->second);
+              img.alt_text = label_text;
+              result.push_back(std::move(img));
+            } else {
+              Link link;
+              link.destination = std::move(ref_result->first);
+              link.title = std::move(ref_result->second);
+              link.children = std::move(link_content);
+              result.push_back(std::move(link));
+            }
+
+            for (auto it = opener; it != delimiter_stack.end(); ++it) {
+              if (it->delimiter == '[' || it->delimiter == '!') {
+                it->active = false;
+              }
+            }
+            delimiter_stack.erase(opener, delimiter_stack.end());
+            ++pos_;  // Skip ']'
+            continue;
+          }
+
           pos_ = saved_pos;
         }
 
@@ -1188,16 +1237,19 @@ class InlineParser {
           text_[num_end] == ';') {
         std::string num_str(text_.substr(num_start, num_end - num_start));
         try {
-          uint32_t code_point;
+          unsigned long code_point_ul;
           if (is_hex) {
-            code_point =
-                static_cast<uint32_t>(std::stoul(num_str, nullptr, 16));
+            code_point_ul = std::stoul(num_str, nullptr, 16);
           } else {
-            code_point =
-                static_cast<uint32_t>(std::stoul(num_str, nullptr, 10));
+            code_point_ul = std::stoul(num_str, nullptr, 10);
           }
-          pos_ = num_end + 1;
-          return detail::CodePointToUtf8(code_point);
+          // Only decode valid Unicode code points (0 to 0x10FFFF)
+          if (code_point_ul <= 0x10FFFF) {
+            pos_ = num_end + 1;
+            return detail::CodePointToUtf8(
+                static_cast<uint32_t>(code_point_ul));
+          }
+          // Invalid code point - leave as literal
         } catch (...) {
           // Invalid number, treat as literal
         }
@@ -1748,10 +1800,79 @@ class BlockParser {
         continue;
       }
 
+      // Check for link reference definition (skip it, already extracted)
+      if (TrySkipLinkReferenceDefinition()) {
+        continue;
+      }
+
       // Default: paragraph (may include setext heading)
       auto para = ParseParagraph();
       blocks.push_back(std::move(para));
     }
+  }
+
+  bool TrySkipLinkReferenceDefinition() {
+    std::string_view line = CurrentLine();
+    int indent = detail::CountIndent(line);
+    if (indent >= 4) return false;
+
+    auto trimmed = detail::TrimLeft(line);
+    if (!trimmed.starts_with('[')) return false;
+
+    size_t close_bracket = trimmed.find(']');
+    if (close_bracket == std::string_view::npos ||
+        close_bracket + 1 >= trimmed.size() ||
+        trimmed[close_bracket + 1] != ':') {
+      return false;
+    }
+
+    // Verify there's a valid destination
+    auto rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
+    if (rest.empty()) return false;
+
+    std::string destination;
+    if (rest[0] == '<') {
+      size_t close_angle = rest.find('>');
+      if (close_angle == std::string_view::npos) return false;
+      destination = std::string(rest.substr(1, close_angle - 1));
+      rest = detail::TrimLeft(rest.substr(close_angle + 1));
+    } else {
+      size_t end_pos = 0;
+      while (end_pos < rest.size() &&
+             !detail::IsUnicodeWhitespace(rest[end_pos])) {
+        if (rest[end_pos] == '\\' && end_pos + 1 < rest.size()) {
+          ++end_pos;
+        }
+        ++end_pos;
+      }
+      if (end_pos == 0) return false;
+      destination = std::string(rest.substr(0, end_pos));
+      rest = detail::TrimLeft(rest.substr(end_pos));
+    }
+
+    // Check optional title
+    if (!rest.empty()) {
+      if (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(') {
+        char close_char = rest[0] == '(' ? ')' : rest[0];
+        size_t title_end = 1;
+        while (title_end < rest.size() && rest[title_end] != close_char) {
+          if (rest[title_end] == '\\' && title_end + 1 < rest.size()) {
+            ++title_end;
+          }
+          ++title_end;
+        }
+        if (title_end >= rest.size()) return false;
+        rest = detail::TrimLeft(rest.substr(title_end + 1));
+      }
+    }
+
+    // Rest of line must be empty or whitespace only
+    if (!rest.empty() && !detail::IsBlankLine(rest)) {
+      return false;
+    }
+
+    Advance();
+    return true;
   }
 
   std::optional<ThematicBreak> TryParseThematicBreak() {
@@ -1872,7 +1993,7 @@ class BlockParser {
       return std::nullopt;
     }
     // Decode backslash escapes in info string
-    info_string = detail::DecodeEscapes(info_string);
+    info_string = detail::DecodeEscapesAndEntities(info_string);
 
     Advance();
 
@@ -2049,14 +2170,20 @@ class BlockParser {
           ++tag_end;
         }
 
-        // Must end with > or have attributes
-        size_t search_pos = tag_end;
-        while (search_pos < trimmed.size() && trimmed[search_pos] != '>') {
-          ++search_pos;
-        }
+        // Check that this is not a URI scheme (no colon after tag name)
+        // Autolinks like <https://...> should not be treated as HTML blocks
+        if (tag_end < trimmed.size() && trimmed[tag_end] == ':') {
+          // Looks like a URI scheme, not an HTML tag
+        } else {
+          // Must end with > or have attributes
+          size_t search_pos = tag_end;
+          while (search_pos < trimmed.size() && trimmed[search_pos] != '>') {
+            ++search_pos;
+          }
 
-        if (search_pos < trimmed.size() && trimmed[search_pos] == '>') {
-          block_type = 7;
+          if (search_pos < trimmed.size() && trimmed[search_pos] == '>') {
+            block_type = 7;
+          }
         }
       }
     }
@@ -2240,6 +2367,28 @@ class BlockParser {
         continue;
       }
 
+      // Check for thematic break first - it takes precedence over list items
+      // Only applies to bullet lists where the bullet could be a thematic break
+      if (!is_ordered && item_indent < 4 && !item_trimmed.empty()) {
+        char first = item_trimmed[0];
+        if (first == '*' || first == '-' || first == '_') {
+          int count = 0;
+          bool valid_break = true;
+          for (char ch : item_trimmed) {
+            if (ch == first) {
+              ++count;
+            } else if (ch != ' ' && ch != '\t') {
+              valid_break = false;
+              break;
+            }
+          }
+          if (valid_break && count >= 3) {
+            // This is a thematic break, not a list item - end the list
+            break;
+          }
+        }
+      }
+
       // Check for new list item
       bool is_new_item = false;
       if (is_ordered) {
@@ -2269,17 +2418,10 @@ class BlockParser {
       }
 
       if (!is_new_item && !list.items.empty()) {
-        // Check if it's a continuation (indented enough)
-        if (item_indent >= marker_width) {
-          // It's a continuation
-          if (had_blank_line) {
-            list.is_tight = false;
-          }
-          // Will be handled by item content collection
-        } else {
-          // Not a continuation, end the list
-          break;
-        }
+        // Not a new item - the list is complete.
+        // Any valid continuation lines should have been collected by the inner
+        // loop. If we're here, the line belongs to a different block.
+        break;
       }
 
       if (is_new_item || list.items.empty()) {
@@ -2360,9 +2502,11 @@ class BlockParser {
           int cont_indent = detail::CountIndent(expanded_cont);
           auto cont_trimmed = detail::TrimLeft(expanded_cont);
 
-          // Check for new list item (same type)
+          // Check for new list item (same type) - only at original list indent
+          // If indented to be content of current item, it should be parsed as
+          // nested list by the BlockParser, not as a sibling item here
           bool is_another_item = false;
-          if (cont_indent < 4) {
+          if (cont_indent < required_indent && cont_indent < 4) {
             if (is_ordered && !cont_trimmed.empty() &&
                 std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {
               size_t num_end = 0;
@@ -2424,6 +2568,10 @@ class BlockParser {
             }
           } else {
             // Properly indented continuation - remove required_indent spaces
+            // If there was a blank line before this content, list becomes loose
+            if (had_blank_line) {
+              list.is_tight = false;
+            }
             std::string dedented =
                 detail::RemoveIndent(expanded_cont, required_indent);
             item_lines.push_back(dedented);
@@ -2452,6 +2600,11 @@ class BlockParser {
 
         list.items.push_back(std::move(item));
       }
+    }
+
+    // Return nullopt if no items were collected
+    if (list.items.empty()) {
+      return std::nullopt;
     }
 
     // Check for loose list (items separated by blank lines)

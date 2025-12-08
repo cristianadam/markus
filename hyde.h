@@ -2290,13 +2290,19 @@ class BlockParser {
                                                         "style", "textarea"};
     for (const auto& tag : type1_tags) {
       std::string open_tag = "<" + tag;
-      if (trimmed.size() >= open_tag.size() + 1) {
+      if (trimmed.size() >= open_tag.size()) {
         std::string lower;
         for (size_t j = 0; j < open_tag.size(); ++j) {
           lower += static_cast<char>(
               std::tolower(static_cast<unsigned char>(trimmed[j])));
         }
         if (lower == open_tag) {
+          // Tag at end of line, or followed by space/tab/>/newline
+          if (trimmed.size() == open_tag.size()) {
+            block_type = 1;
+            end_condition = "</" + tag + ">";
+            break;
+          }
           char next = trimmed[open_tag.size()];
           if (next == ' ' || next == '>' || next == '\t' || next == '\n') {
             block_type = 1;
@@ -3054,6 +3060,85 @@ class BlockParser {
               break;
             }
           }
+        }
+
+        // Check for HTML block (types 1-6 can interrupt paragraphs)
+        if (trimmed.starts_with("<")) {
+          // Type 1: script, pre, style, textarea
+          static const std::vector<std::string> type1_tags = {"script", "pre",
+                                                              "style", "textarea"};
+          for (const auto& tag : type1_tags) {
+            std::string open_tag = "<" + tag;
+            if (trimmed.size() >= open_tag.size()) {
+              std::string lower;
+              for (size_t j = 0; j < open_tag.size(); ++j) {
+                lower += static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(trimmed[j])));
+              }
+              if (lower == open_tag &&
+                  (trimmed.size() == open_tag.size() ||
+                   trimmed[open_tag.size()] == ' ' ||
+                   trimmed[open_tag.size()] == '>' ||
+                   trimmed[open_tag.size()] == '\t')) {
+                goto html_interrupt;
+              }
+            }
+          }
+          // Type 2-5
+          if (trimmed.starts_with("<!--") || trimmed.starts_with("<?") ||
+              trimmed.starts_with("<![CDATA[")) {
+            goto html_interrupt;
+          }
+          if (trimmed.size() >= 2 && trimmed[1] == '!' &&
+              trimmed.size() >= 9) {
+            std::string upper;
+            for (size_t j = 0; j < 9; ++j) {
+              upper += static_cast<char>(
+                  std::toupper(static_cast<unsigned char>(trimmed[j])));
+            }
+            if (upper.starts_with("<!DOCTYPE")) {
+              goto html_interrupt;
+            }
+          }
+          // Type 6: block-level tags
+          static const std::vector<std::string> type6_tags = {
+              "address", "article", "aside", "base", "basefont", "blockquote",
+              "body", "caption", "center", "col", "colgroup", "dd", "details",
+              "dialog", "dir", "div", "dl", "dt", "fieldset", "figcaption",
+              "figure", "footer", "form", "frame", "frameset", "h1", "h2",
+              "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "iframe",
+              "legend", "li", "link", "main", "menu", "menuitem", "nav",
+              "noframes", "ol", "optgroup", "option", "p", "param", "search",
+              "section", "summary", "table", "tbody", "td", "tfoot", "th",
+              "thead", "title", "tr", "track", "ul"};
+          bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
+          size_t tag_start = is_closing ? 2 : 1;
+          size_t tag_end = tag_start;
+          while (tag_end < trimmed.size() &&
+                 (std::isalnum(static_cast<unsigned char>(trimmed[tag_end])) ||
+                  trimmed[tag_end] == '-')) {
+            ++tag_end;
+          }
+          if (tag_end > tag_start) {
+            std::string tag_name;
+            for (size_t j = tag_start; j < tag_end; ++j) {
+              tag_name += static_cast<char>(
+                  std::tolower(static_cast<unsigned char>(trimmed[j])));
+            }
+            for (const auto& t : type6_tags) {
+              if (tag_name == t) {
+                if (tag_end >= trimmed.size() ||
+                    trimmed[tag_end] == ' ' || trimmed[tag_end] == '>' ||
+                    trimmed[tag_end] == '\t' || trimmed[tag_end] == '/') {
+                  goto html_interrupt;
+                }
+              }
+            }
+          }
+        }
+        if (false) {
+        html_interrupt:
+          break;
         }
       }
 

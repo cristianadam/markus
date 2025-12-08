@@ -6,7 +6,8 @@
       "Bash(./run_tests.sh:*)",
       "Bash(timeout 2 bazel-bin/main:*)",
       "Bash(bazel-bin/main)",
-      "Bash(xxd:*)"
+      "Bash(xxd:*)",
+      "Bash(bazel-bin/main:*)"
     ],
     "deny": [],
     "ask": []

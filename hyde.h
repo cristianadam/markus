@@ -329,10 +329,9 @@ inline std::string EncodeUrl(std::string_view url) {
   result.reserve(url.size());
   for (unsigned char c : url) {
     if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' ||
-        c == '/' || c == ':' || c == '?' || c == '#' || c == '[' || c == ']' ||
-        c == '@' || c == '!' || c == '$' || c == '&' || c == '\'' ||
-        c == '(' || c == ')' || c == '*' || c == '+' || c == ',' || c == ';' ||
-        c == '=' || c == '%') {
+        c == '/' || c == ':' || c == '?' || c == '#' || c == '@' || c == '!' ||
+        c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' ||
+        c == '+' || c == ',' || c == ';' || c == '=' || c == '%') {
       result += static_cast<char>(c);
     } else {
       char buf[4];
@@ -1345,7 +1344,8 @@ class InlineParser {
     }
 
     // Skip attributes and find closing - must follow HTML tag syntax
-    // After tag name, expect whitespace, /, or >
+    // After tag name, expect whitespace, /, or > - anything else is invalid
+    bool seen_whitespace = false;
     while (end < text_.size()) {
       char c = text_[end];
       if (c == '>') {
@@ -1359,10 +1359,12 @@ class InlineParser {
         }
         return std::nullopt;  // / not followed by >
       } else if (c == ' ' || c == '\t' || c == '\n') {
+        seen_whitespace = true;
         ++end;
-      } else if (std::isalpha(static_cast<unsigned char>(c)) || c == '_' ||
-                 c == ':') {
-        // Start of attribute name
+      } else if (seen_whitespace &&
+                 (std::isalpha(static_cast<unsigned char>(c)) || c == '_' ||
+                  c == ':')) {
+        // Start of attribute name (must be preceded by whitespace)
         ++end;
         while (end < text_.size()) {
           char ac = text_[end];
@@ -2414,10 +2416,16 @@ class BlockParser {
           ++tag_end;
         }
 
-        // Check that this is not a URI scheme (no colon after tag name)
-        if (tag_end < trimmed.size() && trimmed[tag_end] == ':') {
-          // Looks like a URI scheme, not an HTML tag
+        // After tag name, must have valid HTML tag continuation: whitespace, /, >
+        // Anything else (like + or :) means this isn't a valid HTML tag
+        bool valid_tag = false;
+        if (tag_end >= trimmed.size()) {
+          // Just tag name, no closing - not valid
         } else {
+          char next = trimmed[tag_end];
+          valid_tag = (next == ' ' || next == '\t' || next == '/' || next == '>');
+        }
+        if (valid_tag) {
           // Find the closing > of this tag
           size_t search_pos = tag_end;
           bool in_quote = false;

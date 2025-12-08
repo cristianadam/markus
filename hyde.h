@@ -1931,8 +1931,9 @@ class BlockParser {
         title_valid = false;
       }
 
-      // If destination is empty, this isn't a valid link ref
-      if (destination.empty()) {
+      // If destination parsing returned length 0 (not angle brackets) and no destination, it's invalid
+      // But angle bracket destinations like <> returning empty string with length > 0 are valid
+      if (dest_raw.empty() && dest_len == 0) {
         line_idx_ = start_line;
         Advance();
         continue;

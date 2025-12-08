@@ -1819,7 +1819,9 @@ class BlockParser {
         continue;
       }
 
-      std::string label(trimmed.substr(1, close_bracket - 1));
+      std::string label_raw(trimmed.substr(1, close_bracket - 1));
+      // Decode escapes in label for normalization and matching
+      std::string label = detail::DecodeEscapesAndEntities(label_raw);
       std::string normalized = detail::NormalizeLinkLabel(label);
       if (normalized.empty()) {
         Advance();

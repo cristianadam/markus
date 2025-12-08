@@ -1833,7 +1833,7 @@ class BlockParser {
       size_t start_line = line_idx_;
       Advance();
 
-      // Destination might be on next line
+      // Destination might be on next line (no indentation required)
       if (rest.empty() || detail::IsBlankLine(rest)) {
         if (AtEnd()) {
           line_idx_ = start_line;
@@ -1841,7 +1841,7 @@ class BlockParser {
           continue;
         }
         std::string_view next_line = CurrentLine();
-        if (detail::IsBlankLine(next_line) || detail::CountIndent(next_line) < 1) {
+        if (detail::IsBlankLine(next_line)) {
           line_idx_ = start_line;
           Advance();
           continue;
@@ -1863,11 +1863,19 @@ class BlockParser {
       // Parse optional title (may be on same line or next line)
       std::string title;
       bool title_valid = true;
+      bool title_on_new_line = false;
+      size_t pre_title_line = line_idx_;
 
       if (rest.empty() && !AtEnd()) {
         std::string_view next_line = CurrentLine();
-        if (!detail::IsBlankLine(next_line) && detail::CountIndent(next_line) >= 1) {
-          rest = detail::TrimLeft(next_line);
+        // Title can be on next line if next line starts with title char
+        auto trimmed_next = detail::TrimLeft(next_line);
+        if (!detail::IsBlankLine(next_line) &&
+            (trimmed_next.size() > 0 &&
+             (trimmed_next[0] == '"' || trimmed_next[0] == '\'' ||
+              trimmed_next[0] == '('))) {
+          title_on_new_line = true;
+          rest = trimmed_next;
           Advance();
         }
       }
@@ -1923,7 +1931,20 @@ class BlockParser {
         title_valid = false;
       }
 
-      if (!title_valid || destination.empty()) {
+      // If destination is empty, this isn't a valid link ref
+      if (destination.empty()) {
+        line_idx_ = start_line;
+        Advance();
+        continue;
+      }
+
+      // If title parsing failed but was on a new line, roll back just the title line
+      // and accept the link ref without a title
+      if (!title_valid && title_on_new_line) {
+        line_idx_ = pre_title_line;
+        title.clear();
+      } else if (!title_valid) {
+        // Title on same line failed - invalid link ref
         line_idx_ = start_line;
         Advance();
         continue;
@@ -2018,14 +2039,14 @@ class BlockParser {
     size_t start_line = line_idx_;
     Advance();
 
-    // Destination might be on next line
+    // Destination might be on next line (no indentation required)
     if (rest.empty() || detail::IsBlankLine(rest)) {
       if (AtEnd()) {
         line_idx_ = start_line;
         return false;
       }
       std::string_view next_line = CurrentLine();
-      if (detail::IsBlankLine(next_line) || detail::CountIndent(next_line) < 1) {
+      if (detail::IsBlankLine(next_line)) {
         line_idx_ = start_line;
         return false;
       }
@@ -2043,11 +2064,18 @@ class BlockParser {
 
     // Parse optional title (may be on next line)
     bool title_valid = true;
+    bool title_on_new_line = false;
+    size_t pre_title_line = line_idx_;
 
     if (rest.empty() && !AtEnd()) {
       std::string_view next_line = CurrentLine();
-      if (!detail::IsBlankLine(next_line) && detail::CountIndent(next_line) >= 1) {
-        rest = detail::TrimLeft(next_line);
+      auto trimmed_next = detail::TrimLeft(next_line);
+      if (!detail::IsBlankLine(next_line) &&
+          (trimmed_next.size() > 0 &&
+           (trimmed_next[0] == '"' || trimmed_next[0] == '\'' ||
+            trimmed_next[0] == '('))) {
+        title_on_new_line = true;
+        rest = trimmed_next;
         Advance();
       }
     }
@@ -2089,7 +2117,10 @@ class BlockParser {
       title_valid = false;
     }
 
-    if (!title_valid) {
+    // If title failed but was on a new line, roll back just title and accept without title
+    if (!title_valid && title_on_new_line) {
+      line_idx_ = pre_title_line;
+    } else if (!title_valid) {
       line_idx_ = start_line;
       return false;
     }

@@ -265,8 +265,23 @@ inline bool IsAsciiPunctuation(char c) {
 // Includes ASCII whitespace and common Unicode whitespace chars
 inline bool IsUnicodeWhitespace(char c) {
   unsigned char uc = static_cast<unsigned char>(c);
-  return uc == ' ' || uc == '\t' || uc == '\n' || uc == '\r' || uc == '\f' ||
-         uc == 0xA0;  // NO-BREAK SPACE (first byte of UTF-8 for many spaces)
+  return uc == ' ' || uc == '\t' || uc == '\n' || uc == '\r' || uc == '\f';
+}
+
+// Check for Unicode whitespace at position in a string (handles multi-byte UTF-8)
+// Returns number of bytes to skip if whitespace, 0 otherwise
+inline size_t IsUnicodeWhitespaceAt(std::string_view s, size_t pos) {
+  if (pos >= s.size()) return 0;
+  unsigned char c = static_cast<unsigned char>(s[pos]);
+  if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+    return 1;
+  }
+  // UTF-8 NO-BREAK SPACE: 0xC2 0xA0
+  if (c == 0xC2 && pos + 1 < s.size() &&
+      static_cast<unsigned char>(s[pos + 1]) == 0xA0) {
+    return 2;
+  }
+  return 0;
 }
 
 // Normalize a link label (case-fold and collapse whitespace)
@@ -1043,6 +1058,8 @@ class InlineParser {
           }
 
           pos_ = saved_pos;
+          // Deactivate this opener since it couldn't form a link
+          opener->active = false;
         }
 
         result.push_back(Text("]"));
@@ -1118,7 +1135,7 @@ class InlineParser {
   std::vector<DelimiterNode>::iterator FindLinkOpener(
       std::vector<DelimiterNode>& stack) {
     for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
-      if (it->delimiter == '[' || it->delimiter == '!') {
+      if ((it->delimiter == '[' || it->delimiter == '!') && it->active) {
         return std::prev(it.base());
       }
     }
@@ -1448,11 +1465,12 @@ class InlineParser {
             text_.substr(dest_start, pos_ - dest_start));
         ++pos_;
       } else if (pos_ < text_.size() && text_[pos_] != ')') {
-        // Regular destination
+        // Regular destination - only ASCII space/tab/newline are separators
         size_t dest_start = pos_;
         int paren_depth = 0;
-        while (pos_ < text_.size() &&
-               !detail::IsUnicodeWhitespace(text_[pos_])) {
+        while (pos_ < text_.size() && text_[pos_] != ' ' &&
+               text_[pos_] != '\t' && text_[pos_] != '\n' &&
+               text_[pos_] != '\r') {
           if (text_[pos_] == '(') {
             ++paren_depth;
           } else if (text_[pos_] == ')') {

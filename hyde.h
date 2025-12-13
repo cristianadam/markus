@@ -1876,7 +1876,10 @@ class BlockParser {
         continue;
       }
       std::string destination = detail::DecodeEscapesAndEntities(dest_raw);
-      rest = detail::TrimLeft(rest.substr(dest_len));
+      auto rest_after_dest = rest.substr(dest_len);
+      bool has_whitespace_before_title =
+          rest_after_dest.size() != detail::TrimLeft(rest_after_dest).size();
+      rest = detail::TrimLeft(rest_after_dest);
 
       // Parse optional title (may be on same line or next line)
       std::string title;
@@ -1899,10 +1902,14 @@ class BlockParser {
       }
 
       if (!rest.empty() && (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
-        char open_char = rest[0];
-        char close_char = (open_char == '(') ? ')' : open_char;
-        std::string title_content;
-        size_t i = 1;
+        // Title must be separated from destination by whitespace (or be on new line)
+        if (!title_on_new_line && !has_whitespace_before_title) {
+          title_valid = false;
+        } else {
+          char open_char = rest[0];
+          char close_char = (open_char == '(') ? ')' : open_char;
+          std::string title_content;
+          size_t i = 1;
 
         // Title can span multiple lines
         while (title_valid) {
@@ -1944,6 +1951,7 @@ class BlockParser {
           Advance();
         }
       title_done:;
+        }  // close else block for whitespace check
       } else if (!rest.empty()) {
         // Non-whitespace after destination with no title
         title_valid = false;
@@ -2079,7 +2087,10 @@ class BlockParser {
       line_idx_ = start_line;
       return false;
     }
-    rest = detail::TrimLeft(rest.substr(dest_len));
+    auto rest_after_dest = rest.substr(dest_len);
+    bool has_whitespace_before_title =
+        rest_after_dest.size() != detail::TrimLeft(rest_after_dest).size();
+    rest = detail::TrimLeft(rest_after_dest);
 
     // Parse optional title (may be on next line)
     bool title_valid = true;
@@ -2100,11 +2111,15 @@ class BlockParser {
     }
 
     if (!rest.empty() && (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
-      char open_char = rest[0];
-      char close_char = (open_char == '(') ? ')' : open_char;
-      size_t i = 1;
+      // Title must be separated from destination by whitespace (or be on new line)
+      if (!title_on_new_line && !has_whitespace_before_title) {
+        title_valid = false;
+      } else {
+        char open_char = rest[0];
+        char close_char = (open_char == '(') ? ')' : open_char;
+        size_t i = 1;
 
-      while (title_valid) {
+        while (title_valid) {
         while (i < rest.size()) {
           if (rest[i] == '\\' && i + 1 < rest.size()) {
             i += 2;
@@ -2132,6 +2147,7 @@ class BlockParser {
         Advance();
       }
     skip_title_done:;
+      }  // close else block for whitespace check
     } else if (!rest.empty()) {
       title_valid = false;
     }

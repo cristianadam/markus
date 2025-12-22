@@ -461,11 +461,8 @@ inline uint32_t UnicodeCaseFold(uint32_t cp) {
   if (cp >= 0x0400 && cp <= 0x040F) {
     return cp + 80;
   }
-  // German capital sharp S (ẞ U+1E9E) -> small sharp s (ß U+00DF)
-  // CommonMark uses simple case folding, which maps ẞ to ß
-  if (cp == 0x1E9E) {
-    return 0x00DF;
-  }
+  // German capital sharp S (ẞ U+1E9E) is handled specially in NormalizeLinkLabel
+  // because it folds to "ss" (two characters) in full case folding
   // Latin Extended Additional
   if (cp >= 0x1E00 && cp <= 0x1E95) {
     if ((cp & 1) == 0) return cp + 1;
@@ -516,11 +513,15 @@ inline std::string NormalizeLinkLabel(std::string_view label) {
       continue;
     }
 
-    // Apply case folding
-    uint32_t folded = UnicodeCaseFold(cp);
-
-    // Encode back to UTF-8
-    result += CodePointToUtf8(folded);
+    // Apply case folding - special handling for characters that fold to multiple chars
+    if (cp == 0x1E9E) {
+      // German capital sharp S (ẞ) folds to "ss" in full case folding
+      result += "ss";
+    } else {
+      uint32_t folded = UnicodeCaseFold(cp);
+      // Encode back to UTF-8
+      result += CodePointToUtf8(folded);
+    }
 
     in_whitespace = false;
     first = false;
@@ -2043,18 +2044,124 @@ class BlockParser {
   }
 
   void ExtractLinkReferences(Document& doc) {
+    // Track fenced code block state
+    bool in_fenced_code = false;
+    char fence_char = 0;
+    size_t fence_length = 0;
+
+    // Track if previous line had content (to reject link refs after content)
+    bool prev_line_had_content = false;
+
     while (!AtEnd()) {
       std::string_view line = CurrentLine();
       int indent = detail::CountIndent(line);
+      auto trimmed = detail::TrimLeft(line);
 
-      // Skip indented lines (4+ spaces)
-      if (indent >= 4) {
+      // Handle fenced code blocks - check for fence opening/closing
+      if (!in_fenced_code && indent < 4 && !trimmed.empty() &&
+          (trimmed[0] == '`' || trimmed[0] == '~')) {
+        char potential_fence = trimmed[0];
+        size_t potential_len = 0;
+        while (potential_len < trimmed.size() &&
+               trimmed[potential_len] == potential_fence) {
+          ++potential_len;
+        }
+        if (potential_len >= 3) {
+          // Check that backtick fence doesn't have backticks in info string
+          if (potential_fence == '~' ||
+              trimmed.substr(potential_len).find('`') == std::string_view::npos) {
+            in_fenced_code = true;
+            fence_char = potential_fence;
+            fence_length = potential_len;
+            Advance();
+            continue;
+          }
+        }
+      }
+
+      if (in_fenced_code) {
+        // Check for closing fence
+        if (indent < 4 && !trimmed.empty() && trimmed[0] == fence_char) {
+          size_t close_len = 0;
+          while (close_len < trimmed.size() && trimmed[close_len] == fence_char) {
+            ++close_len;
+          }
+          if (close_len >= fence_length) {
+            // Check rest is whitespace only
+            bool is_close = true;
+            for (size_t j = close_len; j < trimmed.size(); ++j) {
+              if (trimmed[j] != ' ' && trimmed[j] != '\t') {
+                is_close = false;
+                break;
+              }
+            }
+            if (is_close) {
+              in_fenced_code = false;
+            }
+          }
+        }
         Advance();
         continue;
       }
 
-      auto trimmed = detail::TrimLeft(line);
+      // Skip indented lines (4+ spaces)
+      if (indent >= 4) {
+        prev_line_had_content = !detail::IsBlankLine(line);
+        Advance();
+        continue;
+      }
+
+      // Check for blank line - resets prev_line_had_content
+      if (detail::IsBlankLine(line)) {
+        prev_line_had_content = false;
+        Advance();
+        continue;
+      }
+
+      // Check for block-level elements that end a block (not continuable to paragraph)
+      // These reset prev_line_had_content to false
+      bool is_block_element = false;
+      if (trimmed.starts_with('#')) {
+        // ATX heading
+        size_t hash_count = 0;
+        while (hash_count < trimmed.size() && trimmed[hash_count] == '#') ++hash_count;
+        if (hash_count <= 6 && (hash_count >= trimmed.size() ||
+            trimmed[hash_count] == ' ' || trimmed[hash_count] == '\t')) {
+          is_block_element = true;
+        }
+      }
+      if (!is_block_element && trimmed.starts_with('>')) {
+        is_block_element = true;  // Block quote
+      }
+      if (!is_block_element && trimmed.size() >= 3) {
+        // Check for thematic break
+        char first = trimmed[0];
+        if (first == '*' || first == '-' || first == '_') {
+          int count = 0;
+          bool valid = true;
+          for (char ch : trimmed) {
+            if (ch == first) ++count;
+            else if (ch != ' ' && ch != '\t') { valid = false; break; }
+          }
+          if (valid && count >= 3) is_block_element = true;
+        }
+      }
+
+      if (is_block_element) {
+        prev_line_had_content = false;
+        Advance();
+        continue;
+      }
+
+      // Link ref definitions cannot follow non-blank paragraph content
+      if (prev_line_had_content) {
+        prev_line_had_content = true;  // This line also has content
+        Advance();
+        continue;
+      }
+
       if (!trimmed.starts_with('[')) {
+        prev_line_had_content = true;
         Advance();
         continue;
       }
@@ -2064,6 +2171,7 @@ class BlockParser {
       if (close_bracket == std::string_view::npos ||
           close_bracket + 1 >= trimmed.size() ||
           trimmed[close_bracket + 1] != ':') {
+        prev_line_had_content = true;
         Advance();
         continue;
       }
@@ -2073,6 +2181,7 @@ class BlockParser {
       std::string label = detail::DecodeEscapesAndEntities(label_raw);
       std::string normalized = detail::NormalizeLinkLabel(label);
       if (normalized.empty()) {
+        prev_line_had_content = true;
         Advance();
         continue;
       }
@@ -2086,12 +2195,14 @@ class BlockParser {
       if (rest.empty() || detail::IsBlankLine(rest)) {
         if (AtEnd()) {
           line_idx_ = start_line;
+          prev_line_had_content = true;
           Advance();
           continue;
         }
         std::string_view next_line = CurrentLine();
         if (detail::IsBlankLine(next_line)) {
           line_idx_ = start_line;
+          prev_line_had_content = true;
           Advance();
           continue;
         }
@@ -2103,6 +2214,7 @@ class BlockParser {
       auto [dest_raw, dest_len] = ParseLinkDestination(rest);
       if (dest_raw.empty() && dest_len == 0 && !rest.empty() && rest[0] != '<') {
         line_idx_ = start_line;
+        prev_line_had_content = true;
         Advance();
         continue;
       }
@@ -2192,6 +2304,7 @@ class BlockParser {
       // But angle bracket destinations like <> returning empty string with length > 0 are valid
       if (dest_raw.empty() && dest_len == 0) {
         line_idx_ = start_line;
+        prev_line_had_content = true;
         Advance();
         continue;
       }
@@ -2204,6 +2317,7 @@ class BlockParser {
       } else if (!title_valid) {
         // Title on same line failed - invalid link ref
         line_idx_ = start_line;
+        prev_line_had_content = true;
         Advance();
         continue;
       }
@@ -2212,6 +2326,8 @@ class BlockParser {
       if (doc.link_references.find(normalized) == doc.link_references.end()) {
         doc.link_references[normalized] = {detail::EncodeUrl(destination), title};
       }
+      // After successful link ref extraction, next line starts fresh
+      prev_line_had_content = false;
     }
     // Reset for block parsing
     line_idx_ = 0;

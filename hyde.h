@@ -261,6 +261,110 @@ inline bool IsAsciiPunctuation(char c) {
          (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E);
 }
 
+// Get the byte length of a UTF-8 character starting at the given byte
+inline size_t Utf8CharLen(unsigned char c) {
+  if ((c & 0x80) == 0) return 1;       // ASCII
+  if ((c & 0xE0) == 0xC0) return 2;    // 110xxxxx
+  if ((c & 0xF0) == 0xE0) return 3;    // 1110xxxx
+  if ((c & 0xF8) == 0xF0) return 4;    // 11110xxx
+  return 1;  // Invalid, treat as single byte
+}
+
+// Decode UTF-8 code point at position, return code point and bytes consumed
+inline std::pair<uint32_t, size_t> DecodeUtf8At(std::string_view s, size_t pos) {
+  if (pos >= s.size()) return {0, 0};
+  unsigned char c = static_cast<unsigned char>(s[pos]);
+  if ((c & 0x80) == 0) {
+    return {c, 1};
+  }
+  if ((c & 0xE0) == 0xC0 && pos + 1 < s.size()) {
+    uint32_t cp = (c & 0x1F) << 6;
+    cp |= (static_cast<unsigned char>(s[pos + 1]) & 0x3F);
+    return {cp, 2};
+  }
+  if ((c & 0xF0) == 0xE0 && pos + 2 < s.size()) {
+    uint32_t cp = (c & 0x0F) << 12;
+    cp |= (static_cast<unsigned char>(s[pos + 1]) & 0x3F) << 6;
+    cp |= (static_cast<unsigned char>(s[pos + 2]) & 0x3F);
+    return {cp, 3};
+  }
+  if ((c & 0xF8) == 0xF0 && pos + 3 < s.size()) {
+    uint32_t cp = (c & 0x07) << 18;
+    cp |= (static_cast<unsigned char>(s[pos + 1]) & 0x3F) << 12;
+    cp |= (static_cast<unsigned char>(s[pos + 2]) & 0x3F) << 6;
+    cp |= (static_cast<unsigned char>(s[pos + 3]) & 0x3F);
+    return {cp, 4};
+  }
+  return {c, 1};
+}
+
+// Check if a Unicode code point is in P (punctuation) or S (symbol) categories
+// This is used for CommonMark's definition of "Unicode punctuation character"
+inline bool IsUnicodePunctuation(uint32_t cp) {
+  // ASCII punctuation
+  if (cp < 0x80) {
+    return IsAsciiPunctuation(static_cast<char>(cp));
+  }
+  // Common Unicode punctuation and symbols (P and S categories)
+  // This covers the most common cases; a full implementation would need
+  // complete Unicode category tables
+
+  // General Punctuation (U+2000-U+206F)
+  if (cp >= 0x2000 && cp <= 0x206F) return true;
+  // Supplemental Punctuation (U+2E00-U+2E7F)
+  if (cp >= 0x2E00 && cp <= 0x2E7F) return true;
+  // CJK Symbols and Punctuation (U+3000-U+303F)
+  if (cp >= 0x3000 && cp <= 0x303F) return true;
+  // Currency Symbols (U+20A0-U+20CF) - Sc category
+  if (cp >= 0x20A0 && cp <= 0x20CF) return true;
+  // Latin-1 punctuation and symbols
+  if (cp >= 0x00A0 && cp <= 0x00BF) return true;  // Includes £ (00A3), ¥, etc.
+  // Modifier symbols, letterlike symbols
+  if (cp >= 0x02B0 && cp <= 0x02FF) return true;
+  // Misc symbols (U+2600-U+26FF)
+  if (cp >= 0x2600 && cp <= 0x26FF) return true;
+  // Dingbats (U+2700-U+27BF)
+  if (cp >= 0x2700 && cp <= 0x27BF) return true;
+  // Math operators (U+2200-U+22FF)
+  if (cp >= 0x2200 && cp <= 0x22FF) return true;
+  // Arrows (U+2190-U+21FF)
+  if (cp >= 0x2190 && cp <= 0x21FF) return true;
+  // Box drawing (U+2500-U+257F)
+  if (cp >= 0x2500 && cp <= 0x257F) return true;
+  // Geometric shapes (U+25A0-U+25FF)
+  if (cp >= 0x25A0 && cp <= 0x25FF) return true;
+  // Misc Technical (U+2300-U+23FF)
+  if (cp >= 0x2300 && cp <= 0x23FF) return true;
+  // Halfwidth/Fullwidth punctuation (U+FF00-U+FFEF)
+  if (cp >= 0xFF00 && cp <= 0xFFEF) return true;
+  // Small form variants (U+FE50-U+FE6F)
+  if (cp >= 0xFE50 && cp <= 0xFE6F) return true;
+  // CJK compatibility (U+FE30-U+FE4F)
+  if (cp >= 0xFE30 && cp <= 0xFE4F) return true;
+  // Adlam Numbers (U+1E2FF is in this area - 𞋿)
+  if (cp >= 0x1E2C0 && cp <= 0x1E2FF) return true;
+  // Emoticons, emoji, etc. (various planes) - treat as symbols
+  if (cp >= 0x1F300 && cp <= 0x1F9FF) return true;
+
+  return false;
+}
+
+// Check if code point is Unicode whitespace (Zs category + ASCII whitespace)
+inline bool IsUnicodeWhitespaceCodepoint(uint32_t cp) {
+  // ASCII whitespace
+  if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f') {
+    return true;
+  }
+  // Unicode Zs (space separator) category
+  if (cp == 0x00A0) return true;  // NO-BREAK SPACE
+  if (cp == 0x1680) return true;  // OGHAM SPACE MARK
+  if (cp >= 0x2000 && cp <= 0x200A) return true;  // Various spaces
+  if (cp == 0x202F) return true;  // NARROW NO-BREAK SPACE
+  if (cp == 0x205F) return true;  // MEDIUM MATHEMATICAL SPACE
+  if (cp == 0x3000) return true;  // IDEOGRAPHIC SPACE
+  return false;
+}
+
 // Check if a character is Unicode whitespace (simplified)
 // Includes ASCII whitespace and common Unicode whitespace chars
 inline bool IsUnicodeWhitespace(char c) {
@@ -284,24 +388,143 @@ inline size_t IsUnicodeWhitespaceAt(std::string_view s, size_t pos) {
   return 0;
 }
 
+// Convert a Unicode code point to UTF-8
+inline std::string CodePointToUtf8(uint32_t cp) {
+  std::string result;
+  if (cp == 0) {
+    // Null character becomes replacement character
+    result = "\xEF\xBF\xBD";
+  } else if (cp < 0x80) {
+    result += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    result += static_cast<char>(0xC0 | (cp >> 6));
+    result += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    result += static_cast<char>(0xE0 | (cp >> 12));
+    result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    result += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x110000) {
+    result += static_cast<char>(0xF0 | (cp >> 18));
+    result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    result += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    // Invalid code point - use replacement character
+    result = "\xEF\xBF\xBD";
+  }
+  return result;
+}
+
+// Simple Unicode case-folding for a code point
+// Returns the lowercase equivalent (or the same code point if no folding)
+inline uint32_t UnicodeCaseFold(uint32_t cp) {
+  // ASCII uppercase -> lowercase
+  if (cp >= 'A' && cp <= 'Z') {
+    return cp + 32;
+  }
+  // Latin-1 Supplement uppercase (U+00C0-U+00DE, except U+00D7 multiplication sign)
+  if (cp >= 0x00C0 && cp <= 0x00D6) {
+    return cp + 32;  // À-Ö -> à-ö
+  }
+  if (cp >= 0x00D8 && cp <= 0x00DE) {
+    return cp + 32;  // Ø-Þ -> ø-þ
+  }
+  // Latin Extended-A (pairs mostly 32 apart)
+  if (cp >= 0x0100 && cp <= 0x012F) {
+    if ((cp & 1) == 0) return cp + 1;  // Even code points are uppercase
+  }
+  if (cp >= 0x0132 && cp <= 0x0137) {
+    if ((cp & 1) == 0) return cp + 1;
+  }
+  if (cp >= 0x0139 && cp <= 0x0148) {
+    if ((cp & 1) == 1) return cp + 1;  // Odd code points are uppercase here
+  }
+  if (cp >= 0x014A && cp <= 0x0177) {
+    if ((cp & 1) == 0) return cp + 1;
+  }
+  if (cp == 0x0178) return 0x00FF;  // Ÿ -> ÿ
+  if (cp >= 0x0179 && cp <= 0x017E) {
+    if ((cp & 1) == 1) return cp + 1;
+  }
+  // Greek uppercase (U+0391-U+03A9) -> lowercase (U+03B1-U+03C9)
+  if (cp >= 0x0391 && cp <= 0x03A1) {
+    return cp + 32;  // Α-Ρ -> α-ρ
+  }
+  if (cp >= 0x03A3 && cp <= 0x03A9) {
+    return cp + 32;  // Σ-Ω -> σ-ω
+  }
+  // Cyrillic uppercase (U+0410-U+042F) -> lowercase (U+0430-U+044F)
+  if (cp >= 0x0410 && cp <= 0x042F) {
+    return cp + 32;
+  }
+  // More Cyrillic (U+0400-U+040F) -> (U+0450-U+045F)
+  if (cp >= 0x0400 && cp <= 0x040F) {
+    return cp + 80;
+  }
+  // German capital sharp S (ẞ U+1E9E) -> small sharp s (ß U+00DF)
+  // CommonMark uses simple case folding, which maps ẞ to ß
+  if (cp == 0x1E9E) {
+    return 0x00DF;
+  }
+  // Latin Extended Additional
+  if (cp >= 0x1E00 && cp <= 0x1E95) {
+    if ((cp & 1) == 0) return cp + 1;
+  }
+  // Latin Extended-B (various)
+  if (cp >= 0x01A0 && cp <= 0x01A5) {
+    if ((cp & 1) == 0) return cp + 1;
+  }
+  if (cp >= 0x01DE && cp <= 0x01EF) {
+    if ((cp & 1) == 0) return cp + 1;
+  }
+  // Greek Extended
+  if (cp >= 0x1F08 && cp <= 0x1F0F) return cp - 8;
+  if (cp >= 0x1F18 && cp <= 0x1F1D) return cp - 8;
+  if (cp >= 0x1F28 && cp <= 0x1F2F) return cp - 8;
+  if (cp >= 0x1F38 && cp <= 0x1F3F) return cp - 8;
+  if (cp >= 0x1F48 && cp <= 0x1F4D) return cp - 8;
+  if (cp >= 0x1F68 && cp <= 0x1F6F) return cp - 8;
+
+  return cp;  // No case folding
+}
+
 // Normalize a link label (case-fold and collapse whitespace)
+// Uses Unicode-aware case folding for CommonMark compliance
 inline std::string NormalizeLinkLabel(std::string_view label) {
   std::string result;
   result.reserve(label.size());
   bool in_whitespace = false;
   bool first = true;
+  size_t i = 0;
 
-  for (char c : label) {
-    if (IsUnicodeWhitespace(c)) {
+  while (i < label.size()) {
+    // Check for whitespace (including multi-byte Unicode whitespace)
+    size_t ws_len = IsUnicodeWhitespaceAt(label, i);
+    if (ws_len > 0) {
       if (!first && !in_whitespace) {
         result += ' ';
         in_whitespace = true;
       }
-    } else {
-      result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      in_whitespace = false;
-      first = false;
+      i += ws_len;
+      continue;
     }
+
+    // Decode UTF-8 code point
+    auto [cp, len] = DecodeUtf8At(label, i);
+    if (len == 0) {
+      ++i;
+      continue;
+    }
+
+    // Apply case folding
+    uint32_t folded = UnicodeCaseFold(cp);
+
+    // Encode back to UTF-8
+    result += CodePointToUtf8(folded);
+
+    in_whitespace = false;
+    first = false;
+    i += len;
   }
 
   // Trim trailing space
@@ -586,33 +809,6 @@ inline std::vector<std::string> SplitLines(std::string_view input) {
   }
 
   return lines;
-}
-
-// Convert a Unicode code point to UTF-8
-inline std::string CodePointToUtf8(uint32_t cp) {
-  std::string result;
-  if (cp == 0) {
-    // Null character becomes replacement character
-    result = "\xEF\xBF\xBD";
-  } else if (cp < 0x80) {
-    result += static_cast<char>(cp);
-  } else if (cp < 0x800) {
-    result += static_cast<char>(0xC0 | (cp >> 6));
-    result += static_cast<char>(0x80 | (cp & 0x3F));
-  } else if (cp < 0x10000) {
-    result += static_cast<char>(0xE0 | (cp >> 12));
-    result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-    result += static_cast<char>(0x80 | (cp & 0x3F));
-  } else if (cp < 0x110000) {
-    result += static_cast<char>(0xF0 | (cp >> 18));
-    result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-    result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-    result += static_cast<char>(0x80 | (cp & 0x3F));
-  } else {
-    // Invalid code point - use replacement character
-    result = "\xEF\xBF\xBD";
-  }
-  return result;
 }
 
 // HTML named entity map (common entities from CommonMark spec)
@@ -1110,26 +1306,61 @@ class InlineParser {
     return result;
   }
 
+  // Find the start position of the UTF-8 character before the given position
+  size_t FindPrevCharStart(size_t pos) const {
+    if (pos == 0) return 0;
+    size_t i = pos - 1;
+    // Walk back through continuation bytes (10xxxxxx)
+    while (i > 0 && (static_cast<unsigned char>(text_[i]) & 0xC0) == 0x80) {
+      --i;
+    }
+    return i;
+  }
+
   bool IsLeftFlanking(size_t pos, size_t length) {
     if (pos + length >= text_.size()) return false;
-    char after = text_[pos + length];
-    if (detail::IsUnicodeWhitespace(after)) return false;
-    if (!detail::IsAsciiPunctuation(after)) return true;
-    if (pos == 0) return true;
-    char before = text_[pos - 1];
-    return detail::IsUnicodeWhitespace(before) ||
-           detail::IsAsciiPunctuation(before);
+
+    // Get code point after the delimiter run
+    auto [after_cp, after_len] = detail::DecodeUtf8At(text_, pos + length);
+
+    // Not left-flanking if followed by Unicode whitespace
+    if (detail::IsUnicodeWhitespaceCodepoint(after_cp)) return false;
+
+    // Left-flanking if not followed by Unicode punctuation
+    if (!detail::IsUnicodePunctuation(after_cp)) return true;
+
+    // Followed by punctuation - check if preceded by whitespace or punctuation
+    if (pos == 0) return true;  // Start of string is like whitespace
+
+    // Get code point before the delimiter run
+    size_t before_start = FindPrevCharStart(pos);
+    auto [before_cp, before_len] = detail::DecodeUtf8At(text_, before_start);
+
+    return detail::IsUnicodeWhitespaceCodepoint(before_cp) ||
+           detail::IsUnicodePunctuation(before_cp);
   }
 
   bool IsRightFlanking(size_t pos, size_t length) {
     if (pos == 0) return false;
-    char before = text_[pos - 1];
-    if (detail::IsUnicodeWhitespace(before)) return false;
-    if (!detail::IsAsciiPunctuation(before)) return true;
-    if (pos + length >= text_.size()) return true;
-    char after = text_[pos + length];
-    return detail::IsUnicodeWhitespace(after) ||
-           detail::IsAsciiPunctuation(after);
+
+    // Get code point before the delimiter run
+    size_t before_start = FindPrevCharStart(pos);
+    auto [before_cp, before_len] = detail::DecodeUtf8At(text_, before_start);
+
+    // Not right-flanking if preceded by Unicode whitespace
+    if (detail::IsUnicodeWhitespaceCodepoint(before_cp)) return false;
+
+    // Right-flanking if not preceded by Unicode punctuation
+    if (!detail::IsUnicodePunctuation(before_cp)) return true;
+
+    // Preceded by punctuation - check if followed by whitespace or punctuation
+    if (pos + length >= text_.size()) return true;  // End of string is like whitespace
+
+    // Get code point after the delimiter run
+    auto [after_cp, after_len] = detail::DecodeUtf8At(text_, pos + length);
+
+    return detail::IsUnicodeWhitespaceCodepoint(after_cp) ||
+           detail::IsUnicodePunctuation(after_cp);
   }
 
   std::vector<DelimiterNode>::iterator FindLinkOpener(
@@ -2583,11 +2814,6 @@ class BlockParser {
       std::string_view bq_line = CurrentLine();
       int bq_indent = detail::CountIndent(bq_line);
 
-      if (bq_indent >= 4) {
-        // Could be lazy continuation
-        if (quote_lines.empty()) break;
-      }
-
       auto bq_trimmed = detail::TrimLeft(bq_line);
 
       if (bq_trimmed.starts_with(">")) {
@@ -2599,6 +2825,11 @@ class BlockParser {
         // Lazy continuation - only for paragraphs
         // Check if this could be a paragraph continuation
         bool is_continuation = true;
+
+        // Indented code blocks (4+ spaces) cannot be lazy continuation
+        if (bq_indent >= 4) {
+          is_continuation = false;
+        }
 
         // Check for block-level interrupts
         if (bq_trimmed.starts_with("#") || bq_trimmed.starts_with("```") ||
@@ -2612,7 +2843,9 @@ class BlockParser {
         }
 
         if (is_continuation) {
-          quote_lines.push_back(std::string(bq_trimmed));
+          // Mark lazy continuation with special prefix to prevent setext heading
+          // 0x01 (SOH) is stripped by TrimLeft and prevents setext matching
+          quote_lines.push_back(std::string(1, '\x01') + std::string(bq_trimmed));
           Advance();
         } else {
           break;
@@ -3017,7 +3250,8 @@ class BlockParser {
       auto trimmed = detail::TrimLeft(line);
 
       // Check for setext heading underline
-      if (!para_lines.empty() && indent < 4) {
+      // Skip lines marked with \x01 (lazy continuation in blockquotes)
+      if (!para_lines.empty() && indent < 4 && !line.starts_with("\x01")) {
         if (!trimmed.empty() && (trimmed[0] == '=' || trimmed[0] == '-')) {
           char underline_char = trimmed[0];
           // Find where underline chars end
@@ -3218,7 +3452,12 @@ class BlockParser {
         }
       }
 
-      para_lines.push_back(std::string(trimmed));
+      // Strip \x01 marker used for lazy continuation lines
+      if (!trimmed.empty() && trimmed[0] == '\x01') {
+        para_lines.push_back(std::string(trimmed.substr(1)));
+      } else {
+        para_lines.push_back(std::string(trimmed));
+      }
       Advance();
     }
 

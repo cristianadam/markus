@@ -1206,10 +1206,13 @@ class InlineParser {
               result.push_back(std::move(link));
             }
 
-            // Deactivate openers
-            for (auto it = opener; it != delimiter_stack.end(); ++it) {
-              if (it->delimiter == '[' || it->delimiter == '!') {
-                it->active = false;
+            // Deactivate openers - when a link (not image) is formed,
+            // all preceding [ openers are also deactivated (no nested links)
+            if (!is_image) {
+              for (auto& d : delimiter_stack) {
+                if (d.delimiter == '[') {
+                  d.active = false;
+                }
               }
             }
             delimiter_stack.erase(opener, delimiter_stack.end());
@@ -1256,7 +1259,7 @@ class InlineParser {
               Image img;
               img.destination = std::move(ref_result->first);
               img.title = std::move(ref_result->second);
-              img.alt_text = label_text;
+              img.alt_text = GetAltText(link_content);
               result.push_back(std::move(img));
             } else {
               Link link;
@@ -1266,9 +1269,13 @@ class InlineParser {
               result.push_back(std::move(link));
             }
 
-            for (auto it = opener; it != delimiter_stack.end(); ++it) {
-              if (it->delimiter == '[' || it->delimiter == '!') {
-                it->active = false;
+            // Deactivate openers - when a link (not image) is formed,
+            // all preceding [ openers are also deactivated (no nested links)
+            if (!is_image) {
+              for (auto& d : delimiter_stack) {
+                if (d.delimiter == '[') {
+                  d.active = false;
+                }
               }
             }
             delimiter_stack.erase(opener, delimiter_stack.end());
@@ -1829,18 +1836,16 @@ class InlineParser {
               result += arg.content;
             } else if constexpr (std::is_same_v<T, SoftBreak>) {
               result += ' ';
+            } else if constexpr (std::is_same_v<T, HardBreak>) {
+              result += ' ';
             } else if constexpr (std::is_same_v<T, Emphasis>) {
-              // Recursively get alt text
-              for (const auto& child : arg.children) {
-                std::visit(
-                    [&result](auto&& inner) {
-                      using U = std::decay_t<decltype(inner)>;
-                      if constexpr (std::is_same_v<U, Text>) {
-                        result += inner.content;
-                      }
-                    },
-                    child);
-              }
+              result += GetAltText(arg.children);
+            } else if constexpr (std::is_same_v<T, Strong>) {
+              result += GetAltText(arg.children);
+            } else if constexpr (std::is_same_v<T, Link>) {
+              result += GetAltText(arg.children);
+            } else if constexpr (std::is_same_v<T, Image>) {
+              result += arg.alt_text;
             }
           },
           node);
@@ -2863,26 +2868,90 @@ class BlockParser {
           valid_tag = (next == ' ' || next == '\t' || next == '/' || next == '>');
         }
         if (valid_tag) {
-          // Find the closing > of this tag
+          // Validate attributes properly for type 7 HTML block
           size_t search_pos = tag_end;
-          bool in_quote = false;
-          char quote_char = 0;
-          while (search_pos < trimmed.size()) {
+          bool valid_attributes = true;
+
+          while (search_pos < trimmed.size() && valid_attributes) {
             char c = trimmed[search_pos];
-            if (in_quote) {
-              if (c == quote_char) in_quote = false;
-            } else {
-              if (c == '"' || c == '\'') {
-                in_quote = true;
-                quote_char = c;
-              } else if (c == '>') {
-                break;
+
+            if (c == '>') {
+              break;  // Found end of tag
+            } else if (c == '/') {
+              // Self-closing, must be followed by >
+              if (search_pos + 1 < trimmed.size() &&
+                  trimmed[search_pos + 1] == '>') {
+                search_pos++;  // Will break on next iteration
+              } else {
+                valid_attributes = false;
               }
+            } else if (c == ' ' || c == '\t' || c == '\n') {
+              ++search_pos;  // Skip whitespace
+            } else if (std::isalpha(static_cast<unsigned char>(c)) ||
+                       c == '_' || c == ':') {
+              // Start of attribute name
+              ++search_pos;
+              while (search_pos < trimmed.size()) {
+                char ac = trimmed[search_pos];
+                if (std::isalnum(static_cast<unsigned char>(ac)) ||
+                    ac == '_' || ac == ':' || ac == '.' || ac == '-') {
+                  ++search_pos;
+                } else {
+                  break;
+                }
+              }
+              // Skip whitespace after attribute name
+              while (search_pos < trimmed.size() &&
+                     (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t' ||
+                      trimmed[search_pos] == '\n')) {
+                ++search_pos;
+              }
+              // Optional attribute value
+              if (search_pos < trimmed.size() && trimmed[search_pos] == '=') {
+                ++search_pos;
+                // Skip whitespace after =
+                while (search_pos < trimmed.size() &&
+                       (trimmed[search_pos] == ' ' ||
+                        trimmed[search_pos] == '\t' ||
+                        trimmed[search_pos] == '\n')) {
+                  ++search_pos;
+                }
+                if (search_pos >= trimmed.size()) {
+                  valid_attributes = false;
+                } else if (trimmed[search_pos] == '"' ||
+                           trimmed[search_pos] == '\'') {
+                  char quote = trimmed[search_pos];
+                  ++search_pos;
+                  while (search_pos < trimmed.size() &&
+                         trimmed[search_pos] != quote) {
+                    ++search_pos;
+                  }
+                  if (search_pos >= trimmed.size()) {
+                    valid_attributes = false;
+                  } else {
+                    ++search_pos;  // Skip closing quote
+                  }
+                } else {
+                  // Unquoted value
+                  while (search_pos < trimmed.size()) {
+                    char vc = trimmed[search_pos];
+                    if (vc == ' ' || vc == '\t' || vc == '\n' || vc == '"' ||
+                        vc == '\'' || vc == '=' || vc == '<' || vc == '>' ||
+                        vc == '`') {
+                      break;
+                    }
+                    ++search_pos;
+                  }
+                }
+              }
+            } else {
+              // Invalid character - not valid HTML tag
+              valid_attributes = false;
             }
-            ++search_pos;
           }
 
-          if (search_pos < trimmed.size() && trimmed[search_pos] == '>') {
+          if (valid_attributes && search_pos < trimmed.size() &&
+              trimmed[search_pos] == '>') {
             // Check that rest of line is only whitespace
             bool only_whitespace = true;
             for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {

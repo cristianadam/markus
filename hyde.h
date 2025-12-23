@@ -1009,7 +1009,8 @@ class InlineParser {
       link_references_ = nullptr;
 
   struct DelimiterNode {
-    size_t pos;
+    size_t pos;        // Position in result vector
+    size_t text_pos;   // Position in original text (for extracting raw labels)
     size_t count;
     char delimiter;
     bool can_open;
@@ -1126,8 +1127,8 @@ class InlineParser {
         flush_text();
 
         // Add delimiter to stack
-        delimiter_stack.push_back(
-            {result.size(), run_length, c, can_open, can_close, true, &result});
+        delimiter_stack.push_back({result.size(), pos_, run_length, c, can_open,
+                                   can_close, true, &result});
 
         // Add the delimiter characters as text for now
         result.push_back(Text(std::string(run_length, c)));
@@ -1142,8 +1143,10 @@ class InlineParser {
         flush_text();
 
         size_t bracket_pos = result.size();
-        delimiter_stack.push_back(
-            {bracket_pos, 1, is_image ? '!' : '[', true, false, true, &result});
+        size_t bracket_text_pos = pos_;  // Position in original text
+        delimiter_stack.push_back({bracket_pos, bracket_text_pos, 1,
+                                   is_image ? '!' : '[', true, false, true,
+                                   &result});
 
         if (is_image) {
           result.push_back(Text("!["));
@@ -1585,23 +1588,28 @@ class InlineParser {
         !std::isalpha(static_cast<unsigned char>(text_[end]))) {
       // Check for comment, CDATA, processing instruction, or declaration
       if (text_.substr(pos_).starts_with("<!--")) {
-        // Check that what follows is not > or -> (per CommonMark spec)
-        bool valid_comment = false;
+        // Per CommonMark spec: <!--> and <!---> are valid (immediately closed)
+        // Otherwise, find --> to close, but text must not start with > or ->
         if (pos_ + 4 < text_.size()) {
           char next = text_[pos_ + 4];
-          if (next != '>' && !(next == '-' && pos_ + 5 < text_.size() &&
-                               text_[pos_ + 5] == '>')) {
-            valid_comment = true;
+          if (next == '>') {
+            // <!--> is a valid immediately-closed comment
+            pos_ = pos_ + 5;
+            return HtmlInline(std::string(text_.substr(start, pos_ - start)));
           }
-        } else if (pos_ + 4 == text_.size()) {
-          valid_comment = true;  // Just "<!--" at end
-        }
-        if (valid_comment) {
+          if (next == '-' && pos_ + 5 < text_.size() && text_[pos_ + 5] == '>') {
+            // <!---> is a valid immediately-closed comment
+            pos_ = pos_ + 6;
+            return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+          }
+          // Normal comment: find -->
           end = text_.find("-->", pos_ + 4);
           if (end != std::string_view::npos) {
             pos_ = end + 3;
             return HtmlInline(std::string(text_.substr(start, pos_ - start)));
           }
+        } else if (pos_ + 4 == text_.size()) {
+          // Just "<!--" at end - not a valid comment, leave as text
         }
       }
       if (text_.substr(pos_).starts_with("<![CDATA[")) {
@@ -2012,6 +2020,7 @@ class BlockParser {
     Document doc;
     lines_ = detail::SplitLines(input);
     line_idx_ = 0;
+    parent_link_refs_ = &doc.link_references;
 
     // First pass: extract link reference definitions
     ExtractLinkReferences(doc);
@@ -2030,6 +2039,8 @@ class BlockParser {
  private:
   std::vector<std::string> lines_;
   size_t line_idx_ = 0;
+  std::unordered_map<std::string, std::pair<std::string, std::string>>*
+      parent_link_refs_ = nullptr;
 
   bool AtEnd() const { return line_idx_ >= lines_.size(); }
 
@@ -2227,31 +2238,82 @@ class BlockParser {
         continue;
       }
 
-      // Find closing bracket (handling escapes)
-      size_t close_bracket = FindClosingBracket(trimmed, 1);
-      if (close_bracket == std::string_view::npos ||
-          close_bracket + 1 >= trimmed.size() ||
-          trimmed[close_bracket + 1] != ':') {
-        prev_line_had_content = true;
-        Advance();
-        continue;
-      }
-
-      std::string label_raw(trimmed.substr(1, close_bracket - 1));
-      // Decode escapes in label for normalization and matching
-      std::string label = detail::DecodeEscapesAndEntities(label_raw);
-      std::string normalized = detail::NormalizeLinkLabel(label);
-      if (normalized.empty()) {
-        prev_line_had_content = true;
-        Advance();
-        continue;
-      }
-
-      // Get rest of first line after ':'
-      std::string_view rest =
-          detail::TrimLeft(trimmed.substr(close_bracket + 2));
+      // Find closing bracket (handling escapes, may span multiple lines)
       size_t start_line = line_idx_;
-      Advance();
+      std::string label_raw;
+      std::string_view rest;
+      bool found_close = false;
+
+      // First check if closing bracket is on the same line
+      size_t close_bracket = FindClosingBracket(trimmed, 1);
+      if (close_bracket != std::string_view::npos &&
+          close_bracket + 1 < trimmed.size() && trimmed[close_bracket + 1] == ':') {
+        label_raw = std::string(trimmed.substr(1, close_bracket - 1));
+        rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
+        found_close = true;
+        Advance();
+      } else {
+        // Try multi-line label (label can span multiple lines)
+        label_raw = std::string(trimmed.substr(1));  // Content after '['
+        Advance();
+
+        // Collect lines until we find ']:' (limit to reasonable number of lines)
+        int lines_collected = 0;
+        while (!AtEnd() && lines_collected < 50) {
+          std::string_view next_line = CurrentLine();
+          auto next_trimmed = detail::TrimLeft(next_line);
+
+          // Look for ]: at the start of a line (allowing leading whitespace)
+          size_t colon_pos = next_trimmed.find("]:");
+          if (colon_pos != std::string_view::npos) {
+            // Found it - check if there's no unescaped ] before this position
+            bool valid = true;
+            for (size_t j = 0; j < colon_pos; ++j) {
+              if (next_trimmed[j] == '\\' && j + 1 < colon_pos) {
+                ++j;  // Skip escaped char
+              } else if (next_trimmed[j] == ']') {
+                valid = false;  // Unmatched ] before ]:
+                break;
+              }
+            }
+            if (valid) {
+              label_raw += '\n';
+              label_raw += std::string(next_trimmed.substr(0, colon_pos));
+              rest = detail::TrimLeft(next_trimmed.substr(colon_pos + 2));
+              found_close = true;
+              Advance();
+              break;
+            }
+          }
+
+          // Check for blank line - that ends the attempt
+          if (detail::IsBlankLine(next_line)) {
+            break;
+          }
+
+          // Continue collecting label content
+          label_raw += '\n';
+          label_raw += std::string(next_trimmed);
+          Advance();
+          ++lines_collected;
+        }
+      }
+
+      if (!found_close) {
+        line_idx_ = start_line;
+        prev_line_had_content = true;
+        Advance();
+        continue;
+      }
+
+      // Normalize label for matching (WITHOUT decoding escapes per CommonMark spec)
+      std::string normalized = detail::NormalizeLinkLabel(label_raw);
+      if (normalized.empty()) {
+        line_idx_ = start_line;
+        prev_line_had_content = true;
+        Advance();
+        continue;
+      }
 
       // Destination might be on next line (no indentation required)
       if (rest.empty() || detail::IsBlankLine(rest)) {
@@ -2465,20 +2527,72 @@ class BlockParser {
     auto trimmed = detail::TrimLeft(line);
     if (!trimmed.starts_with('[')) return false;
 
+    // Find closing bracket (handling escapes, may span multiple lines)
+    size_t start_line = line_idx_;
+    std::string label_raw;
+    std::string_view rest;
+    bool found_close = false;
+
+    // First check if closing bracket is on the same line
     size_t close_bracket = FindClosingBracket(trimmed, 1);
-    if (close_bracket == std::string_view::npos ||
-        close_bracket + 1 >= trimmed.size() ||
-        trimmed[close_bracket + 1] != ':') {
+    if (close_bracket != std::string_view::npos &&
+        close_bracket + 1 < trimmed.size() && trimmed[close_bracket + 1] == ':') {
+      label_raw = std::string(trimmed.substr(1, close_bracket - 1));
+      rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
+      found_close = true;
+      Advance();
+    } else {
+      // Try multi-line label
+      label_raw = std::string(trimmed.substr(1));
+      Advance();
+
+      int lines_collected = 0;
+      while (!AtEnd() && lines_collected < 50) {
+        std::string_view next_line = CurrentLine();
+        auto next_trimmed = detail::TrimLeft(next_line);
+
+        size_t colon_pos = next_trimmed.find("]:");
+        if (colon_pos != std::string_view::npos) {
+          bool valid = true;
+          for (size_t j = 0; j < colon_pos; ++j) {
+            if (next_trimmed[j] == '\\' && j + 1 < colon_pos) {
+              ++j;
+            } else if (next_trimmed[j] == ']') {
+              valid = false;
+              break;
+            }
+          }
+          if (valid) {
+            label_raw += '\n';
+            label_raw += std::string(next_trimmed.substr(0, colon_pos));
+            rest = detail::TrimLeft(next_trimmed.substr(colon_pos + 2));
+            found_close = true;
+            Advance();
+            break;
+          }
+        }
+
+        if (detail::IsBlankLine(next_line)) {
+          break;
+        }
+
+        label_raw += '\n';
+        label_raw += std::string(next_trimmed);
+        Advance();
+        ++lines_collected;
+      }
+    }
+
+    if (!found_close) {
+      line_idx_ = start_line;
       return false;
     }
 
-    std::string label(trimmed.substr(1, close_bracket - 1));
-    std::string normalized = detail::NormalizeLinkLabel(label);
-    if (normalized.empty()) return false;
-
-    std::string_view rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
-    size_t start_line = line_idx_;
-    Advance();
+    std::string normalized = detail::NormalizeLinkLabel(label_raw);
+    if (normalized.empty()) {
+      line_idx_ = start_line;
+      return false;
+    }
 
     // Destination might be on next line (no indentation required)
     if (rest.empty() || detail::IsBlankLine(rest)) {
@@ -3226,9 +3340,13 @@ class BlockParser {
 
         if (is_continuation) {
           // Mark lazy continuation with special prefix to prevent setext
-          // heading
-          quote_lines.push_back(std::string(1, '\x01') +
-                                std::string(bq_trimmed));
+          // heading (but don't add if already marked)
+          if (!bq_trimmed.empty() && bq_trimmed[0] == '\x01') {
+            quote_lines.push_back(std::string(bq_trimmed));
+          } else {
+            quote_lines.push_back(std::string(1, '\x01') +
+                                  std::string(bq_trimmed));
+          }
           last_line_was_blank = false;
           // Lazy continuation continues the paragraph
           in_paragraph = true;
@@ -3253,6 +3371,15 @@ class BlockParser {
 
     BlockParser nested_parser;
     Document nested_doc = nested_parser.Parse(quote_content);
+
+    // Promote link references from nested document to parent
+    if (parent_link_refs_) {
+      for (const auto& [label, dest_title] : nested_doc.link_references) {
+        if (parent_link_refs_->find(label) == parent_link_refs_->end()) {
+          parent_link_refs_->insert({label, dest_title});
+        }
+      }
+    }
 
     BlockQuote bq;
     bq.children = std::move(nested_doc.children);
@@ -3465,6 +3592,32 @@ class BlockParser {
         int required_indent = content_start;
         bool first_line_empty = first_content.empty() ||
                                 detail::IsBlankLine(first_content);
+
+        // Track fenced code blocks to ignore blank lines within them
+        bool in_item_fenced_code = false;
+        char item_fence_char = 0;
+        size_t item_fence_length = 0;
+
+        // Track if we've seen a nested list marker (indent 1-3)
+        // This helps distinguish nested content from direct code blocks
+        bool has_nested_list = false;
+
+        // Check if first line starts a fenced code block
+        auto first_trimmed = detail::TrimLeft(first_content);
+        if (!first_trimmed.empty() &&
+            (first_trimmed[0] == '`' || first_trimmed[0] == '~')) {
+          size_t fence_len = 0;
+          while (fence_len < first_trimmed.size() &&
+                 first_trimmed[fence_len] == first_trimmed[0]) {
+            ++fence_len;
+          }
+          if (fence_len >= 3) {
+            in_item_fenced_code = true;
+            item_fence_char = first_trimmed[0];
+            item_fence_length = fence_len;
+          }
+        }
+
         while (!AtEnd()) {
           std::string_view cont_line = CurrentLine();
 
@@ -3477,7 +3630,10 @@ class BlockParser {
               break;  // End item - don't collect more lines
             }
             item_lines.push_back("");
-            had_blank_line = true;
+            // Only count blank lines outside fenced code blocks
+            if (!in_item_fenced_code) {
+              had_blank_line = true;
+            }
             Advance();
             continue;
           }
@@ -3578,20 +3734,91 @@ class BlockParser {
             // End list if not properly indented
             if (!had_blank_line) {
               // Lazy continuation - mark with \x01 to prevent block parsing
-              item_lines.push_back(std::string(1, '\x01') +
-                                   std::string(cont_trimmed));
+              // (but don't add if already marked)
+              if (!cont_trimmed.empty() && cont_trimmed[0] == '\x01') {
+                item_lines.push_back(std::string(cont_trimmed));
+              } else {
+                item_lines.push_back(std::string(1, '\x01') +
+                                     std::string(cont_trimmed));
+              }
               Advance();
             } else {
               break;
             }
           } else {
             // Properly indented continuation - remove required_indent spaces
-            // If there was a blank line before this content, list becomes loose
-            if (had_blank_line) {
-              list.is_tight = false;
-            }
             std::string dedented =
                 detail::RemoveIndent(expanded_cont, required_indent);
+
+            // Track fenced code blocks
+            auto dedented_trimmed = detail::TrimLeft(dedented);
+            int dedented_indent = detail::CountIndent(dedented);
+            if (!in_item_fenced_code && dedented_indent < 4 &&
+                !dedented_trimmed.empty() &&
+                (dedented_trimmed[0] == '`' || dedented_trimmed[0] == '~')) {
+              size_t fence_len = 0;
+              while (fence_len < dedented_trimmed.size() &&
+                     dedented_trimmed[fence_len] == dedented_trimmed[0]) {
+                ++fence_len;
+              }
+              if (fence_len >= 3) {
+                in_item_fenced_code = true;
+                item_fence_char = dedented_trimmed[0];
+                item_fence_length = fence_len;
+              }
+            } else if (in_item_fenced_code && !dedented_trimmed.empty() &&
+                       dedented_trimmed[0] == item_fence_char) {
+              size_t close_len = 0;
+              while (close_len < dedented_trimmed.size() &&
+                     dedented_trimmed[close_len] == item_fence_char) {
+                ++close_len;
+              }
+              if (close_len >= item_fence_length) {
+                bool is_close = true;
+                for (size_t j = close_len; j < dedented_trimmed.size(); ++j) {
+                  if (dedented_trimmed[j] != ' ' &&
+                      dedented_trimmed[j] != '\t') {
+                    is_close = false;
+                    break;
+                  }
+                }
+                if (is_close) in_item_fenced_code = false;
+              }
+            }
+
+            // Check for nested list markers (indent 0-3 with list marker)
+            if (!has_nested_list && dedented_indent >= 0 && dedented_indent < 4 &&
+                !dedented_trimmed.empty()) {
+              char fc = dedented_trimmed[0];
+              if (fc == '-' || fc == '+' || fc == '*') {
+                if (dedented_trimmed.size() == 1 || dedented_trimmed[1] == ' ' ||
+                    dedented_trimmed[1] == '\t') {
+                  has_nested_list = true;
+                }
+              } else if (std::isdigit(static_cast<unsigned char>(fc))) {
+                size_t ne = 0;
+                while (ne < dedented_trimmed.size() &&
+                       std::isdigit(
+                           static_cast<unsigned char>(dedented_trimmed[ne]))) {
+                  ++ne;
+                }
+                if (ne > 0 && ne < dedented_trimmed.size() &&
+                    (dedented_trimmed[ne] == '.' || dedented_trimmed[ne] == ')')) {
+                  has_nested_list = true;
+                }
+              }
+            }
+
+            // If there was a blank line before this content, list becomes loose
+            // ONLY if the content is at the item's direct level:
+            // - indent 0: direct paragraph
+            // - indent >= 4 AND no nested list: direct indented code block
+            if (had_blank_line) {
+              if (dedented_indent == 0 ||
+                  (dedented_indent >= 4 && !has_nested_list)) {
+                list.is_tight = false;
+              }
+            }
             item_lines.push_back(dedented);
             Advance();
             had_blank_line = false;
@@ -3614,6 +3841,15 @@ class BlockParser {
           BlockParser item_parser;
           Document item_doc = item_parser.Parse(item_content);
           item.children = std::move(item_doc.children);
+
+          // Promote link references from nested document to parent
+          if (parent_link_refs_) {
+            for (const auto& [label, dest_title] : item_doc.link_references) {
+              if (parent_link_refs_->find(label) == parent_link_refs_->end()) {
+                parent_link_refs_->insert({label, dest_title});
+              }
+            }
+          }
         }
 
         list.items.push_back(std::move(item));

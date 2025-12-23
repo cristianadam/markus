@@ -1583,10 +1583,22 @@ class InlineParser {
         !std::isalpha(static_cast<unsigned char>(text_[end]))) {
       // Check for comment, CDATA, processing instruction, or declaration
       if (text_.substr(pos_).starts_with("<!--")) {
-        end = text_.find("-->", pos_ + 4);
-        if (end != std::string_view::npos) {
-          pos_ = end + 3;
-          return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+        // Check that what follows is not > or -> (per CommonMark spec)
+        bool valid_comment = false;
+        if (pos_ + 4 < text_.size()) {
+          char next = text_[pos_ + 4];
+          if (next != '>' && !(next == '-' && pos_ + 5 < text_.size() && text_[pos_ + 5] == '>')) {
+            valid_comment = true;
+          }
+        } else if (pos_ + 4 == text_.size()) {
+          valid_comment = true;  // Just "<!--" at end
+        }
+        if (valid_comment) {
+          end = text_.find("-->", pos_ + 4);
+          if (end != std::string_view::npos) {
+            pos_ = end + 3;
+            return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+          }
         }
       }
       if (text_.substr(pos_).starts_with("<![CDATA[")) {
@@ -1623,12 +1635,20 @@ class InlineParser {
 
     // Skip attributes and find closing - must follow HTML tag syntax
     // After tag name, expect whitespace, /, or > - anything else is invalid
+    // For closing tags, only whitespace and > are allowed (no attributes)
     bool seen_whitespace = false;
     while (end < text_.size()) {
       char c = text_[end];
       if (c == '>') {
         pos_ = end + 1;
         return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+      } else if (is_closing) {
+        // Closing tags: only whitespace allowed before >
+        if (c == ' ' || c == '\t' || c == '\n') {
+          ++end;
+        } else {
+          return std::nullopt;  // Invalid char in closing tag
+        }
       } else if (c == '/') {
         // Self-closing: must be followed by >
         if (end + 1 < text_.size() && text_[end + 1] == '>') {
@@ -1643,6 +1663,7 @@ class InlineParser {
                  (std::isalpha(static_cast<unsigned char>(c)) || c == '_' ||
                   c == ':')) {
         // Start of attribute name (must be preceded by whitespace)
+        seen_whitespace = false;  // Reset - need whitespace before next attr
         ++end;
         while (end < text_.size()) {
           char ac = text_[end];
@@ -1657,6 +1678,7 @@ class InlineParser {
         // Skip whitespace
         while (end < text_.size() &&
                (text_[end] == ' ' || text_[end] == '\t' || text_[end] == '\n')) {
+          seen_whitespace = true;
           ++end;
         }
         if (end < text_.size() && text_[end] == '=') {
@@ -2758,9 +2780,20 @@ class BlockParser {
     }
 
     // Type 2: <!-- comment -->
+    // The text after <!-- cannot start with > or -> (per CommonMark spec)
     if (block_type == 0 && trimmed.starts_with("<!--")) {
-      block_type = 2;
-      end_condition = "-->";
+      // Check that what follows is not > or ->
+      if (trimmed.size() > 4) {
+        char next = trimmed[4];
+        if (next != '>' && !(next == '-' && trimmed.size() > 5 && trimmed[5] == '>')) {
+          block_type = 2;
+          end_condition = "-->";
+        }
+      } else if (trimmed.size() == 4) {
+        // Just "<!--" with nothing after - valid start
+        block_type = 2;
+        end_condition = "-->";
+      }
     }
 
     // Type 3: <? processing instruction ?>
@@ -2868,9 +2901,33 @@ class BlockParser {
           valid_tag = (next == ' ' || next == '\t' || next == '/' || next == '>');
         }
         if (valid_tag) {
+          // For closing tags, only whitespace is allowed after tag name
+          if (is_closing) {
+            size_t search_pos = tag_end;
+            // Skip whitespace
+            while (search_pos < trimmed.size() &&
+                   (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t')) {
+              ++search_pos;
+            }
+            // Must end with >
+            if (search_pos < trimmed.size() && trimmed[search_pos] == '>') {
+              // Check rest is whitespace
+              bool only_whitespace = true;
+              for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {
+                if (trimmed[j] != ' ' && trimmed[j] != '\t') {
+                  only_whitespace = false;
+                  break;
+                }
+              }
+              if (only_whitespace) {
+                block_type = 7;
+              }
+            }
+          } else {
           // Validate attributes properly for type 7 HTML block
           size_t search_pos = tag_end;
           bool valid_attributes = true;
+          bool need_whitespace = false;  // Track if we need whitespace before next attribute
 
           while (search_pos < trimmed.size() && valid_attributes) {
             char c = trimmed[search_pos];
@@ -2887,9 +2944,11 @@ class BlockParser {
               }
             } else if (c == ' ' || c == '\t' || c == '\n') {
               ++search_pos;  // Skip whitespace
-            } else if (std::isalpha(static_cast<unsigned char>(c)) ||
-                       c == '_' || c == ':') {
-              // Start of attribute name
+              need_whitespace = false;  // Whitespace seen
+            } else if (!need_whitespace &&
+                       (std::isalpha(static_cast<unsigned char>(c)) ||
+                        c == '_' || c == ':')) {
+              // Start of attribute name (must have whitespace before if not first)
               ++search_pos;
               while (search_pos < trimmed.size()) {
                 char ac = trimmed[search_pos];
@@ -2905,6 +2964,7 @@ class BlockParser {
                      (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t' ||
                       trimmed[search_pos] == '\n')) {
                 ++search_pos;
+                need_whitespace = false;
               }
               // Optional attribute value
               if (search_pos < trimmed.size() && trimmed[search_pos] == '=') {
@@ -2930,6 +2990,7 @@ class BlockParser {
                     valid_attributes = false;
                   } else {
                     ++search_pos;  // Skip closing quote
+                    need_whitespace = true;  // Need whitespace before next attr
                   }
                 } else {
                   // Unquoted value
@@ -2942,6 +3003,7 @@ class BlockParser {
                     }
                     ++search_pos;
                   }
+                  need_whitespace = true;  // Need whitespace before next attr
                 }
               }
             } else {
@@ -2964,6 +3026,7 @@ class BlockParser {
               block_type = 7;
             }
           }
+          }  // End of else for opening tags
         }
       }
     }

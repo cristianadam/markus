@@ -1178,6 +1178,17 @@ class InlineParser {
               link_content.push_back(std::move(result[i]));
             }
 
+            // Extract delimiters that belong to link content and process emphasis
+            std::vector<DelimiterNode> link_delimiters;
+            for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
+              if (it->pos > opener->pos && it->pos < result.size()) {
+                DelimiterNode d = *it;
+                d.pos -= (opener->pos + 1);  // Adjust to link_content indices
+                link_delimiters.push_back(d);
+              }
+            }
+            ProcessEmphasis(link_content, link_delimiters);
+
             // Remove everything from opener position
             result.resize(opener->pos);
 
@@ -1227,6 +1238,17 @@ class InlineParser {
             for (size_t i = opener->pos + 1; i < result.size(); ++i) {
               link_content.push_back(std::move(result[i]));
             }
+
+            // Extract delimiters that belong to link content and process emphasis
+            std::vector<DelimiterNode> link_delimiters;
+            for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
+              if (it->pos > opener->pos && it->pos < result.size()) {
+                DelimiterNode d = *it;
+                d.pos -= (opener->pos + 1);  // Adjust to link_content indices
+                link_delimiters.push_back(d);
+              }
+            }
+            ProcessEmphasis(link_content, link_delimiters);
 
             result.resize(opener->pos);
 
@@ -3091,11 +3113,18 @@ class BlockParser {
     int marker_width = 0;
 
     if (trimmed[0] == '-' || trimmed[0] == '+' || trimmed[0] == '*') {
-      if (trimmed.size() < 2 || (trimmed[1] != ' ' && trimmed[1] != '\t')) {
+      // Allow empty list items (just the bullet with nothing after)
+      // or bullet followed by space/tab
+      if (trimmed.size() == 1) {
+        // Just the bullet character - empty list item
+        bullet_char = trimmed[0];
+        marker_width = 1;
+      } else if (trimmed[1] == ' ' || trimmed[1] == '\t') {
+        bullet_char = trimmed[0];
+        marker_width = 2;
+      } else {
         return std::nullopt;
       }
-      bullet_char = trimmed[0];
-      marker_width = 2;
     } else if (std::isdigit(static_cast<unsigned char>(trimmed[0]))) {
       // Ordered list
       is_ordered = true;
@@ -3189,9 +3218,12 @@ class BlockParser {
         }
       } else {
         if (item_indent < 4 && !item_trimmed.empty() &&
-            item_trimmed[0] == bullet_char && item_trimmed.size() >= 2 &&
-            (item_trimmed[1] == ' ' || item_trimmed[1] == '\t')) {
-          is_new_item = true;
+            item_trimmed[0] == bullet_char) {
+          // Match if: just the bullet, or bullet followed by space/tab
+          if (item_trimmed.size() == 1 ||
+              item_trimmed[1] == ' ' || item_trimmed[1] == '\t') {
+            is_new_item = true;
+          }
         }
       }
 
@@ -3298,9 +3330,12 @@ class BlockParser {
                 is_another_item = true;
               }
             } else if (!is_ordered && !cont_trimmed.empty() &&
-                       cont_trimmed[0] == bullet_char &&
-                       cont_trimmed.size() >= 2 && cont_trimmed[1] == ' ') {
-              is_another_item = true;
+                       cont_trimmed[0] == bullet_char) {
+              // Match if: just the bullet, or bullet followed by space/tab
+              if (cont_trimmed.size() == 1 ||
+                  cont_trimmed[1] == ' ' || cont_trimmed[1] == '\t') {
+                is_another_item = true;
+              }
             }
           }
 
@@ -3312,12 +3347,15 @@ class BlockParser {
           if (cont_indent < required_indent) {
             // Check for different list type (different bullet or delimiter)
             // A different bullet/delimiter starts a new list
-            if (!is_ordered && cont_trimmed.size() >= 2 &&
+            if (!is_ordered && !cont_trimmed.empty() &&
                 (cont_trimmed[0] == '-' || cont_trimmed[0] == '+' ||
                  cont_trimmed[0] == '*') &&
-                (cont_trimmed[1] == ' ' || cont_trimmed[1] == '\t') &&
                 cont_trimmed[0] != bullet_char) {
-              break;  // Different bullet starts new list
+              // Valid list marker: just bullet, or bullet + space/tab
+              if (cont_trimmed.size() == 1 ||
+                  cont_trimmed[1] == ' ' || cont_trimmed[1] == '\t') {
+                break;  // Different bullet starts new list
+              }
             }
             if (is_ordered && !cont_trimmed.empty() &&
                 std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {

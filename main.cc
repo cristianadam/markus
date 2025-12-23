@@ -1,6 +1,3 @@
-// Copyright 2024 Hyde Authors
-// SPDX-License-Identifier: MIT
-
 #include <iostream>
 #include <sstream>
 #include <string>

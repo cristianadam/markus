@@ -1,9 +1,3 @@
-// Copyright 2024 Hyde Authors
-// SPDX-License-Identifier: MIT
-//
-// Hyde: A single-header CommonMark parser for C++20
-// No external dependencies beyond the C++20 standard library.
-
 #ifndef HYDE_H_
 #define HYDE_H_
 
@@ -117,9 +111,8 @@ inline std::string NodeTypeToString(NodeType type) {
 }
 
 // Variant type for inline content
-using InlineNode =
-    std::variant<Text, SoftBreak, HardBreak, Code, Emphasis, Strong, Link,
-                 Image, HtmlInline>;
+using InlineNode = std::variant<Text, SoftBreak, HardBreak, Code, Emphasis,
+                                Strong, Link, Image, HtmlInline>;
 
 // Variant type for block content
 using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
@@ -263,15 +256,16 @@ inline bool IsAsciiPunctuation(char c) {
 
 // Get the byte length of a UTF-8 character starting at the given byte
 inline size_t Utf8CharLen(unsigned char c) {
-  if ((c & 0x80) == 0) return 1;       // ASCII
-  if ((c & 0xE0) == 0xC0) return 2;    // 110xxxxx
-  if ((c & 0xF0) == 0xE0) return 3;    // 1110xxxx
-  if ((c & 0xF8) == 0xF0) return 4;    // 11110xxx
-  return 1;  // Invalid, treat as single byte
+  if ((c & 0x80) == 0) return 1;     // ASCII
+  if ((c & 0xE0) == 0xC0) return 2;  // 110xxxxx
+  if ((c & 0xF0) == 0xE0) return 3;  // 1110xxxx
+  if ((c & 0xF8) == 0xF0) return 4;  // 11110xxx
+  return 1;                          // Invalid, treat as single byte
 }
 
 // Decode UTF-8 code point at position, return code point and bytes consumed
-inline std::pair<uint32_t, size_t> DecodeUtf8At(std::string_view s, size_t pos) {
+inline std::pair<uint32_t, size_t> DecodeUtf8At(std::string_view s,
+                                                size_t pos) {
   if (pos >= s.size()) return {0, 0};
   unsigned char c = static_cast<unsigned char>(s[pos]);
   if ((c & 0x80) == 0) {
@@ -356,12 +350,12 @@ inline bool IsUnicodeWhitespaceCodepoint(uint32_t cp) {
     return true;
   }
   // Unicode Zs (space separator) category
-  if (cp == 0x00A0) return true;  // NO-BREAK SPACE
-  if (cp == 0x1680) return true;  // OGHAM SPACE MARK
+  if (cp == 0x00A0) return true;                  // NO-BREAK SPACE
+  if (cp == 0x1680) return true;                  // OGHAM SPACE MARK
   if (cp >= 0x2000 && cp <= 0x200A) return true;  // Various spaces
-  if (cp == 0x202F) return true;  // NARROW NO-BREAK SPACE
-  if (cp == 0x205F) return true;  // MEDIUM MATHEMATICAL SPACE
-  if (cp == 0x3000) return true;  // IDEOGRAPHIC SPACE
+  if (cp == 0x202F) return true;                  // NARROW NO-BREAK SPACE
+  if (cp == 0x205F) return true;                  // MEDIUM MATHEMATICAL SPACE
+  if (cp == 0x3000) return true;                  // IDEOGRAPHIC SPACE
   return false;
 }
 
@@ -372,8 +366,8 @@ inline bool IsUnicodeWhitespace(char c) {
   return uc == ' ' || uc == '\t' || uc == '\n' || uc == '\r' || uc == '\f';
 }
 
-// Check for Unicode whitespace at position in a string (handles multi-byte UTF-8)
-// Returns number of bytes to skip if whitespace, 0 otherwise
+// Check for Unicode whitespace at position in a string (handles multi-byte
+// UTF-8) Returns number of bytes to skip if whitespace, 0 otherwise
 inline size_t IsUnicodeWhitespaceAt(std::string_view s, size_t pos) {
   if (pos >= s.size()) return 0;
   unsigned char c = static_cast<unsigned char>(s[pos]);
@@ -422,7 +416,8 @@ inline uint32_t UnicodeCaseFold(uint32_t cp) {
   if (cp >= 'A' && cp <= 'Z') {
     return cp + 32;
   }
-  // Latin-1 Supplement uppercase (U+00C0-U+00DE, except U+00D7 multiplication sign)
+  // Latin-1 Supplement uppercase (U+00C0-U+00DE, except U+00D7 multiplication
+  // sign)
   if (cp >= 0x00C0 && cp <= 0x00D6) {
     return cp + 32;  // À-Ö -> à-ö
   }
@@ -461,9 +456,9 @@ inline uint32_t UnicodeCaseFold(uint32_t cp) {
   if (cp >= 0x0400 && cp <= 0x040F) {
     return cp + 80;
   }
-  // German capital sharp S (ẞ U+1E9E) is handled specially in NormalizeLinkLabel
-  // because it folds to "ss" (two characters) in full case folding
-  // Latin Extended Additional
+  // German capital sharp S (ẞ U+1E9E) is handled specially in
+  // NormalizeLinkLabel because it folds to "ss" (two characters) in full case
+  // folding Latin Extended Additional
   if (cp >= 0x1E00 && cp <= 0x1E95) {
     if ((cp & 1) == 0) return cp + 1;
   }
@@ -513,7 +508,8 @@ inline std::string NormalizeLinkLabel(std::string_view label) {
       continue;
     }
 
-    // Apply case folding - special handling for characters that fold to multiple chars
+    // Apply case folding - special handling for characters that fold to
+    // multiple chars
     if (cp == 0x1E9E) {
       // German capital sharp S (ẞ) folds to "ss" in full case folding
       result += "ss";
@@ -656,8 +652,8 @@ inline std::string RemoveIndent(std::string_view line, int n) {
   return result;
 }
 
-// Remove blockquote prefix (> and optional following space) with proper tab handling
-// Returns the remaining content with proper indentation preserved
+// Remove blockquote prefix (> and optional following space) with proper tab
+// handling Returns the remaining content with proper indentation preserved
 inline std::string RemoveBlockQuotePrefix(std::string_view line) {
   size_t i = 0;
   int column = 0;
@@ -929,9 +925,11 @@ inline std::string DecodeEscapesAndEntities(std::string_view text) {
           try {
             uint32_t code_point;
             if (is_hex) {
-              code_point = static_cast<uint32_t>(std::stoul(num_str, nullptr, 16));
+              code_point =
+                  static_cast<uint32_t>(std::stoul(num_str, nullptr, 16));
             } else {
-              code_point = static_cast<uint32_t>(std::stoul(num_str, nullptr, 10));
+              code_point =
+                  static_cast<uint32_t>(std::stoul(num_str, nullptr, 10));
             }
             result += CodePointToUtf8(code_point);
             i = num_end;
@@ -950,7 +948,8 @@ inline std::string DecodeEscapesAndEntities(std::string_view text) {
 
         if (name_end > start && name_end < text.size() &&
             text[name_end] == ';') {
-          std::string entity = LookupHtmlEntity(text.substr(start, name_end - start));
+          std::string entity =
+              LookupHtmlEntity(text.substr(start, name_end - start));
           if (!entity.empty()) {
             result += entity;
             i = name_end;
@@ -992,8 +991,9 @@ inline std::string DecodeEscapes(std::string_view text) {
 class InlineParser {
  public:
   explicit InlineParser(
-      const std::unordered_map<std::string, std::pair<std::string, std::string>>*
-          link_refs = nullptr)
+      const std::unordered_map<std::string,
+                               std::pair<std::string, std::string>>* link_refs =
+          nullptr)
       : link_references_(link_refs) {}
 
   std::vector<InlineNode> Parse(std::string_view text) {
@@ -1112,11 +1112,10 @@ class InlineParser {
         bool can_close = right_flanking;
 
         if (c == '_') {
-          can_open =
-              left_flanking &&
-              (!right_flanking ||
-               (run_start > 0 &&
-                detail::IsAsciiPunctuation(text_[run_start - 1])));
+          can_open = left_flanking &&
+                     (!right_flanking ||
+                      (run_start > 0 &&
+                       detail::IsAsciiPunctuation(text_[run_start - 1])));
           can_close =
               right_flanking &&
               (!left_flanking ||
@@ -1178,7 +1177,8 @@ class InlineParser {
               link_content.push_back(std::move(result[i]));
             }
 
-            // Extract delimiters that belong to link content and process emphasis
+            // Extract delimiters that belong to link content and process
+            // emphasis
             std::vector<DelimiterNode> link_delimiters;
             for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
               if (it->pos > opener->pos && it->pos < result.size()) {
@@ -1242,7 +1242,8 @@ class InlineParser {
               link_content.push_back(std::move(result[i]));
             }
 
-            // Extract delimiters that belong to link content and process emphasis
+            // Extract delimiters that belong to link content and process
+            // emphasis
             std::vector<DelimiterNode> link_delimiters;
             for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
               if (it->pos > opener->pos && it->pos < result.size()) {
@@ -1279,7 +1280,7 @@ class InlineParser {
               }
             }
             delimiter_stack.erase(opener, delimiter_stack.end());
-            ++pos_;  // Skip ']'
+            // Note: pos_ was already advanced past ']' at line 1167
             continue;
           }
 
@@ -1384,7 +1385,8 @@ class InlineParser {
     if (!detail::IsUnicodePunctuation(before_cp)) return true;
 
     // Preceded by punctuation - check if followed by whitespace or punctuation
-    if (pos + length >= text_.size()) return true;  // End of string is like whitespace
+    if (pos + length >= text_.size())
+      return true;  // End of string is like whitespace
 
     // Get code point after the delimiter run
     auto [after_cp, after_len] = detail::DecodeUtf8At(text_, pos + length);
@@ -1587,7 +1589,8 @@ class InlineParser {
         bool valid_comment = false;
         if (pos_ + 4 < text_.size()) {
           char next = text_[pos_ + 4];
-          if (next != '>' && !(next == '-' && pos_ + 5 < text_.size() && text_[pos_ + 5] == '>')) {
+          if (next != '>' && !(next == '-' && pos_ + 5 < text_.size() &&
+                               text_[pos_ + 5] == '>')) {
             valid_comment = true;
           }
         } else if (pos_ + 4 == text_.size()) {
@@ -1676,8 +1679,8 @@ class InlineParser {
         }
         // Optional attribute value
         // Skip whitespace
-        while (end < text_.size() &&
-               (text_[end] == ' ' || text_[end] == '\t' || text_[end] == '\n')) {
+        while (end < text_.size() && (text_[end] == ' ' || text_[end] == '\t' ||
+                                      text_[end] == '\n')) {
           seen_whitespace = true;
           ++end;
         }
@@ -1771,8 +1774,8 @@ class InlineParser {
       SkipWhitespace();
 
       // Parse optional title
-      if (pos_ < text_.size() && (text_[pos_] == '"' || text_[pos_] == '\'' ||
-                                  text_[pos_] == '(')) {
+      if (pos_ < text_.size() &&
+          (text_[pos_] == '"' || text_[pos_] == '\'' || text_[pos_] == '(')) {
         char close_char = text_[pos_] == '(' ? ')' : text_[pos_];
         ++pos_;
         size_t title_start = pos_;
@@ -1840,8 +1843,9 @@ class InlineParser {
   }
 
   void SkipWhitespace() {
-    while (pos_ < text_.size() && (text_[pos_] == ' ' || text_[pos_] == '\t' ||
-                                   text_[pos_] == '\n' || text_[pos_] == '\r')) {
+    while (pos_ < text_.size() &&
+           (text_[pos_] == ' ' || text_[pos_] == '\t' || text_[pos_] == '\n' ||
+            text_[pos_] == '\r')) {
       ++pos_;
     }
   }
@@ -1903,8 +1907,8 @@ class InlineParser {
         // Check if sum of counts is multiple of 3 (special rule)
         if ((opener.can_open && opener.can_close) ||
             (closer.can_open && closer.can_close)) {
-          if ((opener.count + closer.count) % 3 == 0 &&
-              opener.count % 3 != 0 && closer.count % 3 != 0) {
+          if ((opener.count + closer.count) % 3 == 0 && opener.count % 3 != 0 &&
+              closer.count % 3 != 0) {
             continue;
           }
         }
@@ -2118,7 +2122,8 @@ class BlockParser {
         if (potential_len >= 3) {
           // Check that backtick fence doesn't have backticks in info string
           if (potential_fence == '~' ||
-              trimmed.substr(potential_len).find('`') == std::string_view::npos) {
+              trimmed.substr(potential_len).find('`') ==
+                  std::string_view::npos) {
             in_fenced_code = true;
             fence_char = potential_fence;
             fence_length = potential_len;
@@ -2132,7 +2137,8 @@ class BlockParser {
         // Check for closing fence
         if (indent < 4 && !trimmed.empty() && trimmed[0] == fence_char) {
           size_t close_len = 0;
-          while (close_len < trimmed.size() && trimmed[close_len] == fence_char) {
+          while (close_len < trimmed.size() &&
+                 trimmed[close_len] == fence_char) {
             ++close_len;
           }
           if (close_len >= fence_length) {
@@ -2167,15 +2173,17 @@ class BlockParser {
         continue;
       }
 
-      // Check for block-level elements that end a block (not continuable to paragraph)
-      // These reset prev_line_had_content to false
+      // Check for block-level elements that end a block (not continuable to
+      // paragraph) These reset prev_line_had_content to false
       bool is_block_element = false;
       if (trimmed.starts_with('#')) {
         // ATX heading
         size_t hash_count = 0;
-        while (hash_count < trimmed.size() && trimmed[hash_count] == '#') ++hash_count;
-        if (hash_count <= 6 && (hash_count >= trimmed.size() ||
-            trimmed[hash_count] == ' ' || trimmed[hash_count] == '\t')) {
+        while (hash_count < trimmed.size() && trimmed[hash_count] == '#')
+          ++hash_count;
+        if (hash_count <= 6 &&
+            (hash_count >= trimmed.size() || trimmed[hash_count] == ' ' ||
+             trimmed[hash_count] == '\t')) {
           is_block_element = true;
         }
       }
@@ -2189,8 +2197,12 @@ class BlockParser {
           int count = 0;
           bool valid = true;
           for (char ch : trimmed) {
-            if (ch == first) ++count;
-            else if (ch != ' ' && ch != '\t') { valid = false; break; }
+            if (ch == first)
+              ++count;
+            else if (ch != ' ' && ch != '\t') {
+              valid = false;
+              break;
+            }
           }
           if (valid && count >= 3) is_block_element = true;
         }
@@ -2236,7 +2248,8 @@ class BlockParser {
       }
 
       // Get rest of first line after ':'
-      std::string_view rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
+      std::string_view rest =
+          detail::TrimLeft(trimmed.substr(close_bracket + 2));
       size_t start_line = line_idx_;
       Advance();
 
@@ -2261,7 +2274,8 @@ class BlockParser {
 
       // Parse destination
       auto [dest_raw, dest_len] = ParseLinkDestination(rest);
-      if (dest_raw.empty() && dest_len == 0 && !rest.empty() && rest[0] != '<') {
+      if (dest_raw.empty() && dest_len == 0 && !rest.empty() &&
+          rest[0] != '<') {
         line_idx_ = start_line;
         prev_line_had_content = true;
         Advance();
@@ -2293,8 +2307,10 @@ class BlockParser {
         }
       }
 
-      if (!rest.empty() && (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
-        // Title must be separated from destination by whitespace (or be on new line)
+      if (!rest.empty() &&
+          (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
+        // Title must be separated from destination by whitespace (or be on new
+        // line)
         if (!title_on_new_line && !has_whitespace_before_title) {
           title_valid = false;
         } else {
@@ -2303,54 +2319,55 @@ class BlockParser {
           std::string title_content;
           size_t i = 1;
 
-        // Title can span multiple lines
-        while (title_valid) {
-          while (i < rest.size()) {
-            if (rest[i] == '\\' && i + 1 < rest.size()) {
-              title_content += rest[i];
-              title_content += rest[i + 1];
-              i += 2;
-            } else if (rest[i] == close_char) {
-              // Found closing - rest must be whitespace only
-              auto after = detail::TrimLeft(rest.substr(i + 1));
-              if (!after.empty()) {
-                title_valid = false;
+          // Title can span multiple lines
+          while (title_valid) {
+            while (i < rest.size()) {
+              if (rest[i] == '\\' && i + 1 < rest.size()) {
+                title_content += rest[i];
+                title_content += rest[i + 1];
+                i += 2;
+              } else if (rest[i] == close_char) {
+                // Found closing - rest must be whitespace only
+                auto after = detail::TrimLeft(rest.substr(i + 1));
+                if (!after.empty()) {
+                  title_valid = false;
+                } else {
+                  title = detail::DecodeEscapesAndEntities(title_content);
+                }
+                goto title_done;
+              } else if (rest[i] == '\n') {
+                title_content += rest[i];
+                ++i;
               } else {
-                title = detail::DecodeEscapesAndEntities(title_content);
+                title_content += rest[i];
+                ++i;
               }
-              goto title_done;
-            } else if (rest[i] == '\n') {
-              title_content += rest[i];
-              ++i;
-            } else {
-              title_content += rest[i];
-              ++i;
             }
+            // Continue to next line
+            if (AtEnd()) {
+              title_valid = false;
+              break;
+            }
+            std::string_view next_line = CurrentLine();
+            if (detail::IsBlankLine(next_line)) {
+              title_valid = false;
+              break;
+            }
+            title_content += '\n';
+            rest = next_line;
+            i = 0;
+            Advance();
           }
-          // Continue to next line
-          if (AtEnd()) {
-            title_valid = false;
-            break;
-          }
-          std::string_view next_line = CurrentLine();
-          if (detail::IsBlankLine(next_line)) {
-            title_valid = false;
-            break;
-          }
-          title_content += '\n';
-          rest = next_line;
-          i = 0;
-          Advance();
-        }
-      title_done:;
+        title_done:;
         }  // close else block for whitespace check
       } else if (!rest.empty()) {
         // Non-whitespace after destination with no title
         title_valid = false;
       }
 
-      // If destination parsing returned length 0 (not angle brackets) and no destination, it's invalid
-      // But angle bracket destinations like <> returning empty string with length > 0 are valid
+      // If destination parsing returned length 0 (not angle brackets) and no
+      // destination, it's invalid But angle bracket destinations like <>
+      // returning empty string with length > 0 are valid
       if (dest_raw.empty() && dest_len == 0) {
         line_idx_ = start_line;
         prev_line_had_content = true;
@@ -2358,8 +2375,8 @@ class BlockParser {
         continue;
       }
 
-      // If title parsing failed but was on a new line, roll back just the title line
-      // and accept the link ref without a title
+      // If title parsing failed but was on a new line, roll back just the title
+      // line and accept the link ref without a title
       if (!title_valid && title_on_new_line) {
         line_idx_ = pre_title_line;
         title.clear();
@@ -2373,7 +2390,8 @@ class BlockParser {
 
       // Only add if not already defined
       if (doc.link_references.find(normalized) == doc.link_references.end()) {
-        doc.link_references[normalized] = {detail::EncodeUrl(destination), title};
+        doc.link_references[normalized] = {detail::EncodeUrl(destination),
+                                           title};
       }
       // After successful link ref extraction, next line starts fresh
       prev_line_had_content = false;
@@ -2506,8 +2524,10 @@ class BlockParser {
       }
     }
 
-    if (!rest.empty() && (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
-      // Title must be separated from destination by whitespace (or be on new line)
+    if (!rest.empty() &&
+        (rest[0] == '"' || rest[0] == '\'' || rest[0] == '(')) {
+      // Title must be separated from destination by whitespace (or be on new
+      // line)
       if (!title_on_new_line && !has_whitespace_before_title) {
         title_valid = false;
       } else {
@@ -2516,39 +2536,40 @@ class BlockParser {
         size_t i = 1;
 
         while (title_valid) {
-        while (i < rest.size()) {
-          if (rest[i] == '\\' && i + 1 < rest.size()) {
-            i += 2;
-          } else if (rest[i] == close_char) {
-            auto after = detail::TrimLeft(rest.substr(i + 1));
-            if (!after.empty()) {
-              title_valid = false;
+          while (i < rest.size()) {
+            if (rest[i] == '\\' && i + 1 < rest.size()) {
+              i += 2;
+            } else if (rest[i] == close_char) {
+              auto after = detail::TrimLeft(rest.substr(i + 1));
+              if (!after.empty()) {
+                title_valid = false;
+              }
+              goto skip_title_done;
+            } else {
+              ++i;
             }
-            goto skip_title_done;
-          } else {
-            ++i;
           }
+          if (AtEnd()) {
+            title_valid = false;
+            break;
+          }
+          std::string_view next_line = CurrentLine();
+          if (detail::IsBlankLine(next_line)) {
+            title_valid = false;
+            break;
+          }
+          rest = next_line;
+          i = 0;
+          Advance();
         }
-        if (AtEnd()) {
-          title_valid = false;
-          break;
-        }
-        std::string_view next_line = CurrentLine();
-        if (detail::IsBlankLine(next_line)) {
-          title_valid = false;
-          break;
-        }
-        rest = next_line;
-        i = 0;
-        Advance();
-      }
-    skip_title_done:;
+      skip_title_done:;
       }  // close else block for whitespace check
     } else if (!rest.empty()) {
       title_valid = false;
     }
 
-    // If title failed but was on a new line, roll back just title and accept without title
+    // If title failed but was on a new line, roll back just title and accept
+    // without title
     if (!title_valid && title_on_new_line) {
       line_idx_ = pre_title_line;
     } else if (!title_valid) {
@@ -2785,7 +2806,8 @@ class BlockParser {
       // Check that what follows is not > or ->
       if (trimmed.size() > 4) {
         char next = trimmed[4];
-        if (next != '>' && !(next == '-' && trimmed.size() > 5 && trimmed[5] == '>')) {
+        if (next != '>' &&
+            !(next == '-' && trimmed.size() > 5 && trimmed[5] == '>')) {
           block_type = 2;
           end_condition = "-->";
         }
@@ -2824,18 +2846,18 @@ class BlockParser {
 
     // Type 6: Block-level HTML tags
     static const std::vector<std::string> type6_tags = {
-        "address",    "article",    "aside",      "base",      "basefont",
-        "blockquote", "body",       "caption",    "center",    "col",
-        "colgroup",   "dd",         "details",    "dialog",    "dir",
-        "div",        "dl",         "dt",         "fieldset",  "figcaption",
-        "figure",     "footer",     "form",       "frame",     "frameset",
-        "h1",         "h2",         "h3",         "h4",        "h5",
-        "h6",         "head",       "header",     "hr",        "html",
-        "iframe",     "legend",     "li",         "link",      "main",
-        "menu",       "menuitem",   "nav",        "noframes",  "ol",
-        "optgroup",   "option",     "p",          "param",     "search",
-        "section",    "summary",    "table",      "tbody",     "td",
-        "tfoot",      "th",         "thead",      "title",     "tr",
+        "address",    "article",  "aside",   "base",     "basefont",
+        "blockquote", "body",     "caption", "center",   "col",
+        "colgroup",   "dd",       "details", "dialog",   "dir",
+        "div",        "dl",       "dt",      "fieldset", "figcaption",
+        "figure",     "footer",   "form",    "frame",    "frameset",
+        "h1",         "h2",       "h3",      "h4",       "h5",
+        "h6",         "head",     "header",  "hr",       "html",
+        "iframe",     "legend",   "li",      "link",     "main",
+        "menu",       "menuitem", "nav",     "noframes", "ol",
+        "optgroup",   "option",   "p",       "param",    "search",
+        "section",    "summary",  "table",   "tbody",    "td",
+        "tfoot",      "th",       "thead",   "title",    "tr",
         "track",      "ul"};
 
     if (block_type == 0) {
@@ -2891,22 +2913,24 @@ class BlockParser {
           ++tag_end;
         }
 
-        // After tag name, must have valid HTML tag continuation: whitespace, /, >
-        // Anything else (like + or :) means this isn't a valid HTML tag
+        // After tag name, must have valid HTML tag continuation: whitespace, /,
+        // > Anything else (like + or :) means this isn't a valid HTML tag
         bool valid_tag = false;
         if (tag_end >= trimmed.size()) {
           // Just tag name, no closing - not valid
         } else {
           char next = trimmed[tag_end];
-          valid_tag = (next == ' ' || next == '\t' || next == '/' || next == '>');
+          valid_tag =
+              (next == ' ' || next == '\t' || next == '/' || next == '>');
         }
         if (valid_tag) {
           // For closing tags, only whitespace is allowed after tag name
           if (is_closing) {
             size_t search_pos = tag_end;
             // Skip whitespace
-            while (search_pos < trimmed.size() &&
-                   (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t')) {
+            while (
+                search_pos < trimmed.size() &&
+                (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t')) {
               ++search_pos;
             }
             // Must end with >
@@ -2924,108 +2948,112 @@ class BlockParser {
               }
             }
           } else {
-          // Validate attributes properly for type 7 HTML block
-          size_t search_pos = tag_end;
-          bool valid_attributes = true;
-          bool need_whitespace = false;  // Track if we need whitespace before next attribute
+            // Validate attributes properly for type 7 HTML block
+            size_t search_pos = tag_end;
+            bool valid_attributes = true;
+            bool need_whitespace =
+                false;  // Track if we need whitespace before next attribute
 
-          while (search_pos < trimmed.size() && valid_attributes) {
-            char c = trimmed[search_pos];
+            while (search_pos < trimmed.size() && valid_attributes) {
+              char c = trimmed[search_pos];
 
-            if (c == '>') {
-              break;  // Found end of tag
-            } else if (c == '/') {
-              // Self-closing, must be followed by >
-              if (search_pos + 1 < trimmed.size() &&
-                  trimmed[search_pos + 1] == '>') {
-                search_pos++;  // Will break on next iteration
-              } else {
-                valid_attributes = false;
-              }
-            } else if (c == ' ' || c == '\t' || c == '\n') {
-              ++search_pos;  // Skip whitespace
-              need_whitespace = false;  // Whitespace seen
-            } else if (!need_whitespace &&
-                       (std::isalpha(static_cast<unsigned char>(c)) ||
-                        c == '_' || c == ':')) {
-              // Start of attribute name (must have whitespace before if not first)
-              ++search_pos;
-              while (search_pos < trimmed.size()) {
-                char ac = trimmed[search_pos];
-                if (std::isalnum(static_cast<unsigned char>(ac)) ||
-                    ac == '_' || ac == ':' || ac == '.' || ac == '-') {
-                  ++search_pos;
+              if (c == '>') {
+                break;  // Found end of tag
+              } else if (c == '/') {
+                // Self-closing, must be followed by >
+                if (search_pos + 1 < trimmed.size() &&
+                    trimmed[search_pos + 1] == '>') {
+                  search_pos++;  // Will break on next iteration
                 } else {
-                  break;
+                  valid_attributes = false;
                 }
-              }
-              // Skip whitespace after attribute name
-              while (search_pos < trimmed.size() &&
-                     (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t' ||
-                      trimmed[search_pos] == '\n')) {
+              } else if (c == ' ' || c == '\t' || c == '\n') {
+                ++search_pos;             // Skip whitespace
+                need_whitespace = false;  // Whitespace seen
+              } else if (!need_whitespace &&
+                         (std::isalpha(static_cast<unsigned char>(c)) ||
+                          c == '_' || c == ':')) {
+                // Start of attribute name (must have whitespace before if not
+                // first)
                 ++search_pos;
-                need_whitespace = false;
-              }
-              // Optional attribute value
-              if (search_pos < trimmed.size() && trimmed[search_pos] == '=') {
-                ++search_pos;
-                // Skip whitespace after =
+                while (search_pos < trimmed.size()) {
+                  char ac = trimmed[search_pos];
+                  if (std::isalnum(static_cast<unsigned char>(ac)) ||
+                      ac == '_' || ac == ':' || ac == '.' || ac == '-') {
+                    ++search_pos;
+                  } else {
+                    break;
+                  }
+                }
+                // Skip whitespace after attribute name
                 while (search_pos < trimmed.size() &&
                        (trimmed[search_pos] == ' ' ||
                         trimmed[search_pos] == '\t' ||
                         trimmed[search_pos] == '\n')) {
                   ++search_pos;
+                  need_whitespace = false;
                 }
-                if (search_pos >= trimmed.size()) {
-                  valid_attributes = false;
-                } else if (trimmed[search_pos] == '"' ||
-                           trimmed[search_pos] == '\'') {
-                  char quote = trimmed[search_pos];
+                // Optional attribute value
+                if (search_pos < trimmed.size() && trimmed[search_pos] == '=') {
                   ++search_pos;
+                  // Skip whitespace after =
                   while (search_pos < trimmed.size() &&
-                         trimmed[search_pos] != quote) {
+                         (trimmed[search_pos] == ' ' ||
+                          trimmed[search_pos] == '\t' ||
+                          trimmed[search_pos] == '\n')) {
                     ++search_pos;
                   }
                   if (search_pos >= trimmed.size()) {
                     valid_attributes = false;
+                  } else if (trimmed[search_pos] == '"' ||
+                             trimmed[search_pos] == '\'') {
+                    char quote = trimmed[search_pos];
+                    ++search_pos;
+                    while (search_pos < trimmed.size() &&
+                           trimmed[search_pos] != quote) {
+                      ++search_pos;
+                    }
+                    if (search_pos >= trimmed.size()) {
+                      valid_attributes = false;
+                    } else {
+                      ++search_pos;  // Skip closing quote
+                      need_whitespace =
+                          true;  // Need whitespace before next attr
+                    }
                   } else {
-                    ++search_pos;  // Skip closing quote
+                    // Unquoted value
+                    while (search_pos < trimmed.size()) {
+                      char vc = trimmed[search_pos];
+                      if (vc == ' ' || vc == '\t' || vc == '\n' || vc == '"' ||
+                          vc == '\'' || vc == '=' || vc == '<' || vc == '>' ||
+                          vc == '`') {
+                        break;
+                      }
+                      ++search_pos;
+                    }
                     need_whitespace = true;  // Need whitespace before next attr
                   }
-                } else {
-                  // Unquoted value
-                  while (search_pos < trimmed.size()) {
-                    char vc = trimmed[search_pos];
-                    if (vc == ' ' || vc == '\t' || vc == '\n' || vc == '"' ||
-                        vc == '\'' || vc == '=' || vc == '<' || vc == '>' ||
-                        vc == '`') {
-                      break;
-                    }
-                    ++search_pos;
-                  }
-                  need_whitespace = true;  // Need whitespace before next attr
+                }
+              } else {
+                // Invalid character - not valid HTML tag
+                valid_attributes = false;
+              }
+            }
+
+            if (valid_attributes && search_pos < trimmed.size() &&
+                trimmed[search_pos] == '>') {
+              // Check that rest of line is only whitespace
+              bool only_whitespace = true;
+              for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {
+                if (trimmed[j] != ' ' && trimmed[j] != '\t') {
+                  only_whitespace = false;
+                  break;
                 }
               }
-            } else {
-              // Invalid character - not valid HTML tag
-              valid_attributes = false;
-            }
-          }
-
-          if (valid_attributes && search_pos < trimmed.size() &&
-              trimmed[search_pos] == '>') {
-            // Check that rest of line is only whitespace
-            bool only_whitespace = true;
-            for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {
-              if (trimmed[j] != ' ' && trimmed[j] != '\t') {
-                only_whitespace = false;
-                break;
+              if (only_whitespace) {
+                block_type = 7;
               }
             }
-            if (only_whitespace) {
-              block_type = 7;
-            }
-          }
           }  // End of else for opening tags
         }
       }
@@ -3197,8 +3225,10 @@ class BlockParser {
         }
 
         if (is_continuation) {
-          // Mark lazy continuation with special prefix to prevent setext heading
-          quote_lines.push_back(std::string(1, '\x01') + std::string(bq_trimmed));
+          // Mark lazy continuation with special prefix to prevent setext
+          // heading
+          quote_lines.push_back(std::string(1, '\x01') +
+                                std::string(bq_trimmed));
           last_line_was_blank = false;
           // Lazy continuation continues the paragraph
           in_paragraph = true;
@@ -3245,18 +3275,16 @@ class BlockParser {
     int marker_width = 0;
 
     if (trimmed[0] == '-' || trimmed[0] == '+' || trimmed[0] == '*') {
-      // Allow empty list items (just the bullet with nothing after)
-      // or bullet followed by space/tab
-      if (trimmed.size() == 1) {
-        // Just the bullet character - empty list item
-        bullet_char = trimmed[0];
-        marker_width = 1;
-      } else if (trimmed[1] == ' ' || trimmed[1] == '\t') {
-        bullet_char = trimmed[0];
-        marker_width = 2;
-      } else {
+      // List marker must be followed by at least one space/tab
+      // A lone bullet character is NOT a list item
+      if (trimmed.size() < 2) {
+        return std::nullopt;  // Need at least bullet + space
+      }
+      if (trimmed[1] != ' ' && trimmed[1] != '\t') {
         return std::nullopt;
       }
+      bullet_char = trimmed[0];
+      marker_width = 2;
     } else if (std::isdigit(static_cast<unsigned char>(trimmed[0]))) {
       // Ordered list
       is_ordered = true;
@@ -3271,10 +3299,13 @@ class BlockParser {
       char delim = trimmed[num_end];
       if (delim != '.' && delim != ')') return std::nullopt;
 
-      if (num_end + 1 >= trimmed.size() ||
-          (trimmed[num_end + 1] != ' ' && trimmed[num_end + 1] != '\t')) {
-        // Allow empty list item
-        if (num_end + 1 < trimmed.size()) return std::nullopt;
+      // Ordered list marker must be followed by at least one space/tab
+      // A lone "1." is NOT a list item
+      if (num_end + 1 >= trimmed.size()) {
+        return std::nullopt;  // Need at least number + delimiter + space
+      }
+      if (trimmed[num_end + 1] != ' ' && trimmed[num_end + 1] != '\t') {
+        return std::nullopt;
       }
 
       start = std::stoi(std::string(trimmed.substr(0, num_end)));
@@ -3352,8 +3383,8 @@ class BlockParser {
         if (item_indent < 4 && !item_trimmed.empty() &&
             item_trimmed[0] == bullet_char) {
           // Match if: just the bullet, or bullet followed by space/tab
-          if (item_trimmed.size() == 1 ||
-              item_trimmed[1] == ' ' || item_trimmed[1] == '\t') {
+          if (item_trimmed.size() == 1 || item_trimmed[1] == ' ' ||
+              item_trimmed[1] == '\t') {
             is_new_item = true;
           }
         }
@@ -3383,24 +3414,21 @@ class BlockParser {
         std::string first_content;
         if (is_ordered) {
           size_t num_end = 0;
-          while (
-              num_end < expanded_trimmed.size() &&
-              std::isdigit(
-                  static_cast<unsigned char>(expanded_trimmed[num_end]))) {
+          while (num_end < expanded_trimmed.size() &&
+                 std::isdigit(
+                     static_cast<unsigned char>(expanded_trimmed[num_end]))) {
             ++num_end;
           }
           // Skip number, delimiter, and required space
           size_t skip = num_end + 1;  // number + delimiter
-          if (skip < expanded_trimmed.size() &&
-              expanded_trimmed[skip] == ' ') {
+          if (skip < expanded_trimmed.size() && expanded_trimmed[skip] == ' ') {
             ++skip;
           }
           first_content = std::string(expanded_trimmed.substr(skip));
         } else {
           // Skip bullet and required space
           size_t skip = 1;  // bullet
-          if (skip < expanded_trimmed.size() &&
-              expanded_trimmed[skip] == ' ') {
+          if (skip < expanded_trimmed.size() && expanded_trimmed[skip] == ' ') {
             ++skip;
           }
           first_content = std::string(expanded_trimmed.substr(skip));
@@ -3464,8 +3492,8 @@ class BlockParser {
             } else if (!is_ordered && !cont_trimmed.empty() &&
                        cont_trimmed[0] == bullet_char) {
               // Match if: just the bullet, or bullet followed by space/tab
-              if (cont_trimmed.size() == 1 ||
-                  cont_trimmed[1] == ' ' || cont_trimmed[1] == '\t') {
+              if (cont_trimmed.size() == 1 || cont_trimmed[1] == ' ' ||
+                  cont_trimmed[1] == '\t') {
                 is_another_item = true;
               }
             }
@@ -3484,16 +3512,17 @@ class BlockParser {
                  cont_trimmed[0] == '*') &&
                 cont_trimmed[0] != bullet_char) {
               // Valid list marker: just bullet, or bullet + space/tab
-              if (cont_trimmed.size() == 1 ||
-                  cont_trimmed[1] == ' ' || cont_trimmed[1] == '\t') {
+              if (cont_trimmed.size() == 1 || cont_trimmed[1] == ' ' ||
+                  cont_trimmed[1] == '\t') {
                 break;  // Different bullet starts new list
               }
             }
             if (is_ordered && !cont_trimmed.empty() &&
                 std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {
               size_t ne = 0;
-              while (ne < cont_trimmed.size() &&
-                     std::isdigit(static_cast<unsigned char>(cont_trimmed[ne]))) {
+              while (
+                  ne < cont_trimmed.size() &&
+                  std::isdigit(static_cast<unsigned char>(cont_trimmed[ne]))) {
                 ++ne;
               }
               if (ne > 0 && ne < cont_trimmed.size() &&
@@ -3693,8 +3722,8 @@ class BlockParser {
             ++hash_count;
           }
           if (hash_count <= 6 &&
-              (hash_count >= trimmed.size() ||
-               trimmed[hash_count] == ' ' || trimmed[hash_count] == '\t')) {
+              (hash_count >= trimmed.size() || trimmed[hash_count] == ' ' ||
+               trimmed[hash_count] == '\t')) {
             break;
           }
         }
@@ -3703,11 +3732,11 @@ class BlockParser {
         }
         // Fenced code block: must be at least 3 fence chars, and for backticks,
         // the info string cannot contain backticks
-        if (trimmed.size() >= 3 &&
-            (trimmed[0] == '`' || trimmed[0] == '~')) {
+        if (trimmed.size() >= 3 && (trimmed[0] == '`' || trimmed[0] == '~')) {
           char fence_char = trimmed[0];
           size_t fence_len = 0;
-          while (fence_len < trimmed.size() && trimmed[fence_len] == fence_char) {
+          while (fence_len < trimmed.size() &&
+                 trimmed[fence_len] == fence_char) {
             ++fence_len;
           }
           if (fence_len >= 3) {
@@ -3771,8 +3800,8 @@ class BlockParser {
         // Check for HTML block (types 1-6 can interrupt paragraphs)
         if (trimmed.starts_with("<")) {
           // Type 1: script, pre, style, textarea
-          static const std::vector<std::string> type1_tags = {"script", "pre",
-                                                              "style", "textarea"};
+          static const std::vector<std::string> type1_tags = {
+              "script", "pre", "style", "textarea"};
           for (const auto& tag : type1_tags) {
             std::string open_tag = "<" + tag;
             if (trimmed.size() >= open_tag.size()) {
@@ -3781,11 +3810,10 @@ class BlockParser {
                 lower += static_cast<char>(
                     std::tolower(static_cast<unsigned char>(trimmed[j])));
               }
-              if (lower == open_tag &&
-                  (trimmed.size() == open_tag.size() ||
-                   trimmed[open_tag.size()] == ' ' ||
-                   trimmed[open_tag.size()] == '>' ||
-                   trimmed[open_tag.size()] == '\t')) {
+              if (lower == open_tag && (trimmed.size() == open_tag.size() ||
+                                        trimmed[open_tag.size()] == ' ' ||
+                                        trimmed[open_tag.size()] == '>' ||
+                                        trimmed[open_tag.size()] == '\t')) {
                 goto html_interrupt;
               }
             }
@@ -3795,8 +3823,7 @@ class BlockParser {
               trimmed.starts_with("<![CDATA[")) {
             goto html_interrupt;
           }
-          if (trimmed.size() >= 2 && trimmed[1] == '!' &&
-              trimmed.size() >= 9) {
+          if (trimmed.size() >= 2 && trimmed[1] == '!' && trimmed.size() >= 9) {
             std::string upper;
             for (size_t j = 0; j < 9; ++j) {
               upper += static_cast<char>(
@@ -3808,15 +3835,19 @@ class BlockParser {
           }
           // Type 6: block-level tags
           static const std::vector<std::string> type6_tags = {
-              "address", "article", "aside", "base", "basefont", "blockquote",
-              "body", "caption", "center", "col", "colgroup", "dd", "details",
-              "dialog", "dir", "div", "dl", "dt", "fieldset", "figcaption",
-              "figure", "footer", "form", "frame", "frameset", "h1", "h2",
-              "h3", "h4", "h5", "h6", "head", "header", "hr", "html", "iframe",
-              "legend", "li", "link", "main", "menu", "menuitem", "nav",
-              "noframes", "ol", "optgroup", "option", "p", "param", "search",
-              "section", "summary", "table", "tbody", "td", "tfoot", "th",
-              "thead", "title", "tr", "track", "ul"};
+              "address",    "article",  "aside",   "base",     "basefont",
+              "blockquote", "body",     "caption", "center",   "col",
+              "colgroup",   "dd",       "details", "dialog",   "dir",
+              "div",        "dl",       "dt",      "fieldset", "figcaption",
+              "figure",     "footer",   "form",    "frame",    "frameset",
+              "h1",         "h2",       "h3",      "h4",       "h5",
+              "h6",         "head",     "header",  "hr",       "html",
+              "iframe",     "legend",   "li",      "link",     "main",
+              "menu",       "menuitem", "nav",     "noframes", "ol",
+              "optgroup",   "option",   "p",       "param",    "search",
+              "section",    "summary",  "table",   "tbody",    "td",
+              "tfoot",      "th",       "thead",   "title",    "tr",
+              "track",      "ul"};
           bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
           size_t tag_start = is_closing ? 2 : 1;
           size_t tag_end = tag_start;
@@ -3833,9 +3864,9 @@ class BlockParser {
             }
             for (const auto& t : type6_tags) {
               if (tag_name == t) {
-                if (tag_end >= trimmed.size() ||
-                    trimmed[tag_end] == ' ' || trimmed[tag_end] == '>' ||
-                    trimmed[tag_end] == '\t' || trimmed[tag_end] == '/') {
+                if (tag_end >= trimmed.size() || trimmed[tag_end] == ' ' ||
+                    trimmed[tag_end] == '>' || trimmed[tag_end] == '\t' ||
+                    trimmed[tag_end] == '/') {
                   goto html_interrupt;
                 }
               }
@@ -4143,8 +4174,8 @@ inline std::string DebugAst(const Document& doc, int indent = 0) {
               }
               result += "\n";
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
-              result += p + "HtmlBlock (type " + std::to_string(n.block_type) +
-                        ")\n";
+              result +=
+                  p + "HtmlBlock (type " + std::to_string(n.block_type) + ")\n";
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               result += p + "BlockQuote\n";
               print_blocks(n.children, ind + 1);

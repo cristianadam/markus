@@ -3275,16 +3275,15 @@ class BlockParser {
     int marker_width = 0;
 
     if (trimmed[0] == '-' || trimmed[0] == '+' || trimmed[0] == '*') {
-      // List marker must be followed by at least one space/tab
-      // A lone bullet character is NOT a list item
-      if (trimmed.size() < 2) {
-        return std::nullopt;  // Need at least bullet + space
-      }
-      if (trimmed[1] != ' ' && trimmed[1] != '\t') {
-        return std::nullopt;
-      }
       bullet_char = trimmed[0];
-      marker_width = 2;
+      // Marker can be followed by space, or be at end of line (empty item)
+      if (trimmed.size() == 1) {
+        marker_width = 1;  // Just the bullet
+      } else if (trimmed[1] == ' ' || trimmed[1] == '\t') {
+        marker_width = 2;  // Bullet + space
+      } else {
+        return std::nullopt;  // Not a list marker
+      }
     } else if (std::isdigit(static_cast<unsigned char>(trimmed[0]))) {
       // Ordered list
       is_ordered = true;
@@ -3299,18 +3298,17 @@ class BlockParser {
       char delim = trimmed[num_end];
       if (delim != '.' && delim != ')') return std::nullopt;
 
-      // Ordered list marker must be followed by at least one space/tab
-      // A lone "1." is NOT a list item
-      if (num_end + 1 >= trimmed.size()) {
-        return std::nullopt;  // Need at least number + delimiter + space
-      }
-      if (trimmed[num_end + 1] != ' ' && trimmed[num_end + 1] != '\t') {
-        return std::nullopt;
-      }
-
       start = std::stoi(std::string(trimmed.substr(0, num_end)));
       delimiter = delim;
-      marker_width = static_cast<int>(num_end) + 2;
+
+      // Marker can be followed by space, or be at end of line (empty item)
+      if (num_end + 1 >= trimmed.size()) {
+        marker_width = static_cast<int>(num_end) + 1;  // Just number + delimiter
+      } else if (trimmed[num_end + 1] == ' ' || trimmed[num_end + 1] == '\t') {
+        marker_width = static_cast<int>(num_end) + 2;  // Number + delimiter + space
+      } else {
+        return std::nullopt;  // Not a list marker
+      }
     } else {
       return std::nullopt;
     }
@@ -3411,56 +3409,73 @@ class BlockParser {
         std::string expanded_line = detail::ExpandTabs(item_line);
         std::string_view expanded_trimmed = detail::TrimLeft(expanded_line);
 
-        std::string first_content;
+        // Calculate required indent based on content start position
+        // For `-    foo`, the content starts at column 5, so required_indent is 5
+        // For `-\tfoo`, the content starts at column 4, so required_indent is 4
+        int expanded_item_indent = detail::CountIndent(expanded_line);
+        int content_start = expanded_item_indent;
+
+        // Find where the marker ends (bullet or number+delimiter)
+        size_t marker_end = 0;
         if (is_ordered) {
-          size_t num_end = 0;
-          while (num_end < expanded_trimmed.size() &&
+          while (marker_end < expanded_trimmed.size() &&
                  std::isdigit(
-                     static_cast<unsigned char>(expanded_trimmed[num_end]))) {
-            ++num_end;
+                     static_cast<unsigned char>(expanded_trimmed[marker_end]))) {
+            ++marker_end;
           }
-          // Skip number, delimiter, and required space
-          size_t skip = num_end + 1;  // number + delimiter
-          if (skip < expanded_trimmed.size() && expanded_trimmed[skip] == ' ') {
-            ++skip;
-          }
-          first_content = std::string(expanded_trimmed.substr(skip));
+          marker_end++;  // +1 for delimiter
         } else {
-          // Skip bullet and required space
-          size_t skip = 1;  // bullet
-          if (skip < expanded_trimmed.size() && expanded_trimmed[skip] == ' ') {
-            ++skip;
-          }
-          first_content = std::string(expanded_trimmed.substr(skip));
+          marker_end = 1;  // bullet
         }
+
+        // Find where content actually starts (skip all spaces after marker)
+        size_t content_pos = marker_end;
+        while (content_pos < expanded_trimmed.size() &&
+               (expanded_trimmed[content_pos] == ' ' ||
+                expanded_trimmed[content_pos] == '\t')) {
+          ++content_pos;
+        }
+
+        // Calculate skip amount for first_content extraction
+        size_t skip;
+
+        // Apply the "5-space rule": if first non-blank content is 5+ positions
+        // after the marker, it becomes an indented code block. Cap skip
+        // at marker + 1, so the extra spaces become code block indent.
+        if (content_pos == expanded_trimmed.size()) {
+          // Empty item - content start is marker + 1 space
+          content_start += static_cast<int>(marker_end) + 1;
+          skip = content_pos;  // Skip everything (empty)
+        } else if (static_cast<int>(content_pos) > static_cast<int>(marker_end) + 4) {
+          // 5-space rule: content starts at marker + 1, making excess into code
+          content_start += static_cast<int>(marker_end) + 1;
+          skip = marker_end + 1;  // Only skip marker + 1 space
+        } else {
+          content_start += static_cast<int>(content_pos);
+          skip = content_pos;  // Skip to actual content
+        }
+
+        std::string first_content =
+            std::string(expanded_trimmed.substr(skip));
         item_lines.push_back(first_content);
         Advance();
         had_blank_line = false;
 
-        // Calculate required indent based on content start position
-        // For `-\tfoo`, the content starts at column 4, so required_indent is 4
-        int expanded_item_indent = detail::CountIndent(expanded_line);
-        int content_start = expanded_item_indent;
-        if (is_ordered) {
-          size_t num_end = 0;
-          while (num_end < expanded_trimmed.size() &&
-                 std::isdigit(
-                     static_cast<unsigned char>(expanded_trimmed[num_end]))) {
-            ++num_end;
-          }
-          content_start += static_cast<int>(num_end) + 1;  // +1 for delimiter
-        } else {
-          content_start += 1;  // +1 for bullet
-        }
-        // Add the space after marker
-        content_start += 1;
-
         // Collect continuation lines
         int required_indent = content_start;
+        bool first_line_empty = first_content.empty() ||
+                                detail::IsBlankLine(first_content);
         while (!AtEnd()) {
           std::string_view cont_line = CurrentLine();
 
           if (detail::IsBlankLine(cont_line)) {
+            // If the first line was empty (just the marker), a blank line
+            // ends this item - we can't continue after a blank for empty items
+            if (first_line_empty) {
+              Advance();
+              had_blank_line = true;
+              break;  // End item - don't collect more lines
+            }
             item_lines.push_back("");
             had_blank_line = true;
             Advance();
@@ -3788,8 +3803,8 @@ class BlockParser {
           }
           if (num_end > 0 && num_end < trimmed.size() &&
               (trimmed[num_end] == '.' || trimmed[num_end] == ')') &&
-              (num_end + 1 >= trimmed.size() || trimmed[num_end + 1] == ' ' ||
-               trimmed[num_end + 1] == '\t')) {
+              num_end + 1 < trimmed.size() &&  // Must have content after marker
+              (trimmed[num_end + 1] == ' ' || trimmed[num_end + 1] == '\t')) {
             // Only interrupt if starts with 1
             if (trimmed.substr(0, num_end) == "1") {
               break;

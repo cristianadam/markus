@@ -3310,6 +3310,29 @@ class BlockParser {
 
           // Check for other block-level interrupts
           if (cont_indent < required_indent) {
+            // Check for different list type (different bullet or delimiter)
+            // A different bullet/delimiter starts a new list
+            if (!is_ordered && cont_trimmed.size() >= 2 &&
+                (cont_trimmed[0] == '-' || cont_trimmed[0] == '+' ||
+                 cont_trimmed[0] == '*') &&
+                (cont_trimmed[1] == ' ' || cont_trimmed[1] == '\t') &&
+                cont_trimmed[0] != bullet_char) {
+              break;  // Different bullet starts new list
+            }
+            if (is_ordered && !cont_trimmed.empty() &&
+                std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {
+              size_t ne = 0;
+              while (ne < cont_trimmed.size() &&
+                     std::isdigit(static_cast<unsigned char>(cont_trimmed[ne]))) {
+                ++ne;
+              }
+              if (ne > 0 && ne < cont_trimmed.size() &&
+                  (cont_trimmed[ne] == '.' || cont_trimmed[ne] == ')') &&
+                  cont_trimmed[ne] != delimiter) {
+                break;  // Different delimiter starts new list
+              }
+            }
+
             // Check for block elements that can interrupt
             if (cont_trimmed.starts_with(">") ||
                 cont_trimmed.starts_with("#") ||

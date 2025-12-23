@@ -2926,42 +2926,129 @@ class BlockParser {
     // Collect block quote lines
     std::vector<std::string> quote_lines;
 
+    // Track state for lazy continuation rules
+    bool last_line_was_blank = false;
+    bool in_fenced_code = false;
+    char fence_char = 0;
+    size_t fence_length = 0;
+    bool in_indented_code = false;
+    bool in_paragraph = false;
+
     while (!AtEnd()) {
       std::string_view bq_line = CurrentLine();
-      int bq_indent = detail::CountIndent(bq_line);
-
       auto bq_trimmed = detail::TrimLeft(bq_line);
 
       if (bq_trimmed.starts_with(">")) {
         // Remove > and optional space with proper tab handling
         std::string bq_content = detail::RemoveBlockQuotePrefix(bq_line);
         quote_lines.push_back(bq_content);
+
+        // Track if this line is blank inside the blockquote
+        auto inner_trimmed = detail::TrimLeft(bq_content);
+        last_line_was_blank = inner_trimmed.empty();
+        int inner_indent = detail::CountIndent(bq_content);
+
+        // Track block types for lazy continuation rules
+        if (!in_fenced_code) {
+          if (inner_indent >= 4 && !inner_trimmed.empty()) {
+            // Could be indented code block (if not continuing paragraph)
+            if (!in_paragraph) {
+              in_indented_code = true;
+              in_paragraph = false;
+            }
+          } else if (!inner_trimmed.empty()) {
+            // Non-indented, non-blank line starts/continues paragraph
+            in_indented_code = false;
+            in_paragraph = true;
+          }
+        }
+
+        if (last_line_was_blank) {
+          in_paragraph = false;
+          in_indented_code = false;
+        }
+
+        // Track fenced code blocks inside the blockquote
+        if (!in_fenced_code && !inner_trimmed.empty() &&
+            (inner_trimmed[0] == '`' || inner_trimmed[0] == '~')) {
+          char potential_fence = inner_trimmed[0];
+          size_t potential_len = 0;
+          while (potential_len < inner_trimmed.size() &&
+                 inner_trimmed[potential_len] == potential_fence) {
+            ++potential_len;
+          }
+          if (potential_len >= 3) {
+            if (potential_fence == '~' ||
+                inner_trimmed.substr(potential_len).find('`') ==
+                    std::string_view::npos) {
+              in_fenced_code = true;
+              fence_char = potential_fence;
+              fence_length = potential_len;
+            }
+          }
+        } else if (in_fenced_code && !inner_trimmed.empty() &&
+                   inner_trimmed[0] == fence_char) {
+          size_t close_len = 0;
+          while (close_len < inner_trimmed.size() &&
+                 inner_trimmed[close_len] == fence_char) {
+            ++close_len;
+          }
+          if (close_len >= fence_length) {
+            bool is_close = true;
+            for (size_t j = close_len; j < inner_trimmed.size(); ++j) {
+              if (inner_trimmed[j] != ' ' && inner_trimmed[j] != '\t') {
+                is_close = false;
+                break;
+              }
+            }
+            if (is_close) in_fenced_code = false;
+          }
+        }
+
         Advance();
       } else if (!bq_trimmed.empty() && !quote_lines.empty()) {
-        // Lazy continuation - only for paragraphs
-        // Check if this could be a paragraph continuation
+        // Lazy continuation - only for paragraphs, not after blank lines,
+        // not inside fenced code blocks
         bool is_continuation = true;
+        int bq_indent = detail::CountIndent(bq_line);
 
-        // Indented code blocks (4+ spaces) cannot be lazy continuation
-        if (bq_indent >= 4) {
+        // No lazy continuation after blank line in blockquote
+        if (last_line_was_blank) {
           is_continuation = false;
         }
 
-        // Check for block-level interrupts
-        if (bq_trimmed.starts_with("#") || bq_trimmed.starts_with("```") ||
-            bq_trimmed.starts_with("~~~") || bq_trimmed.starts_with("---") ||
-            bq_trimmed.starts_with("***") || bq_trimmed.starts_with("___") ||
-            bq_trimmed.starts_with("- ") || bq_trimmed.starts_with("* ") ||
-            bq_trimmed.starts_with("+ ") ||
-            (bq_trimmed.size() >= 2 &&
-             std::isdigit(static_cast<unsigned char>(bq_trimmed[0])))) {
+        // No lazy continuation inside fenced code block or indented code block
+        if (in_fenced_code || in_indented_code) {
           is_continuation = false;
+        }
+
+        // Lazy continuation only continues paragraphs
+        if (!in_paragraph) {
+          is_continuation = false;
+        }
+
+        // Check for block-level interrupts - but only if not indented 4+ spaces
+        // (4+ space indented lines can't start block-level elements, so they're
+        // always lazy continuation if other conditions are met)
+        if (is_continuation && bq_indent < 4) {
+          if (bq_trimmed.starts_with("#") || bq_trimmed.starts_with("```") ||
+              bq_trimmed.starts_with("~~~") || bq_trimmed.starts_with("---") ||
+              bq_trimmed.starts_with("***") || bq_trimmed.starts_with("___") ||
+              bq_trimmed.starts_with("- ") || bq_trimmed.starts_with("* ") ||
+              bq_trimmed.starts_with("+ ") || bq_trimmed.starts_with(">") ||
+              (bq_trimmed.size() >= 2 &&
+               std::isdigit(static_cast<unsigned char>(bq_trimmed[0])))) {
+            is_continuation = false;
+          }
         }
 
         if (is_continuation) {
           // Mark lazy continuation with special prefix to prevent setext heading
-          // 0x01 (SOH) is stripped by TrimLeft and prevents setext matching
           quote_lines.push_back(std::string(1, '\x01') + std::string(bq_trimmed));
+          last_line_was_blank = false;
+          // Lazy continuation continues the paragraph
+          in_paragraph = true;
+          in_indented_code = false;
           Advance();
         } else {
           break;

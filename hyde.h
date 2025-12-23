@@ -3521,29 +3521,31 @@ class BlockParser {
           // Check for other block-level interrupts
           if (cont_indent < required_indent) {
             // Check for different list type (different bullet or delimiter)
-            // A different bullet/delimiter starts a new list
-            if (!is_ordered && !cont_trimmed.empty() &&
-                (cont_trimmed[0] == '-' || cont_trimmed[0] == '+' ||
-                 cont_trimmed[0] == '*') &&
-                cont_trimmed[0] != bullet_char) {
-              // Valid list marker: just bullet, or bullet + space/tab
-              if (cont_trimmed.size() == 1 || cont_trimmed[1] == ' ' ||
-                  cont_trimmed[1] == '\t') {
-                break;  // Different bullet starts new list
+            // A different list type starts a new list
+            // List markers at indent < 4 end the current item (sibling level)
+            // But at indent >= 4, they can be lazy continuation (not siblings)
+            if (cont_indent < 4) {
+              if (!cont_trimmed.empty() &&
+                  (cont_trimmed[0] == '-' || cont_trimmed[0] == '+' ||
+                   cont_trimmed[0] == '*')) {
+                // Bullet list marker
+                if (cont_trimmed.size() == 1 || cont_trimmed[1] == ' ' ||
+                    cont_trimmed[1] == '\t') {
+                  break;  // List marker ends item
+                }
               }
-            }
-            if (is_ordered && !cont_trimmed.empty() &&
-                std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {
-              size_t ne = 0;
-              while (
-                  ne < cont_trimmed.size() &&
-                  std::isdigit(static_cast<unsigned char>(cont_trimmed[ne]))) {
-                ++ne;
-              }
-              if (ne > 0 && ne < cont_trimmed.size() &&
-                  (cont_trimmed[ne] == '.' || cont_trimmed[ne] == ')') &&
-                  cont_trimmed[ne] != delimiter) {
-                break;  // Different delimiter starts new list
+              if (!cont_trimmed.empty() &&
+                  std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {
+                size_t ne = 0;
+                while (
+                    ne < cont_trimmed.size() &&
+                    std::isdigit(static_cast<unsigned char>(cont_trimmed[ne]))) {
+                  ++ne;
+                }
+                if (ne > 0 && ne < cont_trimmed.size() &&
+                    (cont_trimmed[ne] == '.' || cont_trimmed[ne] == ')')) {
+                  break;  // List marker ends item
+                }
               }
             }
 
@@ -3575,8 +3577,9 @@ class BlockParser {
             }
             // End list if not properly indented
             if (!had_blank_line) {
-              // Lazy continuation
-              item_lines.push_back(std::string(cont_trimmed));
+              // Lazy continuation - mark with \x01 to prevent block parsing
+              item_lines.push_back(std::string(1, '\x01') +
+                                   std::string(cont_trimmed));
               Advance();
             } else {
               break;
@@ -3729,7 +3732,8 @@ class BlockParser {
       }
 
       // Check for block-level interrupts
-      if (indent < 4) {
+      // Skip if line is marked with \x01 (lazy continuation)
+      if (indent < 4 && !line.starts_with("\x01")) {
         // ATX heading: must be #, ##, etc. followed by space or end of line
         if (trimmed.starts_with("#")) {
           size_t hash_count = 0;

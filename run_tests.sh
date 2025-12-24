@@ -19,7 +19,7 @@ run_one_test() {
   local i="$1"
 
   output=$(timeout "$TIMEOUT_SECONDS" python3 commonmark-spec/test/spec_tests.py \
-    --program bazel-out/aarch64-fastbuild/bin/main \
+    --program bazel-bin/main \
     -s commonmark-spec/spec.txt \
     -n "$i" 2>&1)
   exit_code=$?
@@ -40,7 +40,7 @@ run_one_test() {
       --dump-tests 2>/dev/null
 
     echo "Program output:"
-    timeout "$TIMEOUT_SECONDS" bazel-out/aarch64-fastbuild/bin/main < <(python3 -c "
+    timeout "$TIMEOUT_SECONDS" bazel-bin/main < <(python3 -c "
 import sys
 sys.path.insert(0, 'commonmark-spec/test')
 from spec_tests import get_tests

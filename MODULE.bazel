@@ -1,5 +1,5 @@
 module(
-    name = "hyde",
+    name = "markus",
     version = "0.1.0",
 )
 

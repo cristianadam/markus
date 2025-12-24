@@ -2,7 +2,7 @@
 #include <sstream>
 #include <string>
 
-#include "hyde.h"
+#include "markus.h"
 
 namespace {
 
@@ -41,10 +41,10 @@ int main(int argc, char* argv[]) {
   std::string markdown = ReadStdin();
 
   if (ast_mode) {
-    hyde::Document doc = hyde::Parse(markdown);
-    std::cout << hyde::DebugAst(doc);
+    markus::Document doc = markus::Parse(markdown);
+    std::cout << markus::DebugAst(doc);
   } else {
-    std::cout << hyde::MarkdownToHtml(markdown);
+    std::cout << markus::MarkdownToHtml(markdown);
   }
 
   return 0;

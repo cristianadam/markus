@@ -1,5 +1,5 @@
-#ifndef HYDE_H_
-#define HYDE_H_
+#ifndef MARKUS_H_
+#define MARKUS_H_
 
 #include <algorithm>
 #include <cctype>
@@ -16,7 +16,7 @@
 #include <variant>
 #include <vector>
 
-namespace hyde {
+namespace markus {
 
 // =============================================================================
 // Forward Declarations
@@ -1009,8 +1009,8 @@ class InlineParser {
       link_references_ = nullptr;
 
   struct DelimiterNode {
-    size_t pos;        // Position in result vector
-    size_t text_pos;   // Position in original text (for extracting raw labels)
+    size_t pos;       // Position in result vector
+    size_t text_pos;  // Position in original text (for extracting raw labels)
     size_t count;
     char delimiter;
     bool can_open;
@@ -1179,10 +1179,12 @@ class InlineParser {
 
         // Look for matching opener - try multiple if brackets unbalanced
         auto opener = delimiter_stack.end();
-        for (auto it = delimiter_stack.rbegin(); it != delimiter_stack.rend(); ++it) {
+        for (auto it = delimiter_stack.rbegin(); it != delimiter_stack.rend();
+             ++it) {
           if ((it->delimiter == '[' || it->delimiter == '!') && it->active) {
             // Check if brackets are balanced between this opener and closer
-            size_t content_start = it->text_pos + (it->delimiter == '!' ? 2 : 1);
+            size_t content_start =
+                it->text_pos + (it->delimiter == '!' ? 2 : 1);
             if (AreBracketsBalanced(content_start, pos_)) {
               opener = std::prev(it.base());
               break;
@@ -1251,18 +1253,17 @@ class InlineParser {
 
           // Try shortcut/collapsed reference link
           // Check if TryParseLinkTail consumed a collapsed reference []
-          bool is_collapsed_ref = (pos_ == saved_pos + 3 &&
-                                   saved_pos + 2 < text_.size() &&
-                                   text_[saved_pos + 1] == '[' &&
-                                   text_[saved_pos + 2] == ']');
+          bool is_collapsed_ref =
+              (pos_ == saved_pos + 3 && saved_pos + 2 < text_.size() &&
+               text_[saved_pos + 1] == '[' && text_[saved_pos + 2] == ']');
 
           // Check if there was a full reference [label] that failed lookup
           // In that case, don't try shortcut reference - per CommonMark spec,
           // if a full reference [foo][bar] fails because bar is undefined,
           // we don't fall back to shortcut [foo]
-          bool had_full_ref_attempt = (saved_pos + 1 < text_.size() &&
-                                       text_[saved_pos + 1] == '[' &&
-                                       !is_collapsed_ref);
+          bool had_full_ref_attempt =
+              (saved_pos + 1 < text_.size() && text_[saved_pos + 1] == '[' &&
+               !is_collapsed_ref);
           if (had_full_ref_attempt) {
             // Full reference was attempted but failed - don't try shortcut
             pos_ = saved_pos;
@@ -1281,9 +1282,11 @@ class InlineParser {
           // Look up the text inside brackets as a reference label
           // IMPORTANT: Use raw text from text_ to preserve escapes for matching
           // (Text nodes have already decoded escapes like \! to !)
-          size_t label_start = opener->text_pos + (opener->delimiter == '!' ? 2 : 1);
+          size_t label_start =
+              opener->text_pos + (opener->delimiter == '!' ? 2 : 1);
           size_t label_end = saved_pos;  // Position of ']'
-          std::string label_text(text_.substr(label_start, label_end - label_start));
+          std::string label_text(
+              text_.substr(label_start, label_end - label_start));
 
           auto ref_result = LookupReference(label_text);
           if (ref_result) {
@@ -1646,7 +1649,8 @@ class InlineParser {
             pos_ = pos_ + 5;
             return HtmlInline(std::string(text_.substr(start, pos_ - start)));
           }
-          if (next == '-' && pos_ + 5 < text_.size() && text_[pos_ + 5] == '>') {
+          if (next == '-' && pos_ + 5 < text_.size() &&
+              text_[pos_ + 5] == '>') {
             // <!---> is a valid immediately-closed comment
             pos_ = pos_ + 6;
             return HtmlInline(std::string(text_.substr(start, pos_ - start)));
@@ -2311,7 +2315,8 @@ class BlockParser {
       // First check if closing bracket is on the same line
       size_t close_bracket = FindClosingBracket(trimmed, 1);
       if (close_bracket != std::string_view::npos &&
-          close_bracket + 1 < trimmed.size() && trimmed[close_bracket + 1] == ':') {
+          close_bracket + 1 < trimmed.size() &&
+          trimmed[close_bracket + 1] == ':') {
         label_raw = std::string(trimmed.substr(1, close_bracket - 1));
         rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
         found_close = true;
@@ -2321,7 +2326,8 @@ class BlockParser {
         label_raw = std::string(trimmed.substr(1));  // Content after '['
         Advance();
 
-        // Collect lines until we find ']:' (limit to reasonable number of lines)
+        // Collect lines until we find ']:' (limit to reasonable number of
+        // lines)
         int lines_collected = 0;
         while (!AtEnd() && lines_collected < 50) {
           std::string_view next_line = CurrentLine();
@@ -2378,7 +2384,8 @@ class BlockParser {
         continue;
       }
 
-      // Normalize label for matching (WITHOUT decoding escapes per CommonMark spec)
+      // Normalize label for matching (WITHOUT decoding escapes per CommonMark
+      // spec)
       std::string normalized = detail::NormalizeLinkLabel(label_raw);
       if (normalized.empty()) {
         line_idx_ = start_line;
@@ -2608,7 +2615,8 @@ class BlockParser {
     // First check if closing bracket is on the same line
     size_t close_bracket = FindClosingBracket(trimmed, 1);
     if (close_bracket != std::string_view::npos &&
-        close_bracket + 1 < trimmed.size() && trimmed[close_bracket + 1] == ':') {
+        close_bracket + 1 < trimmed.size() &&
+        trimmed[close_bracket + 1] == ':') {
       label_raw = std::string(trimmed.substr(1, close_bracket - 1));
       rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
       found_close = true;
@@ -3508,9 +3516,11 @@ class BlockParser {
 
       // Marker can be followed by space, or be at end of line (empty item)
       if (num_end + 1 >= trimmed.size()) {
-        marker_width = static_cast<int>(num_end) + 1;  // Just number + delimiter
+        marker_width =
+            static_cast<int>(num_end) + 1;  // Just number + delimiter
       } else if (trimmed[num_end + 1] == ' ' || trimmed[num_end + 1] == '\t') {
-        marker_width = static_cast<int>(num_end) + 2;  // Number + delimiter + space
+        marker_width =
+            static_cast<int>(num_end) + 2;  // Number + delimiter + space
       } else {
         return std::nullopt;  // Not a list marker
       }
@@ -3615,8 +3625,9 @@ class BlockParser {
         std::string_view expanded_trimmed = detail::TrimLeft(expanded_line);
 
         // Calculate required indent based on content start position
-        // For `-    foo`, the content starts at column 5, so required_indent is 5
-        // For `-\tfoo`, the content starts at column 4, so required_indent is 4
+        // For `-    foo`, the content starts at column 5, so required_indent is
+        // 5 For `-\tfoo`, the content starts at column 4, so required_indent is
+        // 4
         int expanded_item_indent = detail::CountIndent(expanded_line);
         int content_start = expanded_item_indent;
 
@@ -3624,8 +3635,8 @@ class BlockParser {
         size_t marker_end = 0;
         if (is_ordered) {
           while (marker_end < expanded_trimmed.size() &&
-                 std::isdigit(
-                     static_cast<unsigned char>(expanded_trimmed[marker_end]))) {
+                 std::isdigit(static_cast<unsigned char>(
+                     expanded_trimmed[marker_end]))) {
             ++marker_end;
           }
           marker_end++;  // +1 for delimiter
@@ -3651,7 +3662,8 @@ class BlockParser {
           // Empty item - content start is marker + 1 space
           content_start += static_cast<int>(marker_end) + 1;
           skip = content_pos;  // Skip everything (empty)
-        } else if (static_cast<int>(content_pos) > static_cast<int>(marker_end) + 4) {
+        } else if (static_cast<int>(content_pos) >
+                   static_cast<int>(marker_end) + 4) {
           // 5-space rule: content starts at marker + 1, making excess into code
           content_start += static_cast<int>(marker_end) + 1;
           skip = marker_end + 1;  // Only skip marker + 1 space
@@ -3660,16 +3672,15 @@ class BlockParser {
           skip = content_pos;  // Skip to actual content
         }
 
-        std::string first_content =
-            std::string(expanded_trimmed.substr(skip));
+        std::string first_content = std::string(expanded_trimmed.substr(skip));
         item_lines.push_back(first_content);
         Advance();
         had_blank_line = false;
 
         // Collect continuation lines
         int required_indent = content_start;
-        bool first_line_empty = first_content.empty() ||
-                                detail::IsBlankLine(first_content);
+        bool first_line_empty =
+            first_content.empty() || detail::IsBlankLine(first_content);
 
         // Track fenced code blocks to ignore blank lines within them
         bool in_item_fenced_code = false;
@@ -3771,9 +3782,9 @@ class BlockParser {
               if (!cont_trimmed.empty() &&
                   std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {
                 size_t ne = 0;
-                while (
-                    ne < cont_trimmed.size() &&
-                    std::isdigit(static_cast<unsigned char>(cont_trimmed[ne]))) {
+                while (ne < cont_trimmed.size() &&
+                       std::isdigit(
+                           static_cast<unsigned char>(cont_trimmed[ne]))) {
                   ++ne;
                 }
                 if (ne > 0 && ne < cont_trimmed.size() &&
@@ -3865,12 +3876,12 @@ class BlockParser {
             }
 
             // Check for nested list markers (indent 0-3 with list marker)
-            if (!has_nested_list && dedented_indent >= 0 && dedented_indent < 4 &&
-                !dedented_trimmed.empty()) {
+            if (!has_nested_list && dedented_indent >= 0 &&
+                dedented_indent < 4 && !dedented_trimmed.empty()) {
               char fc = dedented_trimmed[0];
               if (fc == '-' || fc == '+' || fc == '*') {
-                if (dedented_trimmed.size() == 1 || dedented_trimmed[1] == ' ' ||
-                    dedented_trimmed[1] == '\t') {
+                if (dedented_trimmed.size() == 1 ||
+                    dedented_trimmed[1] == ' ' || dedented_trimmed[1] == '\t') {
                   has_nested_list = true;
                 }
               } else if (std::isdigit(static_cast<unsigned char>(fc))) {
@@ -3881,7 +3892,8 @@ class BlockParser {
                   ++ne;
                 }
                 if (ne > 0 && ne < dedented_trimmed.size() &&
-                    (dedented_trimmed[ne] == '.' || dedented_trimmed[ne] == ')')) {
+                    (dedented_trimmed[ne] == '.' ||
+                     dedented_trimmed[ne] == ')')) {
                   has_nested_list = true;
                 }
               }
@@ -4533,6 +4545,6 @@ inline std::string DebugAst(const Document& doc, int indent = 0) {
   return result;
 }
 
-}  // namespace hyde
+}  // namespace markus
 
-#endif  // HYDE_H_
+#endif  // MARKUS_H_

@@ -1,7 +1,7 @@
 cc_library(
-    name = "hyde",
+    name = "markus",
     hdrs = [
-        "hyde.h",
+        "markus.h",
     ],
 )
 
@@ -11,6 +11,6 @@ cc_binary(
         "main.cc",
     ],
     deps = [
-        ":hyde",
+        ":markus",
     ],
 )

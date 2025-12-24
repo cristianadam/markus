@@ -526,46 +526,81 @@ inline uint32_t UnicodeCaseFold(uint32_t cp) {
 
 // Normalize a link label (case-fold and collapse whitespace)
 // Uses Unicode-aware case folding for CommonMark compliance
+// Optimized with fast path for ASCII-only labels
 inline std::string NormalizeLinkLabel(std::string_view label) {
+  // Fast path: check if label is ASCII-only (common case)
+  bool all_ascii = true;
+  for (unsigned char c : label) {
+    if (c >= 0x80) {
+      all_ascii = false;
+      break;
+    }
+  }
+
   std::string result;
   result.reserve(label.size());
-  bool in_whitespace = false;
-  bool first = true;
-  size_t i = 0;
 
-  while (i < label.size()) {
-    // Check for whitespace (including multi-byte Unicode whitespace)
-    size_t ws_len = IsUnicodeWhitespaceAt(label, i);
-    if (ws_len > 0) {
-      if (!first && !in_whitespace) {
-        result += ' ';
-        in_whitespace = true;
+  if (all_ascii) {
+    // Fast ASCII-only path: simple lowercase + whitespace collapse
+    bool in_whitespace = false;
+    bool first = true;
+    for (char c : label) {
+      if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+        if (!first && !in_whitespace) {
+          result += ' ';
+          in_whitespace = true;
+        }
+      } else {
+        // ASCII lowercase: 'A'-'Z' (0x41-0x5A) -> 'a'-'z' (0x61-0x7A)
+        if (c >= 'A' && c <= 'Z') {
+          result += static_cast<char>(c + 32);
+        } else {
+          result += c;
+        }
+        in_whitespace = false;
+        first = false;
       }
-      i += ws_len;
-      continue;
     }
+  } else {
+    // Slow path: full Unicode handling
+    bool in_whitespace = false;
+    bool first = true;
+    size_t i = 0;
 
-    // Decode UTF-8 code point
-    auto [cp, len] = DecodeUtf8At(label, i);
-    if (len == 0) {
-      ++i;
-      continue;
+    while (i < label.size()) {
+      // Check for whitespace (including multi-byte Unicode whitespace)
+      size_t ws_len = IsUnicodeWhitespaceAt(label, i);
+      if (ws_len > 0) {
+        if (!first && !in_whitespace) {
+          result += ' ';
+          in_whitespace = true;
+        }
+        i += ws_len;
+        continue;
+      }
+
+      // Decode UTF-8 code point
+      auto [cp, len] = DecodeUtf8At(label, i);
+      if (len == 0) {
+        ++i;
+        continue;
+      }
+
+      // Apply case folding - special handling for characters that fold to
+      // multiple chars
+      if (cp == 0x1E9E) {
+        // German capital sharp S (ẞ) folds to "ss" in full case folding
+        result += "ss";
+      } else {
+        uint32_t folded = UnicodeCaseFold(cp);
+        // Encode back to UTF-8
+        result += CodePointToUtf8(folded);
+      }
+
+      in_whitespace = false;
+      first = false;
+      i += len;
     }
-
-    // Apply case folding - special handling for characters that fold to
-    // multiple chars
-    if (cp == 0x1E9E) {
-      // German capital sharp S (ẞ) folds to "ss" in full case folding
-      result += "ss";
-    } else {
-      uint32_t folded = UnicodeCaseFold(cp);
-      // Encode back to UTF-8
-      result += CodePointToUtf8(folded);
-    }
-
-    in_whitespace = false;
-    first = false;
-    i += len;
   }
 
   // Trim trailing space
@@ -719,7 +754,23 @@ inline int CountIndent(std::string_view line, int* consumed_chars = nullptr) {
 }
 
 // Remove N spaces of indentation (handling tabs)
+// Optimized with fast path for common case of n spaces at start
 inline std::string RemoveIndent(std::string_view line, int n) {
+  if (n <= 0) {
+    return std::string(line);
+  }
+
+  // Fast path: check if we have n spaces at the start (no tabs)
+  size_t space_count = 0;
+  while (space_count < line.size() && line[space_count] == ' ') {
+    ++space_count;
+  }
+  if (space_count >= static_cast<size_t>(n)) {
+    // Common case: just skip n spaces, return rest
+    return std::string(line.substr(n));
+  }
+
+  // Slow path: handle tabs
   std::string result;
   int removed = 0;
   size_t i = 0;
@@ -739,9 +790,8 @@ inline std::string RemoveIndent(std::string_view line, int n) {
         removed = n;
         ++i;
         // Add spaces for the portion of the tab we didn't use
-        for (int j = 0; j < tab_width - remaining; ++j) {
-          result += ' ';
-        }
+        int leftover = tab_width - remaining;
+        result.append(leftover, ' ');
       }
     } else {
       break;
@@ -841,16 +891,27 @@ inline std::string RemoveBlockQuotePrefix(std::string_view line) {
 }
 
 // Expand tabs to spaces (tab stops every 4 columns)
+// Optimized with fast path and batch copying
 inline std::string ExpandTabs(std::string_view line) {
+  // Fast path: no tabs present
+  size_t first_tab = line.find('\t');
+  if (first_tab == std::string_view::npos) {
+    return std::string(line);  // No tabs, zero-copy
+  }
+
   std::string result;
-  int column = 0;
-  for (char c : line) {
+  result.reserve(line.size() + 16);  // Extra space for tab expansion
+
+  // Copy everything before first tab
+  result.append(line.data(), first_tab);
+  int column = static_cast<int>(first_tab);
+
+  for (size_t i = first_tab; i < line.size(); ++i) {
+    char c = line[i];
     if (c == '\t') {
       int next_col = (column / 4 + 1) * 4;
       int spaces = next_col - column;
-      for (int j = 0; j < spaces; ++j) {
-        result += ' ';
-      }
+      result.append(spaces, ' ');
       column = next_col;
     } else {
       result += c;
@@ -890,41 +951,109 @@ inline bool IsBlankLine(std::string_view line) {
   return true;
 }
 
-// Split input into lines
-inline std::vector<std::string> SplitLines(std::string_view input) {
-  std::vector<std::string> lines;
-  std::string current_line;
+// =============================================================================
+// LineBuffer - Cache-friendly line storage
+// =============================================================================
+// Instead of vector<string> (many allocations, poor cache locality),
+// stores line offsets into a contiguous buffer. Only copies data when
+// null characters need replacement.
 
-  for (size_t i = 0; i < input.size(); ++i) {
-    char c = input[i];
-    if (c == '\n') {
-      lines.push_back(std::move(current_line));
-      current_line.clear();
-    } else if (c == '\r') {
-      lines.push_back(std::move(current_line));
-      current_line.clear();
-      if (i + 1 < input.size() && input[i + 1] == '\n') {
-        ++i;  // Skip LF after CR
+class LineBuffer {
+ public:
+  explicit LineBuffer(std::string_view input) {
+    if (input.empty()) {
+      return;
+    }
+
+    // First pass: check for nulls and count lines
+    bool has_nulls = false;
+    size_t line_count = 1;
+    for (size_t i = 0; i < input.size(); ++i) {
+      if (input[i] == '\0') has_nulls = true;
+      if (input[i] == '\n') ++line_count;
+      else if (input[i] == '\r') {
+        ++line_count;
+        if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
       }
-    } else if (c == '\0') {
-      // Replace null with replacement character
-      current_line += "\xEF\xBF\xBD";  // UTF-8 for U+FFFD
+    }
+
+    // Reserve space for line offsets (cache-friendly contiguous array)
+    line_offsets_.reserve(line_count + 1);
+
+    if (has_nulls) {
+      // Slow path: copy and replace nulls
+      buffer_.reserve(input.size() + line_count);  // Extra for replacement chars
+      size_t line_start = 0;
+      for (size_t i = 0; i < input.size(); ++i) {
+        char c = input[i];
+        if (c == '\n') {
+          line_offsets_.push_back({line_start, buffer_.size() - line_start});
+          line_start = buffer_.size();
+        } else if (c == '\r') {
+          line_offsets_.push_back({line_start, buffer_.size() - line_start});
+          if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
+          line_start = buffer_.size();
+        } else if (c == '\0') {
+          buffer_ += "\xEF\xBF\xBD";  // UTF-8 replacement character
+        } else {
+          buffer_ += c;
+        }
+      }
+      // Add final line
+      if (buffer_.size() > line_start ||
+          (!input.empty() && (input.back() == '\n' || input.back() == '\r'))) {
+        line_offsets_.push_back({line_start, buffer_.size() - line_start});
+      }
+      data_ptr_ = buffer_.data();
     } else {
-      current_line += c;
+      // Fast path: just store offsets into original input (zero-copy)
+      data_ptr_ = input.data();
+      size_t line_start = 0;
+      for (size_t i = 0; i < input.size(); ++i) {
+        char c = input[i];
+        if (c == '\n') {
+          line_offsets_.push_back({line_start, i - line_start});
+          line_start = i + 1;
+        } else if (c == '\r') {
+          line_offsets_.push_back({line_start, i - line_start});
+          if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
+          line_start = i + 1;
+        }
+      }
+      // Add final line
+      if (input.size() > line_start ||
+          (!input.empty() && (input.back() == '\n' || input.back() == '\r'))) {
+        line_offsets_.push_back({line_start, input.size() - line_start});
+      }
     }
   }
 
-  // Add last line if non-empty or if input ended with newline
-  if (!current_line.empty() ||
-      (!input.empty() && (input.back() == '\n' || input.back() == '\r'))) {
-    lines.push_back(std::move(current_line));
+  size_t size() const { return line_offsets_.size(); }
+  bool empty() const { return line_offsets_.empty(); }
+
+  std::string_view operator[](size_t idx) const {
+    const auto& [offset, len] = line_offsets_[idx];
+    return std::string_view(data_ptr_ + offset, len);
   }
 
-  // Handle empty input
-  if (lines.empty() && !input.empty()) {
-    lines.push_back(std::string(input));
-  }
+ private:
+  struct LineOffset {
+    size_t offset;
+    size_t length;
+  };
+  std::vector<LineOffset> line_offsets_;  // Contiguous array of offsets
+  std::string buffer_;                     // Only used if nulls present
+  const char* data_ptr_ = nullptr;         // Points to buffer_ or original input
+};
 
+// Legacy SplitLines for compatibility (used by some functions)
+inline std::vector<std::string> SplitLines(std::string_view input) {
+  LineBuffer buf(input);
+  std::vector<std::string> lines;
+  lines.reserve(buf.size());
+  for (size_t i = 0; i < buf.size(); ++i) {
+    lines.emplace_back(buf[i]);
+  }
   return lines;
 }
 
@@ -1019,15 +1148,41 @@ inline std::string_view LookupHtmlEntity(std::string_view name) {
 }
 
 // Decode HTML entities (named, decimal, hex) and backslash escapes
+// Optimized with batch copying for better cache locality
 inline std::string DecodeEscapesAndEntities(std::string_view text) {
+  // Fast path: check if any processing needed
+  bool needs_processing = false;
+  for (char c : text) {
+    if (c == '\\' || c == '&') {
+      needs_processing = true;
+      break;
+    }
+  }
+  if (!needs_processing) {
+    return std::string(text);  // Zero-copy for common case
+  }
+
   std::string result;
   result.reserve(text.size());
 
-  for (size_t i = 0; i < text.size(); ++i) {
+  size_t i = 0;
+  while (i < text.size()) {
+    // Find span of characters that don't need processing
+    size_t span_start = i;
+    while (i < text.size() && text[i] != '\\' && text[i] != '&') {
+      ++i;
+    }
+    // Batch copy the span
+    if (i > span_start) {
+      result.append(text.data() + span_start, i - span_start);
+    }
+    if (i >= text.size()) break;
+
     // Backslash escape
     if (text[i] == '\\' && i + 1 < text.size() &&
         IsAsciiPunctuation(text[i + 1])) {
-      result += text[++i];
+      result += text[i + 1];
+      i += 2;
       continue;
     }
 
@@ -1072,7 +1227,7 @@ inline std::string DecodeEscapesAndEntities(std::string_view text) {
                   static_cast<uint32_t>(std::stoul(num_str, nullptr, 10));
             }
             result += CodePointToUtf8(code_point);
-            i = num_end;
+            i = num_end + 1;
             continue;
           } catch (...) {
             // Invalid number, treat as literal
@@ -1092,30 +1247,52 @@ inline std::string DecodeEscapesAndEntities(std::string_view text) {
               LookupHtmlEntity(text.substr(start, name_end - start));
           if (!entity.empty()) {
             result += entity;
-            i = name_end;
+            i = name_end + 1;
             continue;
           }
         }
       }
     }
 
+    // No escape/entity matched, add literal character
     result += text[i];
+    ++i;
   }
 
   return result;
 }
 
 // Decode backslash escapes only (no entities)
+// Optimized with fast path and batch copying
 inline std::string DecodeEscapes(std::string_view text) {
+  // Fast path: check if any escapes present
+  if (text.find('\\') == std::string_view::npos) {
+    return std::string(text);  // No escapes, zero-copy
+  }
+
   std::string result;
   result.reserve(text.size());
 
-  for (size_t i = 0; i < text.size(); ++i) {
-    if (text[i] == '\\' && i + 1 < text.size() &&
-        IsAsciiPunctuation(text[i + 1])) {
-      result += text[++i];
-    } else {
-      result += text[i];
+  size_t i = 0;
+  while (i < text.size()) {
+    // Find span without backslashes
+    size_t span_start = i;
+    while (i < text.size() && text[i] != '\\') {
+      ++i;
+    }
+    // Batch copy the span
+    if (i > span_start) {
+      result.append(text.data() + span_start, i - span_start);
+    }
+    // Handle backslash
+    if (i < text.size()) {
+      if (i + 1 < text.size() && IsAsciiPunctuation(text[i + 1])) {
+        result += text[i + 1];
+        i += 2;
+      } else {
+        result += text[i];
+        ++i;
+      }
     }
   }
 
@@ -1176,8 +1353,12 @@ class InlineParser {
 
   std::vector<InlineNode> ParseInlines() {
     std::vector<InlineNode> result;
+    // Reserve based on text length heuristic (~1 node per 20 chars)
+    result.reserve(text_.size() / 20 + 4);
+
     std::vector<DelimiterNode> delimiter_stack;
     std::string pending_text;
+    pending_text.reserve(text_.size() / 4);  // Reserve for pending text
 
     auto flush_text = [&]() {
       if (!pending_text.empty()) {
@@ -2120,8 +2301,9 @@ class InlineParser {
         bool is_strong = opener.count >= 2 && closer.count >= 2;
         size_t delim_count = is_strong ? 2 : 1;
 
-        // Build emphasis node
+        // Build emphasis node - reserve capacity to avoid reallocations
         std::vector<InlineNode> content;
+        content.reserve(closer.pos - opener.pos - 1);
         for (size_t i = opener.pos + 1; i < closer.pos; ++i) {
           content.push_back(std::move(nodes[i]));
         }
@@ -2159,7 +2341,9 @@ class InlineParser {
         }
 
         // Insert emphasis node, removing the content in between
+        // Reserve capacity: opener nodes + 1 emph node + nodes after closer
         std::vector<InlineNode> new_nodes;
+        new_nodes.reserve(opener.pos + 1 + 1 + (nodes.size() - closer.pos));
         for (size_t i = 0; i <= opener.pos; ++i) {
           new_nodes.push_back(std::move(nodes[i]));
         }
@@ -2188,18 +2372,14 @@ class InlineParser {
       }
     }
 
-    // Remove empty text nodes
-    std::vector<InlineNode> filtered;
-    for (auto& node : nodes) {
+    // Remove empty text nodes in-place (avoids extra vector allocation)
+    auto new_end = std::remove_if(nodes.begin(), nodes.end(), [](const InlineNode& node) {
       if (auto* text = std::get_if<Text>(&node)) {
-        if (!text->content.empty()) {
-          filtered.push_back(std::move(node));
-        }
-      } else {
-        filtered.push_back(std::move(node));
+        return text->content.empty();
       }
-    }
-    nodes = std::move(filtered);
+      return false;
+    });
+    nodes.erase(new_end, nodes.end());
   }
 };
 
@@ -2211,7 +2391,8 @@ class BlockParser {
  public:
   Document Parse(std::string_view input) {
     Document doc;
-    lines_ = detail::SplitLines(input);
+    // Use LineBuffer for cache-friendly line storage (contiguous offsets)
+    lines_ = std::make_unique<detail::LineBuffer>(input);
     line_idx_ = 0;
     parent_link_refs_ = &doc.link_references;
 
@@ -2230,16 +2411,18 @@ class BlockParser {
   }
 
  private:
-  std::vector<std::string> lines_;
+  // LineBuffer provides cache-friendly storage: contiguous offset array
+  // pointing into single buffer, vs vector<string> with many allocations
+  std::unique_ptr<detail::LineBuffer> lines_;
   size_t line_idx_ = 0;
   std::unordered_map<std::string, std::pair<std::string, std::string>>*
       parent_link_refs_ = nullptr;
 
-  bool AtEnd() const { return line_idx_ >= lines_.size(); }
+  bool AtEnd() const { return !lines_ || line_idx_ >= lines_->size(); }
 
   std::string_view CurrentLine() const {
     if (AtEnd()) return "";
-    return lines_[line_idx_];
+    return (*lines_)[line_idx_];
   }
 
   void Advance() {
@@ -3625,15 +3808,14 @@ class BlockParser {
     int start = 1;
     char delimiter = '.';
     char bullet_char = '-';
-    int marker_width = 0;
 
     if (trimmed[0] == '-' || trimmed[0] == '+' || trimmed[0] == '*') {
       bullet_char = trimmed[0];
       // Marker can be followed by space, or be at end of line (empty item)
       if (trimmed.size() == 1) {
-        marker_width = 1;  // Just the bullet
+        // Just the bullet - valid empty item
       } else if (trimmed[1] == ' ' || trimmed[1] == '\t') {
-        marker_width = 2;  // Bullet + space
+        // Bullet + space - valid
       } else {
         return std::nullopt;  // Not a list marker
       }
@@ -3656,11 +3838,9 @@ class BlockParser {
 
       // Marker can be followed by space, or be at end of line (empty item)
       if (num_end + 1 >= trimmed.size()) {
-        marker_width =
-            static_cast<int>(num_end) + 1;  // Just number + delimiter
+        // Just number + delimiter - valid empty item
       } else if (trimmed[num_end + 1] == ' ' || trimmed[num_end + 1] == '\t') {
-        marker_width =
-            static_cast<int>(num_end) + 2;  // Number + delimiter + space
+        // Number + delimiter + space - valid
       } else {
         return std::nullopt;  // Not a list marker
       }
@@ -4413,6 +4593,8 @@ class HtmlRenderer {
  public:
   std::string Render(const Document& doc) {
     std::string result;
+    // Pre-allocate based on block count heuristic (~100 chars per block)
+    result.reserve(doc.children.size() * 100 + 256);
     RenderBlocks(doc.children, result, false);
     return result;
   }

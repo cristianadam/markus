@@ -375,7 +375,7 @@ inline bool IsSpanBlank(const char* data, size_t len) {
 // Looks for \n, \r (line endings) and \0 (null)
 // SIMD-friendly: accumulates without branching in inner loop
 inline std::pair<size_t, bool> ScanForLinesAndNulls(const char* data,
-                                                     size_t len) {
+                                                    size_t len) {
   size_t line_count = 0;
   bool has_nulls = false;
   size_t i = 0;
@@ -490,7 +490,8 @@ inline size_t Utf8CharLen(unsigned char c) {
 // Decode UTF-8 code point at position, return code point and bytes consumed
 inline std::pair<uint32_t, size_t> DecodeUtf8At(std::string_view s,
                                                 size_t pos) {
-  if (pos >= s.size()) [[unlikely]] return {0, 0};
+  if (pos >= s.size()) [[unlikely]]
+    return {0, 0};
   unsigned char c = static_cast<unsigned char>(s[pos]);
   if ((c & 0x80) == 0) {
     return {c, 1};
@@ -2521,7 +2522,8 @@ class InlineParser {
       }
       if (text_[i] == '[') ++depth;
       if (text_[i] == ']') --depth;
-      if (depth < 0) [[unlikely]] return false;  // More closes than opens
+      if (depth < 0) [[unlikely]]
+        return false;  // More closes than opens
     }
     return depth == 0;
   }
@@ -3005,7 +3007,8 @@ class InlineParser {
   }
 
   std::optional<InlineNode> TryParseAutolink() {
-    if (pos_ >= text_.size() || text_[pos_] != '<') [[unlikely]] return std::nullopt;
+    if (pos_ >= text_.size() || text_[pos_] != '<') [[unlikely]]
+      return std::nullopt;
 
     size_t start = pos_ + 1;
     size_t end = start;
@@ -3015,7 +3018,8 @@ class InlineParser {
       ++end;
     }
 
-    if (end >= text_.size() || text_[end] != '>') [[unlikely]] return std::nullopt;
+    if (end >= text_.size() || text_[end] != '>') [[unlikely]]
+      return std::nullopt;
 
     std::string_view content = text_.substr(start, end - start);
 
@@ -3048,7 +3052,8 @@ class InlineParser {
   }
 
   std::optional<std::pmr::string> TryParseEntity() {
-    if (pos_ >= text_.size() || text_[pos_] != '&') [[unlikely]] return std::nullopt;
+    if (pos_ >= text_.size() || text_[pos_] != '&') [[unlikely]]
+      return std::nullopt;
 
     size_t start = pos_ + 1;
 
@@ -3120,13 +3125,15 @@ class InlineParser {
   }
 
   std::optional<HtmlInline> TryParseHtmlInline() {
-    if (pos_ >= text_.size() || text_[pos_] != '<') [[unlikely]] return std::nullopt;
+    if (pos_ >= text_.size() || text_[pos_] != '<') [[unlikely]]
+      return std::nullopt;
 
     size_t start = pos_;
     size_t end = pos_ + 1;
 
     // Simple HTML tag detection
-    if (end >= text_.size()) [[unlikely]] return std::nullopt;
+    if (end >= text_.size()) [[unlikely]]
+      return std::nullopt;
 
     bool is_closing = (text_[end] == '/');
     if (is_closing) ++end;
@@ -3256,14 +3263,16 @@ class InlineParser {
               (text_[end] == ' ' || text_[end] == '\t' || text_[end] == '\n')) {
             ++end;
           }
-          if (end >= text_.size()) [[unlikely]] return std::nullopt;
+          if (end >= text_.size()) [[unlikely]]
+            return std::nullopt;
           if (text_[end] == '"' || text_[end] == '\'') {
             char quote = text_[end];
             ++end;
             while (end < text_.size() && text_[end] != quote) {
               ++end;
             }
-            if (end >= text_.size()) [[unlikely]] return std::nullopt;
+            if (end >= text_.size()) [[unlikely]]
+              return std::nullopt;
             ++end;
           } else {
             // Unquoted value - no spaces, quotes, =, <, >, or `
@@ -3289,7 +3298,8 @@ class InlineParser {
 
   std::optional<std::pair<std::pmr::string, std::pmr::string>>
   TryParseLinkTail() {
-    if (pos_ >= text_.size()) [[unlikely]] return std::nullopt;
+    if (pos_ >= text_.size()) [[unlikely]]
+      return std::nullopt;
 
     // Inline link: (destination "title")
     if (text_[pos_] == '(') {
@@ -3311,7 +3321,8 @@ class InlineParser {
           }
           ++pos_;
         }
-        if (pos_ >= text_.size() || text_[pos_] != '>') [[unlikely]] return std::nullopt;
+        if (pos_ >= text_.size() || text_[pos_] != '>') [[unlikely]]
+          return std::nullopt;
         destination = detail::DecodeEscapesAndEntities(
             text_.substr(dest_start, pos_ - dest_start));
         ++pos_;
@@ -3350,14 +3361,16 @@ class InlineParser {
           }
           ++pos_;
         }
-        if (pos_ >= text_.size()) [[unlikely]] return std::nullopt;
+        if (pos_ >= text_.size()) [[unlikely]]
+          return std::nullopt;
         title = detail::DecodeEscapesAndEntities(
             text_.substr(title_start, pos_ - title_start));
         ++pos_;
         SkipWhitespace();
       }
 
-      if (pos_ >= text_.size() || text_[pos_] != ')') [[unlikely]] return std::nullopt;
+      if (pos_ >= text_.size() || text_[pos_] != ')') [[unlikely]]
+        return std::nullopt;
       ++pos_;
 
       return std::make_pair(detail::EncodeUrl(destination), title);
@@ -3379,7 +3392,8 @@ class InlineParser {
         if (bracket_depth > 0) ++pos_;
       }
 
-      if (pos_ >= text_.size()) [[unlikely]] return std::nullopt;
+      if (pos_ >= text_.size()) [[unlikely]]
+        return std::nullopt;
 
       std::pmr::string label(text_.substr(label_start, pos_ - label_start));
       ++pos_;
@@ -3397,7 +3411,8 @@ class InlineParser {
 
   std::optional<std::pair<std::pmr::string, std::pmr::string>> LookupReference(
       const std::pmr::string& label) {
-    if (!link_references_) [[unlikely]] return std::nullopt;
+    if (!link_references_) [[unlikely]]
+      return std::nullopt;
 
     std::pmr::string normalized = detail::NormalizeLinkLabel(label);
     auto it = link_references_->find(normalized);
@@ -3446,7 +3461,8 @@ class InlineParser {
 
   void ProcessEmphasis(std::pmr::vector<InlineNode>& nodes,
                        std::pmr::vector<DelimiterNode>& delimiters) {
-    if (delimiters.empty()) [[unlikely]] return;
+    if (delimiters.empty()) [[unlikely]]
+      return;
 
     // Process emphasis using the algorithm from CommonMark spec
     size_t closer_idx = 0;
@@ -3636,14 +3652,16 @@ class BlockParser {
       }
       if (label[i] == '[') ++depth;
       if (label[i] == ']') --depth;
-      if (depth < 0) [[unlikely]] return false;
+      if (depth < 0) [[unlikely]]
+        return false;
     }
     return depth == 0;
   }
 
   // Helper to parse destination with balanced parentheses
   std::pair<std::pmr::string, size_t> ParseLinkDestination(std::string_view s) {
-    if (s.empty()) [[unlikely]] return {"", 0};
+    if (s.empty()) [[unlikely]]
+      return {"", 0};
 
     if (s[0] == '<') {
       // Angle-bracket destination
@@ -3679,7 +3697,8 @@ class BlockParser {
         ++end;
       }
     }
-    if (paren_depth != 0) [[unlikely]] return {"", 0};
+    if (paren_depth != 0) [[unlikely]]
+      return {"", 0};
     return {std::pmr::string(s.substr(0, end)), end};
   }
 
@@ -4291,13 +4310,16 @@ class BlockParser {
   std::optional<ThematicBreak> TryParseThematicBreak() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) [[unlikely]] return std::nullopt;
+    if (indent >= 4) [[unlikely]]
+      return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty()) [[unlikely]] return std::nullopt;
+    if (trimmed.empty()) [[unlikely]]
+      return std::nullopt;
 
     char marker = trimmed[0];
-    if (marker != '-' && marker != '*' && marker != '_') [[unlikely]] return std::nullopt;
+    if (marker != '-' && marker != '*' && marker != '_') [[unlikely]]
+      return std::nullopt;
 
     int count = 0;
     for (char c : trimmed) {
@@ -4319,10 +4341,12 @@ class BlockParser {
   std::optional<Heading> TryParseAtxHeading() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) [[unlikely]] return std::nullopt;
+    if (indent >= 4) [[unlikely]]
+      return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty() || trimmed[0] != '#') [[unlikely]] return std::nullopt;
+    if (trimmed.empty() || trimmed[0] != '#') [[unlikely]]
+      return std::nullopt;
 
     int level = 0;
     size_t i = 0;
@@ -4331,7 +4355,8 @@ class BlockParser {
       ++i;
     }
 
-    if (level > 6) [[unlikely]] return std::nullopt;
+    if (level > 6) [[unlikely]]
+      return std::nullopt;
     if (i < trimmed.size() && trimmed[i] != ' ' && trimmed[i] != '\t') {
       return std::nullopt;
     }
@@ -4384,13 +4409,16 @@ class BlockParser {
   std::optional<CodeBlock> TryParseFencedCodeBlock() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) [[unlikely]] return std::nullopt;
+    if (indent >= 4) [[unlikely]]
+      return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty()) [[unlikely]] return std::nullopt;
+    if (trimmed.empty()) [[unlikely]]
+      return std::nullopt;
 
     char fence_char = trimmed[0];
-    if (fence_char != '`' && fence_char != '~') [[unlikely]] return std::nullopt;
+    if (fence_char != '`' && fence_char != '~') [[unlikely]]
+      return std::nullopt;
 
     size_t fence_length = 0;
     while (fence_length < trimmed.size() &&
@@ -4398,11 +4426,13 @@ class BlockParser {
       ++fence_length;
     }
 
-    if (fence_length < 3) [[unlikely]] return std::nullopt;
+    if (fence_length < 3) [[unlikely]]
+      return std::nullopt;
 
     // Check for backtick in info string (not allowed for backtick fences)
     std::pmr::string info_string(detail::Trim(trimmed.substr(fence_length)));
-    if (fence_char == '`' && info_string.find('`') != std::string::npos) [[unlikely]] {
+    if (fence_char == '`' && info_string.find('`') != std::string::npos)
+        [[unlikely]] {
       return std::nullopt;
     }
     // Decode backslash escapes in info string
@@ -4472,10 +4502,12 @@ class BlockParser {
   std::optional<HtmlBlock> TryParseHtmlBlock() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) [[unlikely]] return std::nullopt;
+    if (indent >= 4) [[unlikely]]
+      return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty() || trimmed[0] != '<') [[unlikely]] return std::nullopt;
+    if (trimmed.empty() || trimmed[0] != '<') [[unlikely]]
+      return std::nullopt;
 
     int block_type = 0;
     std::pmr::string end_condition;
@@ -4767,7 +4799,8 @@ class BlockParser {
       }
     }
 
-    if (block_type == 0) [[unlikely]] return std::nullopt;
+    if (block_type == 0) [[unlikely]]
+      return std::nullopt;
 
     // Collect HTML block content
     std::pmr::string content;
@@ -4808,10 +4841,12 @@ class BlockParser {
   std::optional<BlockQuote> TryParseBlockQuote() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) [[unlikely]] return std::nullopt;
+    if (indent >= 4) [[unlikely]]
+      return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty() || trimmed[0] != '>') [[unlikely]] return std::nullopt;
+    if (trimmed.empty() || trimmed[0] != '>') [[unlikely]]
+      return std::nullopt;
 
     // Collect block quote lines
     std::pmr::vector<std::pmr::string> quote_lines;
@@ -4954,7 +4989,8 @@ class BlockParser {
       }
     }
 
-    if (quote_lines.empty()) [[unlikely]] return std::nullopt;
+    if (quote_lines.empty()) [[unlikely]]
+      return std::nullopt;
 
     // Parse the content of the block quote
     std::pmr::string quote_content;
@@ -4983,10 +5019,12 @@ class BlockParser {
   std::optional<List> TryParseList() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) [[unlikely]] return std::nullopt;
+    if (indent >= 4) [[unlikely]]
+      return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty()) [[unlikely]] return std::nullopt;
+    if (trimmed.empty()) [[unlikely]]
+      return std::nullopt;
 
     // Check for bullet list
     bool is_ordered = false;
@@ -5012,11 +5050,14 @@ class BlockParser {
              std::isdigit(static_cast<unsigned char>(trimmed[num_end]))) {
         ++num_end;
       }
-      if (num_end == 0 || num_end > 9) [[unlikely]] return std::nullopt;
-      if (num_end >= trimmed.size()) [[unlikely]] return std::nullopt;
+      if (num_end == 0 || num_end > 9) [[unlikely]]
+        return std::nullopt;
+      if (num_end >= trimmed.size()) [[unlikely]]
+        return std::nullopt;
 
       char delim = trimmed[num_end];
-      if (delim != '.' && delim != ')') [[unlikely]] return std::nullopt;
+      if (delim != '.' && delim != ')') [[unlikely]]
+        return std::nullopt;
 
       start = std::stoi(std::string(trimmed.substr(0, num_end)));
       delimiter = delim;
@@ -5468,7 +5509,8 @@ class BlockParser {
   std::optional<CodeBlock> TryParseIndentedCodeBlock() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent < 4) [[unlikely]] return std::nullopt;
+    if (indent < 4) [[unlikely]]
+      return std::nullopt;
 
     std::pmr::string content;
 
@@ -5505,7 +5547,8 @@ class BlockParser {
       }
     }
 
-    if (content.empty()) [[unlikely]] return std::nullopt;
+    if (content.empty()) [[unlikely]]
+      return std::nullopt;
 
     CodeBlock block;
     block.content = content;
@@ -5974,6 +6017,7 @@ inline std::pmr::string RenderHtml(const Document& doc) {
 
 // Convenience function: parse Markdown and render to HTML
 inline std::pmr::string MarkdownToHtml(std::string_view input) {
+  std::pmr::set_default_resource(&g_arena);
   return RenderHtml(Parse(input));
 }
 

@@ -1019,6 +1019,21 @@ class InlineParser {
     std::vector<InlineNode>* target;
   };
 
+  // Check if brackets are balanced in text between start and end (exclusive)
+  bool AreBracketsBalanced(size_t start, size_t end) {
+    int depth = 0;
+    for (size_t i = start; i < end && i < text_.size(); ++i) {
+      if (text_[i] == '\\' && i + 1 < end) {
+        ++i;  // Skip escaped character
+        continue;
+      }
+      if (text_[i] == '[') ++depth;
+      if (text_[i] == ']') --depth;
+      if (depth < 0) return false;  // More closes than opens
+    }
+    return depth == 0;
+  }
+
   std::vector<InlineNode> ParseInlines() {
     std::vector<InlineNode> result;
     std::vector<DelimiterNode> delimiter_stack;
@@ -1162,9 +1177,21 @@ class InlineParser {
       if (c == ']') {
         flush_text();
 
-        // Look for matching opener
-        auto opener = FindLinkOpener(delimiter_stack);
-        if (opener != delimiter_stack.end() && opener->active) {
+        // Look for matching opener - try multiple if brackets unbalanced
+        auto opener = delimiter_stack.end();
+        for (auto it = delimiter_stack.rbegin(); it != delimiter_stack.rend(); ++it) {
+          if ((it->delimiter == '[' || it->delimiter == '!') && it->active) {
+            // Check if brackets are balanced between this opener and closer
+            size_t content_start = it->text_pos + (it->delimiter == '!' ? 2 : 1);
+            if (AreBracketsBalanced(content_start, pos_)) {
+              opener = std::prev(it.base());
+              break;
+            }
+            // Unbalanced - skip this opener, try earlier ones
+          }
+        }
+
+        if (opener != delimiter_stack.end()) {
           // Try to parse link destination
           size_t saved_pos = pos_;
           ++pos_;  // Skip ']'
@@ -1222,19 +1249,41 @@ class InlineParser {
             continue;
           }
 
-          // Try shortcut reference link: [foo] with no following () or []
-          // Look up the text inside brackets as a reference label
-          std::string label_text;
-          for (size_t i = opener->pos + 1; i < result.size(); ++i) {
-            std::visit(
-                [&label_text](auto&& arg) {
-                  using T = std::decay_t<decltype(arg)>;
-                  if constexpr (std::is_same_v<T, Text>) {
-                    label_text += arg.content;
-                  }
-                },
-                result[i]);
+          // Try shortcut/collapsed reference link
+          // Check if TryParseLinkTail consumed a collapsed reference []
+          bool is_collapsed_ref = (pos_ == saved_pos + 3 &&
+                                   saved_pos + 2 < text_.size() &&
+                                   text_[saved_pos + 1] == '[' &&
+                                   text_[saved_pos + 2] == ']');
+
+          // Check if there was a full reference [label] that failed lookup
+          // In that case, don't try shortcut reference - per CommonMark spec,
+          // if a full reference [foo][bar] fails because bar is undefined,
+          // we don't fall back to shortcut [foo]
+          bool had_full_ref_attempt = (saved_pos + 1 < text_.size() &&
+                                       text_[saved_pos + 1] == '[' &&
+                                       !is_collapsed_ref);
+          if (had_full_ref_attempt) {
+            // Full reference was attempted but failed - don't try shortcut
+            pos_ = saved_pos;
+            opener->active = false;
+            result.push_back(Text("]"));
+            ++pos_;
+            continue;
           }
+
+          // Only reset pos_ if not a collapsed reference - in that case
+          // TryParseLinkTail correctly consumed the [] but returned nullopt
+          if (!is_collapsed_ref) {
+            pos_ = saved_pos + 1;
+          }
+
+          // Look up the text inside brackets as a reference label
+          // IMPORTANT: Use raw text from text_ to preserve escapes for matching
+          // (Text nodes have already decoded escapes like \! to !)
+          size_t label_start = opener->text_pos + (opener->delimiter == '!' ? 2 : 1);
+          size_t label_end = saved_pos;  // Position of ']'
+          std::string label_text(text_.substr(label_start, label_end - label_start));
 
           auto ref_result = LookupReference(label_text);
           if (ref_result) {
@@ -2065,6 +2114,21 @@ class BlockParser {
     return std::string_view::npos;
   }
 
+  // Check if brackets are balanced in a label string
+  bool IsLabelBracketsBalanced(const std::string& label) {
+    int depth = 0;
+    for (size_t i = 0; i < label.size(); ++i) {
+      if (label[i] == '\\' && i + 1 < label.size()) {
+        ++i;  // Skip escaped character
+        continue;
+      }
+      if (label[i] == '[') ++depth;
+      if (label[i] == ']') --depth;
+      if (depth < 0) return false;
+    }
+    return depth == 0;
+  }
+
   // Helper to parse destination with balanced parentheses
   std::pair<std::string, size_t> ParseLinkDestination(std::string_view s) {
     if (s.empty()) return {"", 0};
@@ -2300,6 +2364,14 @@ class BlockParser {
       }
 
       if (!found_close) {
+        line_idx_ = start_line;
+        prev_line_had_content = true;
+        Advance();
+        continue;
+      }
+
+      // Check that label has balanced brackets
+      if (!IsLabelBracketsBalanced(label_raw)) {
         line_idx_ = start_line;
         prev_line_had_content = true;
         Advance();
@@ -2584,6 +2656,12 @@ class BlockParser {
     }
 
     if (!found_close) {
+      line_idx_ = start_line;
+      return false;
+    }
+
+    // Check that label has balanced brackets
+    if (!IsLabelBracketsBalanced(label_raw)) {
       line_idx_ = start_line;
       return false;
     }

@@ -249,9 +249,29 @@ struct Document {
 namespace detail {
 
 // Check if a character is ASCII punctuation
+// Uses a 256-byte lookup table for O(1) performance
 inline bool IsAsciiPunctuation(char c) {
-  return (c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) ||
-         (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E);
+  // Lookup table: 1 if ASCII punctuation, 0 otherwise
+  // ASCII punctuation: 0x21-0x2F, 0x3A-0x40, 0x5B-0x60, 0x7B-0x7E
+  static constexpr uint8_t kPunctuationTable[256] = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x00-0x0F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // 0x20-0x2F (! to /)
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1,  // 0x30-0x3F (: to ?)
+      1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x40-0x4F (@)
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1,  // 0x50-0x5F ([ to _)
+      1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x60-0x6F (`)
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0,  // 0x70-0x7F ({ to ~)
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x80-0x8F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x90-0x9F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0xA0-0xAF
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0xB0-0xBF
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0xC0-0xCF
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0xD0-0xDF
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0xE0-0xEF
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0xF0-0xFF
+  };
+  return kPunctuationTable[static_cast<unsigned char>(c)] != 0;
 }
 
 // Get the byte length of a UTF-8 character starting at the given byte
@@ -360,10 +380,29 @@ inline bool IsUnicodeWhitespaceCodepoint(uint32_t cp) {
 }
 
 // Check if a character is Unicode whitespace (simplified)
-// Includes ASCII whitespace and common Unicode whitespace chars
+// Uses lookup table for O(1) performance
 inline bool IsUnicodeWhitespace(char c) {
-  unsigned char uc = static_cast<unsigned char>(c);
-  return uc == ' ' || uc == '\t' || uc == '\n' || uc == '\r' || uc == '\f';
+  // Lookup table for ASCII whitespace: space(0x20), tab(0x09), newline(0x0A),
+  // carriage return(0x0D), form feed(0x0C)
+  static constexpr uint8_t kWhitespaceTable[256] = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0,  // 0x00-0x0F: tab,lf,ff,cr
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
+      1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x20-0x2F: space
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x30-0x3F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x40-0x7F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x80-0xFF
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  };
+  return kWhitespaceTable[static_cast<unsigned char>(c)] != 0;
 }
 
 // Check for Unicode whitespace at position in a string (handles multi-byte
@@ -371,7 +410,8 @@ inline bool IsUnicodeWhitespace(char c) {
 inline size_t IsUnicodeWhitespaceAt(std::string_view s, size_t pos) {
   if (pos >= s.size()) return 0;
   unsigned char c = static_cast<unsigned char>(s[pos]);
-  if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+  // Fast path for ASCII whitespace using existing lookup
+  if (IsUnicodeWhitespace(static_cast<char>(c))) {
     return 1;
   }
   // UTF-8 NO-BREAK SPACE: 0xC2 0xA0
@@ -383,30 +423,34 @@ inline size_t IsUnicodeWhitespaceAt(std::string_view s, size_t pos) {
 }
 
 // Convert a Unicode code point to UTF-8
+// Uses fixed buffer to avoid multiple string reallocations
 inline std::string CodePointToUtf8(uint32_t cp) {
-  std::string result;
-  if (cp == 0) {
-    // Null character becomes replacement character
-    result = "\xEF\xBF\xBD";
+  char buf[4];
+  size_t len;
+
+  if (cp == 0 || cp >= 0x110000) {
+    // Null or invalid code point - use replacement character U+FFFD
+    return "\xEF\xBF\xBD";
   } else if (cp < 0x80) {
-    result += static_cast<char>(cp);
+    buf[0] = static_cast<char>(cp);
+    len = 1;
   } else if (cp < 0x800) {
-    result += static_cast<char>(0xC0 | (cp >> 6));
-    result += static_cast<char>(0x80 | (cp & 0x3F));
+    buf[0] = static_cast<char>(0xC0 | (cp >> 6));
+    buf[1] = static_cast<char>(0x80 | (cp & 0x3F));
+    len = 2;
   } else if (cp < 0x10000) {
-    result += static_cast<char>(0xE0 | (cp >> 12));
-    result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-    result += static_cast<char>(0x80 | (cp & 0x3F));
-  } else if (cp < 0x110000) {
-    result += static_cast<char>(0xF0 | (cp >> 18));
-    result += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-    result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-    result += static_cast<char>(0x80 | (cp & 0x3F));
+    buf[0] = static_cast<char>(0xE0 | (cp >> 12));
+    buf[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    buf[2] = static_cast<char>(0x80 | (cp & 0x3F));
+    len = 3;
   } else {
-    // Invalid code point - use replacement character
-    result = "\xEF\xBF\xBD";
+    buf[0] = static_cast<char>(0xF0 | (cp >> 18));
+    buf[1] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    buf[2] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    buf[3] = static_cast<char>(0x80 | (cp & 0x3F));
+    len = 4;
   }
-  return result;
+  return std::string(buf, len);
 }
 
 // Simple Unicode case-folding for a code point
@@ -532,46 +576,102 @@ inline std::string NormalizeLinkLabel(std::string_view label) {
   return result;
 }
 
-// HTML entity escaping
+// HTML entity escaping - optimized with lookup table and batch copying
 inline std::string EscapeHtml(std::string_view text) {
+  // Lookup table: 0 = no escape needed, non-zero = escape index
+  // 1=&, 2=<, 3=>, 4="
+  static constexpr uint8_t kEscapeTable[256] = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x00-0x0F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
+      0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x20-0x2F: " at 0x22, & at 0x26
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 3, 0,  // 0x30-0x3F: < at 0x3C, > at 0x3E
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x40-0x4F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x50-0x5F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x60-0x6F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x70-0x7F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x80-0xFF (high bytes)
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  };
+  static constexpr const char* kEscapeStrings[] = {
+      nullptr, "&amp;", "&lt;", "&gt;", "&quot;"};
+
   std::string result;
-  result.reserve(text.size());
-  for (char c : text) {
-    switch (c) {
-      case '&':
-        result += "&amp;";
-        break;
-      case '<':
-        result += "&lt;";
-        break;
-      case '>':
-        result += "&gt;";
-        break;
-      case '"':
-        result += "&quot;";
-        break;
-      default:
-        result += c;
-        break;
+  result.reserve(text.size() + text.size() / 8);  // Slightly over-reserve
+
+  size_t i = 0;
+  while (i < text.size()) {
+    // Find span of characters that don't need escaping
+    size_t start = i;
+    while (i < text.size() &&
+           kEscapeTable[static_cast<unsigned char>(text[i])] == 0) {
+      ++i;
+    }
+    // Batch copy non-escaped span
+    if (i > start) {
+      result.append(text.data() + start, i - start);
+    }
+    // Handle escaped character
+    if (i < text.size()) {
+      result += kEscapeStrings[kEscapeTable[static_cast<unsigned char>(text[i])]];
+      ++i;
     }
   }
   return result;
 }
 
 // URL encoding for link destinations
+// Uses lookup table for O(1) character classification and precomputed hex table
 inline std::string EncodeUrl(std::string_view url) {
+  // Lookup table: 1 = character is safe (no encoding needed), 0 = needs encoding
+  // Safe chars: alphanumeric and -_.~/:?#@!$&'()*+,;=%
+  static constexpr uint8_t kSafeTable[256] = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x00-0x0F
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
+      0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // 0x20-0x2F: !#$%&'()*+,-./
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1,  // 0x30-0x3F: 0-9:;=?
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // 0x40-0x4F: @A-O
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1,  // 0x50-0x5F: P-Z_
+      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // 0x60-0x6F: a-o
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0,  // 0x70-0x7F: p-z~
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x80-0xFF
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  };
+  // Hex encoding lookup (avoids snprintf)
+  static constexpr char kHexChars[] = "0123456789ABCDEF";
+
   std::string result;
-  result.reserve(url.size());
-  for (unsigned char c : url) {
-    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' ||
-        c == '/' || c == ':' || c == '?' || c == '#' || c == '@' || c == '!' ||
-        c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' ||
-        c == '+' || c == ',' || c == ';' || c == '=' || c == '%') {
-      result += static_cast<char>(c);
-    } else {
-      char buf[4];
-      std::snprintf(buf, sizeof(buf), "%%%02X", c);
-      result += buf;
+  result.reserve(url.size() + url.size() / 4);
+
+  size_t i = 0;
+  while (i < url.size()) {
+    // Find span of safe characters
+    size_t start = i;
+    while (i < url.size() && kSafeTable[static_cast<unsigned char>(url[i])]) {
+      ++i;
+    }
+    // Batch copy safe span
+    if (i > start) {
+      result.append(url.data() + start, i - start);
+    }
+    // Encode unsafe character
+    if (i < url.size()) {
+      unsigned char c = static_cast<unsigned char>(url[i]);
+      result += '%';
+      result += kHexChars[c >> 4];
+      result += kHexChars[c & 0x0F];
+      ++i;
     }
   }
   return result;
@@ -761,9 +861,29 @@ inline std::string ExpandTabs(std::string_view line) {
 }
 
 // Check if line is blank (only whitespace)
+// Uses lookup table for O(1) per-character checks
 inline bool IsBlankLine(std::string_view line) {
+  // Lookup table: 1 = blank character (space, tab, \r, \n), 0 = non-blank
+  static constexpr uint8_t kBlankTable[256] = {
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,  // 0x00-0x0F: tab,lf,cr
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
+      1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x20-0x2F: space
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x30-0xFF (all non-blank)
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  };
   for (char c : line) {
-    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+    if (!kBlankTable[static_cast<unsigned char>(c)]) {
       return false;
     }
   }
@@ -808,70 +928,90 @@ inline std::vector<std::string> SplitLines(std::string_view input) {
   return lines;
 }
 
-// HTML named entity map (common entities from CommonMark spec)
-inline std::string LookupHtmlEntity(std::string_view name) {
-  // This is a subset - full CommonMark compliance requires all HTML5 entities
-  static const std::unordered_map<std::string, std::string> entities = {
-      {"nbsp", "\xC2\xA0"},
-      {"amp", "&"},
-      {"lt", "<"},
-      {"gt", ">"},
-      {"quot", "\""},
-      {"apos", "'"},
-      {"copy", "\xC2\xA9"},
-      {"reg", "\xC2\xAE"},
-      {"AElig", "\xC3\x86"},
-      {"Dcaron", "\xC4\x8E"},
-      {"frac34", "\xC2\xBE"},
-      {"HilbertSpace", "\xE2\x84\x8B"},
-      {"DifferentialD", "\xE2\x85\x86"},
-      {"ClockwiseContourIntegral", "\xE2\x88\xB2"},
-      {"ngE", "\xE2\x89\xA7\xCC\xB8"},
-      {"ouml", "\xC3\xB6"},
-      {"Ouml", "\xC3\x96"},
-      {"auml", "\xC3\xA4"},
-      {"Auml", "\xC3\x84"},
-      {"uuml", "\xC3\xBC"},
-      {"Uuml", "\xC3\x9C"},
-      {"szlig", "\xC3\x9F"},
-      {"euro", "\xE2\x82\xAC"},
-      {"pound", "\xC2\xA3"},
-      {"yen", "\xC2\xA5"},
-      {"cent", "\xC2\xA2"},
-      {"deg", "\xC2\xB0"},
-      {"plusmn", "\xC2\xB1"},
-      {"times", "\xC3\x97"},
-      {"divide", "\xC3\xB7"},
-      {"frac12", "\xC2\xBD"},
-      {"frac14", "\xC2\xBC"},
-      {"para", "\xC2\xB6"},
-      {"sect", "\xC2\xA7"},
-      {"dagger", "\xE2\x80\xA0"},
-      {"Dagger", "\xE2\x80\xA1"},
-      {"bull", "\xE2\x80\xA2"},
-      {"hellip", "\xE2\x80\xA6"},
-      {"ndash", "\xE2\x80\x93"},
-      {"mdash", "\xE2\x80\x94"},
-      {"lsquo", "\xE2\x80\x98"},
-      {"rsquo", "\xE2\x80\x99"},
-      {"ldquo", "\xE2\x80\x9C"},
-      {"rdquo", "\xE2\x80\x9D"},
-      {"laquo", "\xC2\xAB"},
-      {"raquo", "\xC2\xBB"},
-      {"trade", "\xE2\x84\xA2"},
-      {"larr", "\xE2\x86\x90"},
-      {"rarr", "\xE2\x86\x92"},
-      {"uarr", "\xE2\x86\x91"},
-      {"darr", "\xE2\x86\x93"},
-      {"harr", "\xE2\x86\x94"},
-      {"spades", "\xE2\x99\xA0"},
-      {"clubs", "\xE2\x99\xA3"},
-      {"hearts", "\xE2\x99\xA5"},
-      {"diams", "\xE2\x99\xA6"},
-  };
+// Helper for transparent string_view lookup in unordered_map
+struct StringHash {
+  using is_transparent = void;
+  size_t operator()(std::string_view sv) const noexcept {
+    return std::hash<std::string_view>{}(sv);
+  }
+  size_t operator()(const std::string& s) const noexcept {
+    return std::hash<std::string_view>{}(s);
+  }
+};
 
-  std::string name_str(name);
-  auto it = entities.find(name_str);
+struct StringEqual {
+  using is_transparent = void;
+  bool operator()(std::string_view lhs, std::string_view rhs) const noexcept {
+    return lhs == rhs;
+  }
+};
+
+// HTML named entity map (common entities from CommonMark spec)
+// Uses transparent lookup to avoid string_view->string conversion
+inline std::string_view LookupHtmlEntity(std::string_view name) {
+  // This is a subset - full CommonMark compliance requires all HTML5 entities
+  static const std::unordered_map<std::string, std::string_view, StringHash,
+                                  StringEqual>
+      entities = {
+          {"nbsp", "\xC2\xA0"},
+          {"amp", "&"},
+          {"lt", "<"},
+          {"gt", ">"},
+          {"quot", "\""},
+          {"apos", "'"},
+          {"copy", "\xC2\xA9"},
+          {"reg", "\xC2\xAE"},
+          {"AElig", "\xC3\x86"},
+          {"Dcaron", "\xC4\x8E"},
+          {"frac34", "\xC2\xBE"},
+          {"HilbertSpace", "\xE2\x84\x8B"},
+          {"DifferentialD", "\xE2\x85\x86"},
+          {"ClockwiseContourIntegral", "\xE2\x88\xB2"},
+          {"ngE", "\xE2\x89\xA7\xCC\xB8"},
+          {"ouml", "\xC3\xB6"},
+          {"Ouml", "\xC3\x96"},
+          {"auml", "\xC3\xA4"},
+          {"Auml", "\xC3\x84"},
+          {"uuml", "\xC3\xBC"},
+          {"Uuml", "\xC3\x9C"},
+          {"szlig", "\xC3\x9F"},
+          {"euro", "\xE2\x82\xAC"},
+          {"pound", "\xC2\xA3"},
+          {"yen", "\xC2\xA5"},
+          {"cent", "\xC2\xA2"},
+          {"deg", "\xC2\xB0"},
+          {"plusmn", "\xC2\xB1"},
+          {"times", "\xC3\x97"},
+          {"divide", "\xC3\xB7"},
+          {"frac12", "\xC2\xBD"},
+          {"frac14", "\xC2\xBC"},
+          {"para", "\xC2\xB6"},
+          {"sect", "\xC2\xA7"},
+          {"dagger", "\xE2\x80\xA0"},
+          {"Dagger", "\xE2\x80\xA1"},
+          {"bull", "\xE2\x80\xA2"},
+          {"hellip", "\xE2\x80\xA6"},
+          {"ndash", "\xE2\x80\x93"},
+          {"mdash", "\xE2\x80\x94"},
+          {"lsquo", "\xE2\x80\x98"},
+          {"rsquo", "\xE2\x80\x99"},
+          {"ldquo", "\xE2\x80\x9C"},
+          {"rdquo", "\xE2\x80\x9D"},
+          {"laquo", "\xC2\xAB"},
+          {"raquo", "\xC2\xBB"},
+          {"trade", "\xE2\x84\xA2"},
+          {"larr", "\xE2\x86\x90"},
+          {"rarr", "\xE2\x86\x92"},
+          {"uarr", "\xE2\x86\x91"},
+          {"darr", "\xE2\x86\x93"},
+          {"harr", "\xE2\x86\x94"},
+          {"spades", "\xE2\x99\xA0"},
+          {"clubs", "\xE2\x99\xA3"},
+          {"hearts", "\xE2\x99\xA5"},
+          {"diams", "\xE2\x99\xA6"},
+      };
+
+  auto it = entities.find(name);
   if (it != entities.end()) {
     return it->second;
   }
@@ -948,7 +1088,7 @@ inline std::string DecodeEscapesAndEntities(std::string_view text) {
 
         if (name_end > start && name_end < text.size() &&
             text[name_end] == ';') {
-          std::string entity =
+          std::string_view entity =
               LookupHtmlEntity(text.substr(start, name_end - start));
           if (!entity.empty()) {
             result += entity;
@@ -1611,11 +1751,11 @@ class InlineParser {
 
       if (name_end > start && name_end < text_.size() &&
           text_[name_end] == ';') {
-        std::string entity =
+        std::string_view entity =
             detail::LookupHtmlEntity(text_.substr(start, name_end - start));
         if (!entity.empty()) {
           pos_ = name_end + 1;
-          return entity;
+          return std::string(entity);
         }
       }
     }
@@ -4319,22 +4459,33 @@ class HtmlRenderer {
   }
 
   void RenderHeading(const Heading& heading, std::string& out) {
-    out += "<h" + std::to_string(heading.level) + ">";
-    RenderInlines(heading.children, out);
-    out += "</h" + std::to_string(heading.level) + ">\n";
+    // Precomputed heading tags for levels 1-6 (avoids std::to_string)
+    static constexpr const char* kOpenTags[] = {"",     "<h1>", "<h2>",
+                                                 "<h3>", "<h4>", "<h5>", "<h6>"};
+    static constexpr const char* kCloseTags[] = {"",       "</h1>\n", "</h2>\n",
+                                                  "</h3>\n", "</h4>\n", "</h5>\n",
+                                                  "</h6>\n"};
+    int level = heading.level;
+    if (level >= 1 && level <= 6) {
+      out += kOpenTags[level];
+      RenderInlines(heading.children, out);
+      out += kCloseTags[level];
+    }
   }
 
   void RenderCodeBlock(const CodeBlock& block, std::string& out) {
     out += "<pre><code";
     if (!block.info_string.empty()) {
-      // Extract language (first word of info string)
-      std::string lang;
-      for (char c : block.info_string) {
-        if (c == ' ' || c == '\t') break;
-        lang += c;
-      }
+      // Extract language (first word of info string) using find
+      size_t end = block.info_string.find_first_of(" \t");
+      std::string_view lang =
+          (end == std::string::npos)
+              ? std::string_view(block.info_string)
+              : std::string_view(block.info_string).substr(0, end);
       if (!lang.empty()) {
-        out += " class=\"language-" + detail::EscapeHtml(lang) + "\"";
+        out += " class=\"language-";
+        out += detail::EscapeHtml(lang);
+        out += "\"";
       }
     }
     out += ">";

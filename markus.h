@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <memory_resource>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -15,6 +16,25 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+// =============================================================================
+// Arena Allocator Setup
+// =============================================================================
+
+inline constexpr std::size_t kArenaSize = 128 * 1024 * 1024;  // 64 MiB
+
+// The backing buffer (static storage). One per program because it's inline.
+alignas(std::max_align_t) inline std::byte g_buffer[kArenaSize];
+
+// The arena spills to heap via upstream new_delete_resource().
+inline std::pmr::monotonic_buffer_resource g_arena{
+    g_buffer, kArenaSize, std::pmr::new_delete_resource()};
+
+// Set the arena as the default memory resource for all pmr containers
+// inline const bool kArenaInitialized = []() {
+//   std::pmr::set_default_resource(&g_arena);
+//   return true;
+// };
 
 namespace markus {
 
@@ -68,7 +88,7 @@ enum class NodeType {
 };
 
 // Convert NodeType to string for debugging
-inline std::string NodeTypeToString(NodeType type) {
+inline std::pmr::string NodeTypeToString(NodeType type) {
   switch (type) {
     case NodeType::kDocument:
       return "Document";
@@ -124,9 +144,9 @@ using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
 
 struct Text {
   static constexpr NodeType kType = NodeType::kText;
-  std::string content;
+  std::pmr::string content;
 
-  explicit Text(std::string c) : content(std::move(c)) {}
+  explicit Text(std::pmr::string c) : content(std::move(c)) {}
   Text() = default;
 };
 
@@ -140,41 +160,41 @@ struct HardBreak {
 
 struct Code {
   static constexpr NodeType kType = NodeType::kCode;
-  std::string content;
+  std::pmr::string content;
 
-  explicit Code(std::string c) : content(std::move(c)) {}
+  explicit Code(std::pmr::string c) : content(std::move(c)) {}
   Code() = default;
 };
 
 struct Emphasis {
   static constexpr NodeType kType = NodeType::kEmphasis;
-  std::vector<InlineNode> children;
+  std::pmr::vector<InlineNode> children;
 };
 
 struct Strong {
   static constexpr NodeType kType = NodeType::kStrong;
-  std::vector<InlineNode> children;
+  std::pmr::vector<InlineNode> children;
 };
 
 struct Link {
   static constexpr NodeType kType = NodeType::kLink;
-  std::string destination;
-  std::string title;
-  std::vector<InlineNode> children;
+  std::pmr::string destination;
+  std::pmr::string title;
+  std::pmr::vector<InlineNode> children;
 };
 
 struct Image {
   static constexpr NodeType kType = NodeType::kImage;
-  std::string destination;
-  std::string title;
-  std::string alt_text;
+  std::pmr::string destination;
+  std::pmr::string title;
+  std::pmr::string alt_text;
 };
 
 struct HtmlInline {
   static constexpr NodeType kType = NodeType::kHtmlInline;
-  std::string content;
+  std::pmr::string content;
 
-  explicit HtmlInline(std::string c) : content(std::move(c)) {}
+  explicit HtmlInline(std::pmr::string c) : content(std::move(c)) {}
   HtmlInline() = default;
 };
 
@@ -184,15 +204,15 @@ struct HtmlInline {
 
 struct Paragraph {
   static constexpr NodeType kType = NodeType::kParagraph;
-  std::vector<InlineNode> children;
-  std::string raw_content;  // For debugging
+  std::pmr::vector<InlineNode> children;
+  std::pmr::string raw_content;  // For debugging
 };
 
 struct Heading {
   static constexpr NodeType kType = NodeType::kHeading;
   int level = 1;  // 1-6
-  std::vector<InlineNode> children;
-  std::string raw_content;  // For debugging
+  std::pmr::vector<InlineNode> children;
+  std::pmr::string raw_content;  // For debugging
 };
 
 struct ThematicBreak {
@@ -201,20 +221,20 @@ struct ThematicBreak {
 
 struct CodeBlock {
   static constexpr NodeType kType = NodeType::kCodeBlock;
-  std::string info_string;  // Language hint (e.g., "cpp", "python")
-  std::string content;
+  std::pmr::string info_string;  // Language hint (e.g., "cpp", "python")
+  std::pmr::string content;
   bool is_fenced = false;
 };
 
 struct HtmlBlock {
   static constexpr NodeType kType = NodeType::kHtmlBlock;
-  std::string content;
+  std::pmr::string content;
   int block_type = 0;  // CommonMark HTML block type (1-7)
 };
 
 struct ListItem {
   static constexpr NodeType kType = NodeType::kListItem;
-  std::vector<BlockNode> children;
+  std::pmr::vector<BlockNode> children;
   bool is_tight = true;
 };
 
@@ -225,20 +245,21 @@ struct List {
   char delimiter = '.';    // '.' or ')' for ordered lists
   char bullet_char = '-';  // '-', '+', or '*' for unordered lists
   bool is_tight = true;
-  std::vector<ListItem> items;
+  std::pmr::vector<ListItem> items;
 };
 
 struct BlockQuote {
   static constexpr NodeType kType = NodeType::kBlockQuote;
-  std::vector<BlockNode> children;
+  std::pmr::vector<BlockNode> children;
 };
 
 struct Document {
   static constexpr NodeType kType = NodeType::kDocument;
-  std::vector<BlockNode> children;
+  std::pmr::vector<BlockNode> children;
 
   // Link reference definitions
-  std::unordered_map<std::string, std::pair<std::string, std::string>>
+  std::pmr::unordered_map<std::pmr::string,
+                          std::pair<std::pmr::string, std::pmr::string>>
       link_references;  // label -> (destination, title)
 };
 
@@ -247,6 +268,189 @@ struct Document {
 // =============================================================================
 
 namespace detail {
+
+// =============================================================================
+// SIMD-Friendly Helper Functions
+// =============================================================================
+
+// Find first occurrence of any byte from a set in a chunk of data
+// Returns position relative to start, or len if not found
+// Designed for auto-vectorization by processing without early exits
+inline size_t FindFirstSpecialChar(const char* data, size_t len,
+                                   const uint8_t* special_table) {
+  size_t i = 0;
+  // Process 8 bytes at a time - compiler can vectorize this
+  for (; i + 8 <= len; i += 8) {
+    // Check 8 bytes - any special character found?
+    uint8_t found = 0;
+    found |= special_table[static_cast<unsigned char>(data[i])];
+    found |= special_table[static_cast<unsigned char>(data[i + 1])];
+    found |= special_table[static_cast<unsigned char>(data[i + 2])];
+    found |= special_table[static_cast<unsigned char>(data[i + 3])];
+    found |= special_table[static_cast<unsigned char>(data[i + 4])];
+    found |= special_table[static_cast<unsigned char>(data[i + 5])];
+    found |= special_table[static_cast<unsigned char>(data[i + 6])];
+    found |= special_table[static_cast<unsigned char>(data[i + 7])];
+    if (found) {
+      // Found something in this chunk, find exact position
+      for (size_t j = i; j < i + 8; ++j) {
+        if (special_table[static_cast<unsigned char>(data[j])]) {
+          return j;
+        }
+      }
+    }
+  }
+  // Handle remaining bytes
+  for (; i < len; ++i) {
+    if (special_table[static_cast<unsigned char>(data[i])]) {
+      return i;
+    }
+  }
+  return len;
+}
+
+// Find first byte where safe_table[byte] == 0 (i.e., needs encoding)
+// Used for URL encoding where table has 1 for safe, 0 for unsafe
+inline size_t FindFirstUnsafeChar(const char* data, size_t len,
+                                  const uint8_t* safe_table) {
+  size_t i = 0;
+  // Process 8 bytes at a time
+  for (; i + 8 <= len; i += 8) {
+    // Check 8 bytes - all safe?
+    uint8_t all_safe = 1;
+    all_safe &= safe_table[static_cast<unsigned char>(data[i])];
+    all_safe &= safe_table[static_cast<unsigned char>(data[i + 1])];
+    all_safe &= safe_table[static_cast<unsigned char>(data[i + 2])];
+    all_safe &= safe_table[static_cast<unsigned char>(data[i + 3])];
+    all_safe &= safe_table[static_cast<unsigned char>(data[i + 4])];
+    all_safe &= safe_table[static_cast<unsigned char>(data[i + 5])];
+    all_safe &= safe_table[static_cast<unsigned char>(data[i + 6])];
+    all_safe &= safe_table[static_cast<unsigned char>(data[i + 7])];
+    if (!all_safe) {
+      // Found something unsafe, find exact position
+      for (size_t j = i; j < i + 8; ++j) {
+        if (!safe_table[static_cast<unsigned char>(data[j])]) {
+          return j;
+        }
+      }
+    }
+  }
+  // Handle remaining bytes
+  for (; i < len; ++i) {
+    if (!safe_table[static_cast<unsigned char>(data[i])]) {
+      return i;
+    }
+  }
+  return len;
+}
+
+// Check if a span contains only blank characters (space, tab, \r, \n)
+// SIMD-friendly: processes 8 bytes at a time
+inline bool IsSpanBlank(const char* data, size_t len) {
+  size_t i = 0;
+  // Process 8 bytes at a time
+  for (; i + 8 <= len; i += 8) {
+    // For each byte, check if it's NOT a blank character
+    // Blank chars: space(0x20), tab(0x09), \n(0x0A), \r(0x0D)
+    bool all_blank = true;
+    for (size_t j = 0; j < 8; ++j) {
+      unsigned char c = static_cast<unsigned char>(data[i + j]);
+      bool is_blank = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+      all_blank = all_blank && is_blank;
+    }
+    if (!all_blank) return false;
+  }
+  // Handle remaining bytes
+  for (; i < len; ++i) {
+    unsigned char c = static_cast<unsigned char>(data[i]);
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Count occurrences and check for special bytes in a span
+// Returns: pair<line_count, has_special>
+// Looks for \n, \r (line endings) and \0 (null)
+// SIMD-friendly: accumulates without branching in inner loop
+inline std::pair<size_t, bool> ScanForLinesAndNulls(const char* data,
+                                                     size_t len) {
+  size_t line_count = 0;
+  bool has_nulls = false;
+  size_t i = 0;
+
+  // Process 8 bytes at a time, accumulating counts
+  for (; i + 8 <= len; i += 8) {
+    // Check each byte for line endings and nulls
+    for (size_t j = 0; j < 8; ++j) {
+      char c = data[i + j];
+      if (c == '\n') {
+        ++line_count;
+      } else if (c == '\r') {
+        ++line_count;
+        // Check for \r\n (but be careful at chunk boundary)
+        if (j + 1 < 8 && data[i + j + 1] == '\n') {
+          ++j;  // Skip the \n
+        } else if (i + j + 1 < len && data[i + j + 1] == '\n') {
+          // Will be handled in next iteration or remainder
+        }
+      } else if (c == '\0') {
+        has_nulls = true;
+      }
+    }
+  }
+
+  // Handle remaining bytes
+  for (; i < len; ++i) {
+    char c = data[i];
+    if (c == '\n') {
+      ++line_count;
+    } else if (c == '\r') {
+      ++line_count;
+      if (i + 1 < len && data[i + 1] == '\n') {
+        ++i;  // Skip the \n in \r\n
+      }
+    } else if (c == '\0') {
+      has_nulls = true;
+    }
+  }
+
+  return {line_count, has_nulls};
+}
+
+// Find next line ending (\n or \r) starting from pos
+// Returns position of line ending, or len if not found
+inline size_t FindNextLineEnding(const char* data, size_t len, size_t start) {
+  size_t i = start;
+  // Process 8 bytes at a time
+  for (; i + 8 <= len; i += 8) {
+    // Check 8 bytes for line endings
+    bool found = false;
+    for (size_t j = 0; j < 8; ++j) {
+      char c = data[i + j];
+      if (c == '\n' || c == '\r') {
+        found = true;
+        break;
+      }
+    }
+    if (found) {
+      // Find exact position
+      for (size_t j = i; j < i + 8 && j < len; ++j) {
+        if (data[j] == '\n' || data[j] == '\r') {
+          return j;
+        }
+      }
+    }
+  }
+  // Handle remaining bytes
+  for (; i < len; ++i) {
+    if (data[i] == '\n' || data[i] == '\r') {
+      return i;
+    }
+  }
+  return len;
+}
 
 // Check if a character is ASCII punctuation
 // Uses a 256-byte lookup table for O(1) performance
@@ -286,7 +490,7 @@ inline size_t Utf8CharLen(unsigned char c) {
 // Decode UTF-8 code point at position, return code point and bytes consumed
 inline std::pair<uint32_t, size_t> DecodeUtf8At(std::string_view s,
                                                 size_t pos) {
-  if (pos >= s.size()) return {0, 0};
+  if (pos >= s.size()) [[unlikely]] return {0, 0};
   unsigned char c = static_cast<unsigned char>(s[pos]);
   if ((c & 0x80) == 0) {
     return {c, 1};
@@ -385,22 +589,263 @@ inline bool IsUnicodeWhitespace(char c) {
   // Lookup table for ASCII whitespace: space(0x20), tab(0x09), newline(0x0A),
   // carriage return(0x0D), form feed(0x0C)
   static constexpr uint8_t kWhitespaceTable[256] = {
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0,  // 0x00-0x0F: tab,lf,ff,cr
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
-      1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x20-0x2F: space
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x30-0x3F
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x40-0x7F
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x80-0xFF
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      0,
+      1,
+      1,
+      0,
+      0,  // 0x00-0x0F:
+          // tab,lf,ff,cr
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x10-0x1F
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x20-0x2F: space
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x30-0x3F
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x40-0x7F
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x80-0xFF
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
   };
   return kWhitespaceTable[static_cast<unsigned char>(c)] != 0;
 }
@@ -424,11 +869,11 @@ inline size_t IsUnicodeWhitespaceAt(std::string_view s, size_t pos) {
 
 // Convert a Unicode code point to UTF-8
 // Uses fixed buffer to avoid multiple string reallocations
-inline std::string CodePointToUtf8(uint32_t cp) {
+inline std::pmr::string CodePointToUtf8(uint32_t cp) {
   char buf[4];
   size_t len;
 
-  if (cp == 0 || cp >= 0x110000) {
+  if (cp == 0 || cp >= 0x110000) [[unlikely]] {
     // Null or invalid code point - use replacement character U+FFFD
     return "\xEF\xBF\xBD";
   } else if (cp < 0x80) {
@@ -450,7 +895,7 @@ inline std::string CodePointToUtf8(uint32_t cp) {
     buf[3] = static_cast<char>(0x80 | (cp & 0x3F));
     len = 4;
   }
-  return std::string(buf, len);
+  return std::pmr::string(buf, len);
 }
 
 // Simple Unicode case-folding for a code point
@@ -527,7 +972,7 @@ inline uint32_t UnicodeCaseFold(uint32_t cp) {
 // Normalize a link label (case-fold and collapse whitespace)
 // Uses Unicode-aware case folding for CommonMark compliance
 // Optimized with fast path for ASCII-only labels
-inline std::string NormalizeLinkLabel(std::string_view label) {
+inline std::pmr::string NormalizeLinkLabel(std::string_view label) {
   // Fast path: check if label is ASCII-only (common case)
   bool all_ascii = true;
   for (unsigned char c : label) {
@@ -537,7 +982,7 @@ inline std::string NormalizeLinkLabel(std::string_view label) {
     }
   }
 
-  std::string result;
+  std::pmr::string result;
   result.reserve(label.size());
 
   if (all_ascii) {
@@ -612,48 +1057,289 @@ inline std::string NormalizeLinkLabel(std::string_view label) {
 }
 
 // HTML entity escaping - optimized with lookup table and batch copying
-inline std::string EscapeHtml(std::string_view text) {
+inline std::pmr::string EscapeHtml(std::string_view text) {
   // Lookup table: 0 = no escape needed, non-zero = escape index
   // 1=&, 2=<, 3=>, 4="
   static constexpr uint8_t kEscapeTable[256] = {
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x00-0x0F
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
-      0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x20-0x2F: " at 0x22, & at 0x26
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 3, 0,  // 0x30-0x3F: < at 0x3C, > at 0x3E
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x40-0x4F
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x50-0x5F
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x60-0x6F
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x70-0x7F
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x80-0xFF (high bytes)
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x00-0x0F
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x10-0x1F
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x20-0x2F: " at 0x22,
+          // & at 0x26
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      2,
+      0,
+      3,
+      0,  // 0x30-0x3F: < at 0x3C,
+          // > at 0x3E
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x40-0x4F
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x50-0x5F
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x60-0x6F
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x70-0x7F
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x80-0xFF (high bytes)
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
   };
-  static constexpr const char* kEscapeStrings[] = {
-      nullptr, "&amp;", "&lt;", "&gt;", "&quot;"};
+  static constexpr const char* kEscapeStrings[] = {nullptr, "&amp;", "&lt;",
+                                                   "&gt;", "&quot;"};
 
-  std::string result;
+  std::pmr::string result;
   result.reserve(text.size() + text.size() / 8);  // Slightly over-reserve
 
   size_t i = 0;
   while (i < text.size()) {
-    // Find span of characters that don't need escaping
-    size_t start = i;
-    while (i < text.size() &&
-           kEscapeTable[static_cast<unsigned char>(text[i])] == 0) {
-      ++i;
-    }
+    // Use SIMD-friendly helper to find next character needing escape
+    size_t next_special =
+        FindFirstSpecialChar(text.data() + i, text.size() - i, kEscapeTable);
     // Batch copy non-escaped span
-    if (i > start) {
-      result.append(text.data() + start, i - start);
+    if (next_special > 0) {
+      result.append(text.data() + i, next_special);
     }
+    i += next_special;
     // Handle escaped character
     if (i < text.size()) {
-      result += kEscapeStrings[kEscapeTable[static_cast<unsigned char>(text[i])]];
+      result +=
+          kEscapeStrings[kEscapeTable[static_cast<unsigned char>(text[i])]];
       ++i;
     }
   }
@@ -662,44 +1348,284 @@ inline std::string EscapeHtml(std::string_view text) {
 
 // URL encoding for link destinations
 // Uses lookup table for O(1) character classification and precomputed hex table
-inline std::string EncodeUrl(std::string_view url) {
-  // Lookup table: 1 = character is safe (no encoding needed), 0 = needs encoding
-  // Safe chars: alphanumeric and -_.~/:?#@!$&'()*+,;=%
+inline std::pmr::string EncodeUrl(std::string_view url) {
+  // Lookup table: 1 = character is safe (no encoding needed), 0 = needs
+  // encoding Safe chars: alphanumeric and -_.~/:?#@!$&'()*+,;=%
   static constexpr uint8_t kSafeTable[256] = {
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x00-0x0F
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
-      0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // 0x20-0x2F: !#$%&'()*+,-./
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1,  // 0x30-0x3F: 0-9:;=?
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // 0x40-0x4F: @A-O
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1,  // 0x50-0x5F: P-Z_
-      0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // 0x60-0x6F: a-o
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0,  // 0x70-0x7F: p-z~
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x80-0xFF
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x00-0x0F
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x10-0x1F
+      0,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,  // 0x20-0x2F:
+          // !#$%&'()*+,-./
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0,
+      1,  // 0x30-0x3F: 0-9:;=?
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,  // 0x40-0x4F: @A-O
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      1,  // 0x50-0x5F: P-Z_
+      0,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,  // 0x60-0x6F: a-o
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0,
+      1,
+      0,  // 0x70-0x7F: p-z~
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x80-0xFF
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
   };
   // Hex encoding lookup (avoids snprintf)
   static constexpr char kHexChars[] = "0123456789ABCDEF";
 
-  std::string result;
+  std::pmr::string result;
   result.reserve(url.size() + url.size() / 4);
 
   size_t i = 0;
   while (i < url.size()) {
-    // Find span of safe characters
-    size_t start = i;
-    while (i < url.size() && kSafeTable[static_cast<unsigned char>(url[i])]) {
-      ++i;
-    }
+    // Use SIMD-friendly helper to find first unsafe character
+    size_t next_unsafe =
+        FindFirstUnsafeChar(url.data() + i, url.size() - i, kSafeTable);
     // Batch copy safe span
-    if (i > start) {
-      result.append(url.data() + start, i - start);
+    if (next_unsafe > 0) {
+      result.append(url.data() + i, next_unsafe);
     }
+    i += next_unsafe;
     // Encode unsafe character
     if (i < url.size()) {
       unsigned char c = static_cast<unsigned char>(url[i]);
@@ -755,9 +1681,9 @@ inline int CountIndent(std::string_view line, int* consumed_chars = nullptr) {
 
 // Remove N spaces of indentation (handling tabs)
 // Optimized with fast path for common case of n spaces at start
-inline std::string RemoveIndent(std::string_view line, int n) {
+inline std::pmr::string RemoveIndent(std::string_view line, int n) {
   if (n <= 0) {
-    return std::string(line);
+    return std::pmr::string(line);
   }
 
   // Fast path: check if we have n spaces at the start (no tabs)
@@ -767,11 +1693,11 @@ inline std::string RemoveIndent(std::string_view line, int n) {
   }
   if (space_count >= static_cast<size_t>(n)) {
     // Common case: just skip n spaces, return rest
-    return std::string(line.substr(n));
+    return std::pmr::string(line.substr(n));
   }
 
   // Slow path: handle tabs
-  std::string result;
+  std::pmr::string result;
   int removed = 0;
   size_t i = 0;
 
@@ -804,7 +1730,7 @@ inline std::string RemoveIndent(std::string_view line, int n) {
 
 // Remove blockquote prefix (> and optional following space) with proper tab
 // handling Returns the remaining content with proper indentation preserved
-inline std::string RemoveBlockQuotePrefix(std::string_view line) {
+inline std::pmr::string RemoveBlockQuotePrefix(std::string_view line) {
   size_t i = 0;
   int column = 0;
 
@@ -828,7 +1754,7 @@ inline std::string RemoveBlockQuotePrefix(std::string_view line) {
 
   // Check for >
   if (i >= line.size() || line[i] != '>') {
-    return std::string(line);
+    return std::pmr::string(line);
   }
   ++i;
   ++column;
@@ -848,7 +1774,7 @@ inline std::string RemoveBlockQuotePrefix(std::string_view line) {
       ++i;
       content_start_column = tab_end;
       // The remaining (spaces_from_tab - 1) spaces become content indent
-      std::string result;
+      std::pmr::string result;
       for (int j = 0; j < spaces_from_tab - 1; ++j) {
         result += ' ';
       }
@@ -872,7 +1798,7 @@ inline std::string RemoveBlockQuotePrefix(std::string_view line) {
   }
 
   // Expand any remaining tabs in content
-  std::string result;
+  std::pmr::string result;
   int col = content_start_column;
   while (i < line.size()) {
     if (line[i] == '\t') {
@@ -892,14 +1818,14 @@ inline std::string RemoveBlockQuotePrefix(std::string_view line) {
 
 // Expand tabs to spaces (tab stops every 4 columns)
 // Optimized with fast path and batch copying
-inline std::string ExpandTabs(std::string_view line) {
+inline std::pmr::string ExpandTabs(std::string_view line) {
   // Fast path: no tabs present
   size_t first_tab = line.find('\t');
   if (first_tab == std::string_view::npos) {
-    return std::string(line);  // No tabs, zero-copy
+    return std::pmr::string(line);  // No tabs, zero-copy
   }
 
-  std::string result;
+  std::pmr::string result;
   result.reserve(line.size() + 16);  // Extra space for tab expansion
 
   // Copy everything before first tab
@@ -926,23 +1852,269 @@ inline std::string ExpandTabs(std::string_view line) {
 inline bool IsBlankLine(std::string_view line) {
   // Lookup table: 1 = blank character (space, tab, \r, \n), 0 = non-blank
   static constexpr uint8_t kBlankTable[256] = {
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,  // 0x00-0x0F: tab,lf,cr
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x10-0x1F
-      1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x20-0x2F: space
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  // 0x30-0xFF (all non-blank)
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      0,
+      0,
+      1,
+      0,
+      0,  // 0x00-0x0F: tab,lf,cr
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x10-0x1F
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x20-0x2F: space
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,  // 0x30-0xFF (all
+          // non-blank)
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
   };
+  // Use SIMD-friendly helper for bulk processing
+  if (line.size() >= 8) {
+    return IsSpanBlank(line.data(), line.size());
+  }
+  // Scalar fallback for short lines
   for (char c : line) {
     if (!kBlankTable[static_cast<unsigned char>(c)]) {
       return false;
@@ -961,7 +2133,7 @@ inline bool IsBlankLine(std::string_view line) {
 class LineBuffer {
  public:
   explicit LineBuffer(std::string_view input) {
-    if (input.empty()) {
+    if (input.empty()) [[unlikely]] {
       return;
     }
 
@@ -970,7 +2142,8 @@ class LineBuffer {
     size_t line_count = 1;
     for (size_t i = 0; i < input.size(); ++i) {
       if (input[i] == '\0') has_nulls = true;
-      if (input[i] == '\n') ++line_count;
+      if (input[i] == '\n')
+        ++line_count;
       else if (input[i] == '\r') {
         ++line_count;
         if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
@@ -980,9 +2153,10 @@ class LineBuffer {
     // Reserve space for line offsets (cache-friendly contiguous array)
     line_offsets_.reserve(line_count + 1);
 
-    if (has_nulls) {
+    if (has_nulls) [[unlikely]] {
       // Slow path: copy and replace nulls
-      buffer_.reserve(input.size() + line_count);  // Extra for replacement chars
+      buffer_.reserve(input.size() +
+                      line_count);  // Extra for replacement chars
       size_t line_start = 0;
       for (size_t i = 0; i < input.size(); ++i) {
         char c = input[i];
@@ -1041,15 +2215,15 @@ class LineBuffer {
     size_t offset;
     size_t length;
   };
-  std::vector<LineOffset> line_offsets_;  // Contiguous array of offsets
-  std::string buffer_;                     // Only used if nulls present
-  const char* data_ptr_ = nullptr;         // Points to buffer_ or original input
+  std::pmr::vector<LineOffset> line_offsets_;  // Contiguous array of offsets
+  std::pmr::string buffer_;                    // Only used if nulls present
+  const char* data_ptr_ = nullptr;  // Points to buffer_ or original input
 };
 
 // Legacy SplitLines for compatibility (used by some functions)
-inline std::vector<std::string> SplitLines(std::string_view input) {
+inline std::pmr::vector<std::pmr::string> SplitLines(std::string_view input) {
   LineBuffer buf(input);
-  std::vector<std::string> lines;
+  std::pmr::vector<std::pmr::string> lines;
   lines.reserve(buf.size());
   for (size_t i = 0; i < buf.size(); ++i) {
     lines.emplace_back(buf[i]);
@@ -1063,7 +2237,7 @@ struct StringHash {
   size_t operator()(std::string_view sv) const noexcept {
     return std::hash<std::string_view>{}(sv);
   }
-  size_t operator()(const std::string& s) const noexcept {
+  size_t operator()(const std::pmr::string& s) const noexcept {
     return std::hash<std::string_view>{}(s);
   }
 };
@@ -1079,8 +2253,8 @@ struct StringEqual {
 // Uses transparent lookup to avoid string_view->string conversion
 inline std::string_view LookupHtmlEntity(std::string_view name) {
   // This is a subset - full CommonMark compliance requires all HTML5 entities
-  static const std::unordered_map<std::string, std::string_view, StringHash,
-                                  StringEqual>
+  static const std::pmr::unordered_map<std::pmr::string, std::string_view,
+                                       StringHash, StringEqual>
       entities = {
           {"nbsp", "\xC2\xA0"},
           {"amp", "&"},
@@ -1149,7 +2323,7 @@ inline std::string_view LookupHtmlEntity(std::string_view name) {
 
 // Decode HTML entities (named, decimal, hex) and backslash escapes
 // Optimized with batch copying for better cache locality
-inline std::string DecodeEscapesAndEntities(std::string_view text) {
+inline std::pmr::string DecodeEscapesAndEntities(std::string_view text) {
   // Fast path: check if any processing needed
   bool needs_processing = false;
   for (char c : text) {
@@ -1159,10 +2333,10 @@ inline std::string DecodeEscapesAndEntities(std::string_view text) {
     }
   }
   if (!needs_processing) {
-    return std::string(text);  // Zero-copy for common case
+    return std::pmr::string(text);  // Zero-copy for common case
   }
 
-  std::string result;
+  std::pmr::string result;
   result.reserve(text.size());
 
   size_t i = 0;
@@ -1264,13 +2438,13 @@ inline std::string DecodeEscapesAndEntities(std::string_view text) {
 
 // Decode backslash escapes only (no entities)
 // Optimized with fast path and batch copying
-inline std::string DecodeEscapes(std::string_view text) {
+inline std::pmr::string DecodeEscapes(std::string_view text) {
   // Fast path: check if any escapes present
   if (text.find('\\') == std::string_view::npos) {
-    return std::string(text);  // No escapes, zero-copy
+    return std::pmr::string(text);  // No escapes, zero-copy
   }
 
-  std::string result;
+  std::pmr::string result;
   result.reserve(text.size());
 
   size_t i = 0;
@@ -1308,12 +2482,12 @@ inline std::string DecodeEscapes(std::string_view text) {
 class InlineParser {
  public:
   explicit InlineParser(
-      const std::unordered_map<std::string,
-                               std::pair<std::string, std::string>>* link_refs =
-          nullptr)
+      const std::pmr::unordered_map<
+          std::pmr::string, std::pair<std::pmr::string, std::pmr::string>>*
+          link_refs = nullptr)
       : link_references_(link_refs) {}
 
-  std::vector<InlineNode> Parse(std::string_view text) {
+  std::pmr::vector<InlineNode> Parse(std::string_view text) {
     text_ = text;
     pos_ = 0;
     return ParseInlines();
@@ -1322,7 +2496,8 @@ class InlineParser {
  private:
   std::string_view text_;
   size_t pos_ = 0;
-  const std::unordered_map<std::string, std::pair<std::string, std::string>>*
+  const std::pmr::unordered_map<std::pmr::string,
+                                std::pair<std::pmr::string, std::pmr::string>>*
       link_references_ = nullptr;
 
   struct DelimiterNode {
@@ -1333,7 +2508,7 @@ class InlineParser {
     bool can_open;
     bool can_close;
     bool active;
-    std::vector<InlineNode>* target;
+    std::pmr::vector<InlineNode>* target;
   };
 
   // Check if brackets are balanced in text between start and end (exclusive)
@@ -1346,18 +2521,18 @@ class InlineParser {
       }
       if (text_[i] == '[') ++depth;
       if (text_[i] == ']') --depth;
-      if (depth < 0) return false;  // More closes than opens
+      if (depth < 0) [[unlikely]] return false;  // More closes than opens
     }
     return depth == 0;
   }
 
-  std::vector<InlineNode> ParseInlines() {
-    std::vector<InlineNode> result;
+  std::pmr::vector<InlineNode> ParseInlines() {
+    std::pmr::vector<InlineNode> result;
     // Reserve based on text length heuristic (~1 node per 20 chars)
     result.reserve(text_.size() / 20 + 4);
 
-    std::vector<DelimiterNode> delimiter_stack;
-    std::string pending_text;
+    std::pmr::vector<DelimiterNode> delimiter_stack;
+    std::pmr::string pending_text;
     pending_text.reserve(text_.size() / 4);  // Reserve for pending text
 
     auto flush_text = [&]() {
@@ -1375,7 +2550,7 @@ class InlineParser {
         char next = text_[pos_ + 1];
         if (detail::IsAsciiPunctuation(next)) {
           flush_text();
-          result.push_back(Text(std::string(1, next)));
+          result.push_back(Text(std::pmr::string(1, next)));
           pos_ += 2;
           continue;
         } else if (next == '\n') {
@@ -1410,7 +2585,7 @@ class InlineParser {
                text_[pos_ + backtick_count] == '`') {
           ++backtick_count;
         }
-        pending_text += std::string(backtick_count, '`');
+        pending_text += std::pmr::string(backtick_count, '`');
         pos_ += backtick_count;
         continue;
       }
@@ -1467,7 +2642,7 @@ class InlineParser {
                                    can_close, true, &result});
 
         // Add the delimiter characters as text for now
-        result.push_back(Text(std::string(run_length, c)));
+        result.push_back(Text(std::pmr::string(run_length, c)));
         pos_ += run_length;
         continue;
       }
@@ -1525,14 +2700,14 @@ class InlineParser {
             bool is_image = (opener->delimiter == '!');
 
             // Collect inline content between opener and closer
-            std::vector<InlineNode> link_content;
+            std::pmr::vector<InlineNode> link_content;
             for (size_t i = opener->pos + 1; i < result.size(); ++i) {
               link_content.push_back(std::move(result[i]));
             }
 
             // Extract delimiters that belong to link content and process
             // emphasis
-            std::vector<DelimiterNode> link_delimiters;
+            std::pmr::vector<DelimiterNode> link_delimiters;
             for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
               if (it->pos > opener->pos && it->pos < result.size()) {
                 DelimiterNode d = *it;
@@ -1606,21 +2781,21 @@ class InlineParser {
           size_t label_start =
               opener->text_pos + (opener->delimiter == '!' ? 2 : 1);
           size_t label_end = saved_pos;  // Position of ']'
-          std::string label_text(
+          std::pmr::string label_text(
               text_.substr(label_start, label_end - label_start));
 
           auto ref_result = LookupReference(label_text);
           if (ref_result) {
             bool is_image = (opener->delimiter == '!');
 
-            std::vector<InlineNode> link_content;
+            std::pmr::vector<InlineNode> link_content;
             for (size_t i = opener->pos + 1; i < result.size(); ++i) {
               link_content.push_back(std::move(result[i]));
             }
 
             // Extract delimiters that belong to link content and process
             // emphasis
-            std::vector<DelimiterNode> link_delimiters;
+            std::pmr::vector<DelimiterNode> link_delimiters;
             for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
               if (it->pos > opener->pos && it->pos < result.size()) {
                 DelimiterNode d = *it;
@@ -1771,8 +2946,8 @@ class InlineParser {
            detail::IsUnicodePunctuation(after_cp);
   }
 
-  std::vector<DelimiterNode>::iterator FindLinkOpener(
-      std::vector<DelimiterNode>& stack) {
+  std::pmr::vector<DelimiterNode>::iterator FindLinkOpener(
+      std::pmr::vector<DelimiterNode>& stack) {
     for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
       if ((it->delimiter == '[' || it->delimiter == '!') && it->active) {
         return std::prev(it.base());
@@ -1801,7 +2976,7 @@ class InlineParser {
         }
         if (close_count == backtick_count) {
           // Found matching closer
-          std::string content(
+          std::pmr::string content(
               text_.substr(content_start, search_pos - content_start));
 
           // Normalize: replace newlines with spaces
@@ -1830,7 +3005,7 @@ class InlineParser {
   }
 
   std::optional<InlineNode> TryParseAutolink() {
-    if (pos_ >= text_.size() || text_[pos_] != '<') return std::nullopt;
+    if (pos_ >= text_.size() || text_[pos_] != '<') [[unlikely]] return std::nullopt;
 
     size_t start = pos_ + 1;
     size_t end = start;
@@ -1840,14 +3015,14 @@ class InlineParser {
       ++end;
     }
 
-    if (end >= text_.size() || text_[end] != '>') return std::nullopt;
+    if (end >= text_.size() || text_[end] != '>') [[unlikely]] return std::nullopt;
 
     std::string_view content = text_.substr(start, end - start);
 
     // Check for URI autolink
     static const std::regex uri_regex(
         R"(^[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^\s<>]*$)");
-    std::string content_str(content);
+    std::pmr::string content_str(content);
     if (std::regex_match(content_str, uri_regex)) {
       pos_ = end + 1;
       Link link;
@@ -1872,8 +3047,8 @@ class InlineParser {
     return std::nullopt;
   }
 
-  std::optional<std::string> TryParseEntity() {
-    if (pos_ >= text_.size() || text_[pos_] != '&') return std::nullopt;
+  std::optional<std::pmr::string> TryParseEntity() {
+    if (pos_ >= text_.size() || text_[pos_] != '&') [[unlikely]] return std::nullopt;
 
     size_t start = pos_ + 1;
 
@@ -1936,7 +3111,7 @@ class InlineParser {
             detail::LookupHtmlEntity(text_.substr(start, name_end - start));
         if (!entity.empty()) {
           pos_ = name_end + 1;
-          return std::string(entity);
+          return std::pmr::string(entity);
         }
       }
     }
@@ -1945,13 +3120,13 @@ class InlineParser {
   }
 
   std::optional<HtmlInline> TryParseHtmlInline() {
-    if (pos_ >= text_.size() || text_[pos_] != '<') return std::nullopt;
+    if (pos_ >= text_.size() || text_[pos_] != '<') [[unlikely]] return std::nullopt;
 
     size_t start = pos_;
     size_t end = pos_ + 1;
 
     // Simple HTML tag detection
-    if (end >= text_.size()) return std::nullopt;
+    if (end >= text_.size()) [[unlikely]] return std::nullopt;
 
     bool is_closing = (text_[end] == '/');
     if (is_closing) ++end;
@@ -1968,19 +3143,22 @@ class InlineParser {
           if (next == '>') {
             // <!--> is a valid immediately-closed comment
             pos_ = pos_ + 5;
-            return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+            return HtmlInline(
+                std::pmr::string(text_.substr(start, pos_ - start)));
           }
           if (next == '-' && pos_ + 5 < text_.size() &&
               text_[pos_ + 5] == '>') {
             // <!---> is a valid immediately-closed comment
             pos_ = pos_ + 6;
-            return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+            return HtmlInline(
+                std::pmr::string(text_.substr(start, pos_ - start)));
           }
           // Normal comment: find -->
           end = text_.find("-->", pos_ + 4);
           if (end != std::string_view::npos) {
             pos_ = end + 3;
-            return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+            return HtmlInline(
+                std::pmr::string(text_.substr(start, pos_ - start)));
           }
         } else if (pos_ + 4 == text_.size()) {
           // Just "<!--" at end - not a valid comment, leave as text
@@ -1990,14 +3168,16 @@ class InlineParser {
         end = text_.find("]]>", pos_ + 9);
         if (end != std::string_view::npos) {
           pos_ = end + 3;
-          return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+          return HtmlInline(
+              std::pmr::string(text_.substr(start, pos_ - start)));
         }
       }
       if (text_.substr(pos_).starts_with("<?")) {
         end = text_.find("?>", pos_ + 2);
         if (end != std::string_view::npos) {
           pos_ = end + 2;
-          return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+          return HtmlInline(
+              std::pmr::string(text_.substr(start, pos_ - start)));
         }
       }
       if (text_.substr(pos_).starts_with("<!") && end + 1 < text_.size() &&
@@ -2005,7 +3185,8 @@ class InlineParser {
         end = text_.find('>', pos_ + 2);
         if (end != std::string_view::npos) {
           pos_ = end + 1;
-          return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+          return HtmlInline(
+              std::pmr::string(text_.substr(start, pos_ - start)));
         }
       }
       return std::nullopt;
@@ -2026,7 +3207,7 @@ class InlineParser {
       char c = text_[end];
       if (c == '>') {
         pos_ = end + 1;
-        return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+        return HtmlInline(std::pmr::string(text_.substr(start, pos_ - start)));
       } else if (is_closing) {
         // Closing tags: only whitespace allowed before >
         if (c == ' ' || c == '\t' || c == '\n') {
@@ -2038,7 +3219,8 @@ class InlineParser {
         // Self-closing: must be followed by >
         if (end + 1 < text_.size() && text_[end + 1] == '>') {
           pos_ = end + 2;
-          return HtmlInline(std::string(text_.substr(start, pos_ - start)));
+          return HtmlInline(
+              std::pmr::string(text_.substr(start, pos_ - start)));
         }
         return std::nullopt;  // / not followed by >
       } else if (c == ' ' || c == '\t' || c == '\n') {
@@ -2074,14 +3256,14 @@ class InlineParser {
               (text_[end] == ' ' || text_[end] == '\t' || text_[end] == '\n')) {
             ++end;
           }
-          if (end >= text_.size()) return std::nullopt;
+          if (end >= text_.size()) [[unlikely]] return std::nullopt;
           if (text_[end] == '"' || text_[end] == '\'') {
             char quote = text_[end];
             ++end;
             while (end < text_.size() && text_[end] != quote) {
               ++end;
             }
-            if (end >= text_.size()) return std::nullopt;
+            if (end >= text_.size()) [[unlikely]] return std::nullopt;
             ++end;
           } else {
             // Unquoted value - no spaces, quotes, =, <, >, or `
@@ -2105,16 +3287,17 @@ class InlineParser {
     return std::nullopt;
   }
 
-  std::optional<std::pair<std::string, std::string>> TryParseLinkTail() {
-    if (pos_ >= text_.size()) return std::nullopt;
+  std::optional<std::pair<std::pmr::string, std::pmr::string>>
+  TryParseLinkTail() {
+    if (pos_ >= text_.size()) [[unlikely]] return std::nullopt;
 
     // Inline link: (destination "title")
     if (text_[pos_] == '(') {
       ++pos_;
       SkipWhitespace();
 
-      std::string destination;
-      std::string title;
+      std::pmr::string destination;
+      std::pmr::string title;
 
       // Parse destination
       if (pos_ < text_.size() && text_[pos_] == '<') {
@@ -2128,7 +3311,7 @@ class InlineParser {
           }
           ++pos_;
         }
-        if (pos_ >= text_.size() || text_[pos_] != '>') return std::nullopt;
+        if (pos_ >= text_.size() || text_[pos_] != '>') [[unlikely]] return std::nullopt;
         destination = detail::DecodeEscapesAndEntities(
             text_.substr(dest_start, pos_ - dest_start));
         ++pos_;
@@ -2167,14 +3350,14 @@ class InlineParser {
           }
           ++pos_;
         }
-        if (pos_ >= text_.size()) return std::nullopt;
+        if (pos_ >= text_.size()) [[unlikely]] return std::nullopt;
         title = detail::DecodeEscapesAndEntities(
             text_.substr(title_start, pos_ - title_start));
         ++pos_;
         SkipWhitespace();
       }
 
-      if (pos_ >= text_.size() || text_[pos_] != ')') return std::nullopt;
+      if (pos_ >= text_.size() || text_[pos_] != ')') [[unlikely]] return std::nullopt;
       ++pos_;
 
       return std::make_pair(detail::EncodeUrl(destination), title);
@@ -2196,12 +3379,12 @@ class InlineParser {
         if (bracket_depth > 0) ++pos_;
       }
 
-      if (pos_ >= text_.size()) return std::nullopt;
+      if (pos_ >= text_.size()) [[unlikely]] return std::nullopt;
 
-      std::string label(text_.substr(label_start, pos_ - label_start));
+      std::pmr::string label(text_.substr(label_start, pos_ - label_start));
       ++pos_;
 
-      if (label.empty()) {
+      if (label.empty()) [[unlikely]] {
         // Collapsed reference - label comes from link text
         return std::nullopt;  // Need to look up later
       }
@@ -2212,11 +3395,11 @@ class InlineParser {
     return std::nullopt;
   }
 
-  std::optional<std::pair<std::string, std::string>> LookupReference(
-      const std::string& label) {
-    if (!link_references_) return std::nullopt;
+  std::optional<std::pair<std::pmr::string, std::pmr::string>> LookupReference(
+      const std::pmr::string& label) {
+    if (!link_references_) [[unlikely]] return std::nullopt;
 
-    std::string normalized = detail::NormalizeLinkLabel(label);
+    std::pmr::string normalized = detail::NormalizeLinkLabel(label);
     auto it = link_references_->find(normalized);
     if (it != link_references_->end()) {
       return it->second;
@@ -2232,8 +3415,8 @@ class InlineParser {
     }
   }
 
-  std::string GetAltText(const std::vector<InlineNode>& nodes) {
-    std::string result;
+  std::pmr::string GetAltText(const std::pmr::vector<InlineNode>& nodes) {
+    std::pmr::string result;
     for (const auto& node : nodes) {
       std::visit(
           [&result, this](auto&& arg) {
@@ -2261,9 +3444,9 @@ class InlineParser {
     return result;
   }
 
-  void ProcessEmphasis(std::vector<InlineNode>& nodes,
-                       std::vector<DelimiterNode>& delimiters) {
-    if (delimiters.empty()) return;
+  void ProcessEmphasis(std::pmr::vector<InlineNode>& nodes,
+                       std::pmr::vector<DelimiterNode>& delimiters) {
+    if (delimiters.empty()) [[unlikely]] return;
 
     // Process emphasis using the algorithm from CommonMark spec
     size_t closer_idx = 0;
@@ -2302,7 +3485,7 @@ class InlineParser {
         size_t delim_count = is_strong ? 2 : 1;
 
         // Build emphasis node - reserve capacity to avoid reallocations
-        std::vector<InlineNode> content;
+        std::pmr::vector<InlineNode> content;
         content.reserve(closer.pos - opener.pos - 1);
         for (size_t i = opener.pos + 1; i < closer.pos; ++i) {
           content.push_back(std::move(nodes[i]));
@@ -2323,7 +3506,7 @@ class InlineParser {
         // Update opener text
         if (opener.count > delim_count) {
           std::get<Text>(nodes[opener.pos]).content =
-              std::string(opener.count - delim_count, opener.delimiter);
+              std::pmr::string(opener.count - delim_count, opener.delimiter);
           opener.count -= delim_count;
         } else {
           nodes[opener.pos] = Text("");
@@ -2333,7 +3516,7 @@ class InlineParser {
         // Update closer text
         if (closer.count > delim_count) {
           std::get<Text>(nodes[closer.pos]).content =
-              std::string(closer.count - delim_count, closer.delimiter);
+              std::pmr::string(closer.count - delim_count, closer.delimiter);
           closer.count -= delim_count;
         } else {
           nodes[closer.pos] = Text("");
@@ -2342,7 +3525,7 @@ class InlineParser {
 
         // Insert emphasis node, removing the content in between
         // Reserve capacity: opener nodes + 1 emph node + nodes after closer
-        std::vector<InlineNode> new_nodes;
+        std::pmr::vector<InlineNode> new_nodes;
         new_nodes.reserve(opener.pos + 1 + 1 + (nodes.size() - closer.pos));
         for (size_t i = 0; i <= opener.pos; ++i) {
           new_nodes.push_back(std::move(nodes[i]));
@@ -2373,12 +3556,13 @@ class InlineParser {
     }
 
     // Remove empty text nodes in-place (avoids extra vector allocation)
-    auto new_end = std::remove_if(nodes.begin(), nodes.end(), [](const InlineNode& node) {
-      if (auto* text = std::get_if<Text>(&node)) {
-        return text->content.empty();
-      }
-      return false;
-    });
+    auto new_end =
+        std::remove_if(nodes.begin(), nodes.end(), [](const InlineNode& node) {
+          if (auto* text = std::get_if<Text>(&node)) {
+            return text->content.empty();
+          }
+          return false;
+        });
     nodes.erase(new_end, nodes.end());
   }
 };
@@ -2415,7 +3599,8 @@ class BlockParser {
   // pointing into single buffer, vs vector<string> with many allocations
   std::unique_ptr<detail::LineBuffer> lines_;
   size_t line_idx_ = 0;
-  std::unordered_map<std::string, std::pair<std::string, std::string>>*
+  std::pmr::unordered_map<std::pmr::string,
+                          std::pair<std::pmr::string, std::pmr::string>>*
       parent_link_refs_ = nullptr;
 
   bool AtEnd() const { return !lines_ || line_idx_ >= lines_->size(); }
@@ -2442,7 +3627,7 @@ class BlockParser {
   }
 
   // Check if brackets are balanced in a label string
-  bool IsLabelBracketsBalanced(const std::string& label) {
+  bool IsLabelBracketsBalanced(const std::pmr::string& label) {
     int depth = 0;
     for (size_t i = 0; i < label.size(); ++i) {
       if (label[i] == '\\' && i + 1 < label.size()) {
@@ -2451,14 +3636,14 @@ class BlockParser {
       }
       if (label[i] == '[') ++depth;
       if (label[i] == ']') --depth;
-      if (depth < 0) return false;
+      if (depth < 0) [[unlikely]] return false;
     }
     return depth == 0;
   }
 
   // Helper to parse destination with balanced parentheses
-  std::pair<std::string, size_t> ParseLinkDestination(std::string_view s) {
-    if (s.empty()) return {"", 0};
+  std::pair<std::pmr::string, size_t> ParseLinkDestination(std::string_view s) {
+    if (s.empty()) [[unlikely]] return {"", 0};
 
     if (s[0] == '<') {
       // Angle-bracket destination
@@ -2466,12 +3651,12 @@ class BlockParser {
         if (s[i] == '\\' && i + 1 < s.size()) {
           ++i;
         } else if (s[i] == '>') {
-          return {std::string(s.substr(1, i - 1)), i + 1};
-        } else if (s[i] == '<' || s[i] == '\n') {
+          return {std::pmr::string(s.substr(1, i - 1)), i + 1};
+        } else if (s[i] == '<' || s[i] == '\n') [[unlikely]] {
           return {"", 0};
         }
       }
-      return {"", 0};
+      return {"", 0};  // Unclosed angle bracket - unlikely
     }
 
     // Regular destination with balanced parentheses
@@ -2494,8 +3679,8 @@ class BlockParser {
         ++end;
       }
     }
-    if (paren_depth != 0) return {"", 0};
-    return {std::string(s.substr(0, end)), end};
+    if (paren_depth != 0) [[unlikely]] return {"", 0};
+    return {std::pmr::string(s.substr(0, end)), end};
   }
 
   void ExtractLinkReferences(Document& doc) {
@@ -2631,7 +3816,7 @@ class BlockParser {
 
       // Find closing bracket (handling escapes, may span multiple lines)
       size_t start_line = line_idx_;
-      std::string label_raw;
+      std::pmr::string label_raw;
       std::string_view rest;
       bool found_close = false;
 
@@ -2640,13 +3825,13 @@ class BlockParser {
       if (close_bracket != std::string_view::npos &&
           close_bracket + 1 < trimmed.size() &&
           trimmed[close_bracket + 1] == ':') {
-        label_raw = std::string(trimmed.substr(1, close_bracket - 1));
+        label_raw = std::pmr::string(trimmed.substr(1, close_bracket - 1));
         rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
         found_close = true;
         Advance();
       } else {
         // Try multi-line label (label can span multiple lines)
-        label_raw = std::string(trimmed.substr(1));  // Content after '['
+        label_raw = std::pmr::string(trimmed.substr(1));  // Content after '['
         Advance();
 
         // Collect lines until we find ']:' (limit to reasonable number of
@@ -2671,7 +3856,7 @@ class BlockParser {
             }
             if (valid) {
               label_raw += '\n';
-              label_raw += std::string(next_trimmed.substr(0, colon_pos));
+              label_raw += std::pmr::string(next_trimmed.substr(0, colon_pos));
               rest = detail::TrimLeft(next_trimmed.substr(colon_pos + 2));
               found_close = true;
               Advance();
@@ -2686,7 +3871,7 @@ class BlockParser {
 
           // Continue collecting label content
           label_raw += '\n';
-          label_raw += std::string(next_trimmed);
+          label_raw += std::pmr::string(next_trimmed);
           Advance();
           ++lines_collected;
         }
@@ -2709,8 +3894,8 @@ class BlockParser {
 
       // Normalize label for matching (WITHOUT decoding escapes per CommonMark
       // spec)
-      std::string normalized = detail::NormalizeLinkLabel(label_raw);
-      if (normalized.empty()) {
+      std::pmr::string normalized = detail::NormalizeLinkLabel(label_raw);
+      if (normalized.empty()) [[unlikely]] {
         line_idx_ = start_line;
         prev_line_had_content = true;
         Advance();
@@ -2745,14 +3930,14 @@ class BlockParser {
         Advance();
         continue;
       }
-      std::string destination = detail::DecodeEscapesAndEntities(dest_raw);
+      std::pmr::string destination = detail::DecodeEscapesAndEntities(dest_raw);
       auto rest_after_dest = rest.substr(dest_len);
       bool has_whitespace_before_title =
           rest_after_dest.size() != detail::TrimLeft(rest_after_dest).size();
       rest = detail::TrimLeft(rest_after_dest);
 
       // Parse optional title (may be on same line or next line)
-      std::string title;
+      std::pmr::string title;
       bool title_valid = true;
       bool title_on_new_line = false;
       size_t pre_title_line = line_idx_;
@@ -2780,7 +3965,7 @@ class BlockParser {
         } else {
           char open_char = rest[0];
           char close_char = (open_char == '(') ? ')' : open_char;
-          std::string title_content;
+          std::pmr::string title_content;
           size_t i = 1;
 
           // Title can span multiple lines
@@ -2864,7 +4049,7 @@ class BlockParser {
     line_idx_ = 0;
   }
 
-  void ParseBlocks(std::vector<BlockNode>& blocks) {
+  void ParseBlocks(std::pmr::vector<BlockNode>& blocks) {
     while (!AtEnd()) {
       std::string_view line = CurrentLine();
 
@@ -2931,7 +4116,7 @@ class BlockParser {
 
     // Find closing bracket (handling escapes, may span multiple lines)
     size_t start_line = line_idx_;
-    std::string label_raw;
+    std::pmr::string label_raw;
     std::string_view rest;
     bool found_close = false;
 
@@ -2940,13 +4125,13 @@ class BlockParser {
     if (close_bracket != std::string_view::npos &&
         close_bracket + 1 < trimmed.size() &&
         trimmed[close_bracket + 1] == ':') {
-      label_raw = std::string(trimmed.substr(1, close_bracket - 1));
+      label_raw = std::pmr::string(trimmed.substr(1, close_bracket - 1));
       rest = detail::TrimLeft(trimmed.substr(close_bracket + 2));
       found_close = true;
       Advance();
     } else {
       // Try multi-line label
-      label_raw = std::string(trimmed.substr(1));
+      label_raw = std::pmr::string(trimmed.substr(1));
       Advance();
 
       int lines_collected = 0;
@@ -2967,7 +4152,7 @@ class BlockParser {
           }
           if (valid) {
             label_raw += '\n';
-            label_raw += std::string(next_trimmed.substr(0, colon_pos));
+            label_raw += std::pmr::string(next_trimmed.substr(0, colon_pos));
             rest = detail::TrimLeft(next_trimmed.substr(colon_pos + 2));
             found_close = true;
             Advance();
@@ -2980,7 +4165,7 @@ class BlockParser {
         }
 
         label_raw += '\n';
-        label_raw += std::string(next_trimmed);
+        label_raw += std::pmr::string(next_trimmed);
         Advance();
         ++lines_collected;
       }
@@ -2997,8 +4182,8 @@ class BlockParser {
       return false;
     }
 
-    std::string normalized = detail::NormalizeLinkLabel(label_raw);
-    if (normalized.empty()) {
+    std::pmr::string normalized = detail::NormalizeLinkLabel(label_raw);
+    if (normalized.empty()) [[unlikely]] {
       line_idx_ = start_line;
       return false;
     }
@@ -3106,13 +4291,13 @@ class BlockParser {
   std::optional<ThematicBreak> TryParseThematicBreak() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) return std::nullopt;
+    if (indent >= 4) [[unlikely]] return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty()) return std::nullopt;
+    if (trimmed.empty()) [[unlikely]] return std::nullopt;
 
     char marker = trimmed[0];
-    if (marker != '-' && marker != '*' && marker != '_') return std::nullopt;
+    if (marker != '-' && marker != '*' && marker != '_') [[unlikely]] return std::nullopt;
 
     int count = 0;
     for (char c : trimmed) {
@@ -3134,10 +4319,10 @@ class BlockParser {
   std::optional<Heading> TryParseAtxHeading() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) return std::nullopt;
+    if (indent >= 4) [[unlikely]] return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty() || trimmed[0] != '#') return std::nullopt;
+    if (trimmed.empty() || trimmed[0] != '#') [[unlikely]] return std::nullopt;
 
     int level = 0;
     size_t i = 0;
@@ -3146,7 +4331,7 @@ class BlockParser {
       ++i;
     }
 
-    if (level > 6) return std::nullopt;
+    if (level > 6) [[unlikely]] return std::nullopt;
     if (i < trimmed.size() && trimmed[i] != ' ' && trimmed[i] != '\t') {
       return std::nullopt;
     }
@@ -3157,7 +4342,7 @@ class BlockParser {
     }
 
     // Get content (strip trailing #'s)
-    std::string content(trimmed.substr(i));
+    std::pmr::string content(trimmed.substr(i));
 
     // Remove trailing #'s (preceded by spaces)
     while (!content.empty()) {
@@ -3199,13 +4384,13 @@ class BlockParser {
   std::optional<CodeBlock> TryParseFencedCodeBlock() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) return std::nullopt;
+    if (indent >= 4) [[unlikely]] return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty()) return std::nullopt;
+    if (trimmed.empty()) [[unlikely]] return std::nullopt;
 
     char fence_char = trimmed[0];
-    if (fence_char != '`' && fence_char != '~') return std::nullopt;
+    if (fence_char != '`' && fence_char != '~') [[unlikely]] return std::nullopt;
 
     size_t fence_length = 0;
     while (fence_length < trimmed.size() &&
@@ -3213,11 +4398,11 @@ class BlockParser {
       ++fence_length;
     }
 
-    if (fence_length < 3) return std::nullopt;
+    if (fence_length < 3) [[unlikely]] return std::nullopt;
 
     // Check for backtick in info string (not allowed for backtick fences)
-    std::string info_string(detail::Trim(trimmed.substr(fence_length)));
-    if (fence_char == '`' && info_string.find('`') != std::string::npos) {
+    std::pmr::string info_string(detail::Trim(trimmed.substr(fence_length)));
+    if (fence_char == '`' && info_string.find('`') != std::string::npos) [[unlikely]] {
       return std::nullopt;
     }
     // Decode backslash escapes in info string
@@ -3226,7 +4411,7 @@ class BlockParser {
     Advance();
 
     // Collect code content
-    std::string content;
+    std::pmr::string content;
     bool found_closing = false;
     while (!AtEnd()) {
       std::string_view code_line = CurrentLine();
@@ -3287,21 +4472,21 @@ class BlockParser {
   std::optional<HtmlBlock> TryParseHtmlBlock() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) return std::nullopt;
+    if (indent >= 4) [[unlikely]] return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty() || trimmed[0] != '<') return std::nullopt;
+    if (trimmed.empty() || trimmed[0] != '<') [[unlikely]] return std::nullopt;
 
     int block_type = 0;
-    std::string end_condition;
+    std::pmr::string end_condition;
 
     // Type 1: <script>, <pre>, <style>, <textarea>
-    static const std::vector<std::string> type1_tags = {"script", "pre",
-                                                        "style", "textarea"};
+    static const std::pmr::vector<std::pmr::string> type1_tags = {
+        "script", "pre", "style", "textarea"};
     for (const auto& tag : type1_tags) {
-      std::string open_tag = "<" + tag;
+      std::pmr::string open_tag = "<" + tag;
       if (trimmed.size() >= open_tag.size()) {
-        std::string lower;
+        std::pmr::string lower;
         for (size_t j = 0; j < open_tag.size(); ++j) {
           lower += static_cast<char>(
               std::tolower(static_cast<unsigned char>(trimmed[j])));
@@ -3350,7 +4535,7 @@ class BlockParser {
     // Type 4: <!DOCTYPE
     if (block_type == 0 && trimmed.size() >= 2 && trimmed[0] == '<' &&
         trimmed[1] == '!') {
-      std::string prefix;
+      std::pmr::string prefix;
       for (size_t j = 0; j < std::min(size_t(9), trimmed.size()); ++j) {
         prefix += static_cast<char>(
             std::toupper(static_cast<unsigned char>(trimmed[j])));
@@ -3368,7 +4553,7 @@ class BlockParser {
     }
 
     // Type 6: Block-level HTML tags
-    static const std::vector<std::string> type6_tags = {
+    static const std::pmr::vector<std::pmr::string> type6_tags = {
         "address",    "article",  "aside",   "base",     "basefont",
         "blockquote", "body",     "caption", "center",   "col",
         "colgroup",   "dd",       "details", "dialog",   "dir",
@@ -3395,7 +4580,7 @@ class BlockParser {
       }
 
       if (tag_end > tag_start) {
-        std::string tag_name;
+        std::pmr::string tag_name;
         for (size_t j = tag_start; j < tag_end; ++j) {
           tag_name += static_cast<char>(
               std::tolower(static_cast<unsigned char>(trimmed[j])));
@@ -3582,10 +4767,10 @@ class BlockParser {
       }
     }
 
-    if (block_type == 0) return std::nullopt;
+    if (block_type == 0) [[unlikely]] return std::nullopt;
 
     // Collect HTML block content
-    std::string content;
+    std::pmr::string content;
 
     while (!AtEnd()) {
       std::string_view html_line = CurrentLine();
@@ -3594,7 +4779,7 @@ class BlockParser {
 
       // Check for end condition
       if (block_type <= 5) {
-        std::string lower_line;
+        std::pmr::string lower_line;
         for (char c : html_line) {
           lower_line +=
               static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -3623,13 +4808,13 @@ class BlockParser {
   std::optional<BlockQuote> TryParseBlockQuote() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) return std::nullopt;
+    if (indent >= 4) [[unlikely]] return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty() || trimmed[0] != '>') return std::nullopt;
+    if (trimmed.empty() || trimmed[0] != '>') [[unlikely]] return std::nullopt;
 
     // Collect block quote lines
-    std::vector<std::string> quote_lines;
+    std::pmr::vector<std::pmr::string> quote_lines;
 
     // Track state for lazy continuation rules
     bool last_line_was_blank = false;
@@ -3645,7 +4830,7 @@ class BlockParser {
 
       if (bq_trimmed.starts_with(">")) {
         // Remove > and optional space with proper tab handling
-        std::string bq_content = detail::RemoveBlockQuotePrefix(bq_line);
+        std::pmr::string bq_content = detail::RemoveBlockQuotePrefix(bq_line);
         quote_lines.push_back(bq_content);
 
         // Track if this line is blank inside the blockquote
@@ -3751,10 +4936,10 @@ class BlockParser {
           // Mark lazy continuation with special prefix to prevent setext
           // heading (but don't add if already marked)
           if (!bq_trimmed.empty() && bq_trimmed[0] == '\x01') {
-            quote_lines.push_back(std::string(bq_trimmed));
+            quote_lines.push_back(std::pmr::string(bq_trimmed));
           } else {
-            quote_lines.push_back(std::string(1, '\x01') +
-                                  std::string(bq_trimmed));
+            quote_lines.push_back(std::pmr::string(1, '\x01') +
+                                  std::pmr::string(bq_trimmed));
           }
           last_line_was_blank = false;
           // Lazy continuation continues the paragraph
@@ -3769,10 +4954,10 @@ class BlockParser {
       }
     }
 
-    if (quote_lines.empty()) return std::nullopt;
+    if (quote_lines.empty()) [[unlikely]] return std::nullopt;
 
     // Parse the content of the block quote
-    std::string quote_content;
+    std::pmr::string quote_content;
     for (const auto& ql : quote_lines) {
       quote_content += ql;
       quote_content += '\n';
@@ -3798,10 +4983,10 @@ class BlockParser {
   std::optional<List> TryParseList() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent >= 4) return std::nullopt;
+    if (indent >= 4) [[unlikely]] return std::nullopt;
 
     auto trimmed = detail::TrimLeft(line);
-    if (trimmed.empty()) return std::nullopt;
+    if (trimmed.empty()) [[unlikely]] return std::nullopt;
 
     // Check for bullet list
     bool is_ordered = false;
@@ -3827,11 +5012,11 @@ class BlockParser {
              std::isdigit(static_cast<unsigned char>(trimmed[num_end]))) {
         ++num_end;
       }
-      if (num_end == 0 || num_end > 9) return std::nullopt;
-      if (num_end >= trimmed.size()) return std::nullopt;
+      if (num_end == 0 || num_end > 9) [[unlikely]] return std::nullopt;
+      if (num_end >= trimmed.size()) [[unlikely]] return std::nullopt;
 
       char delim = trimmed[num_end];
-      if (delim != '.' && delim != ')') return std::nullopt;
+      if (delim != '.' && delim != ')') [[unlikely]] return std::nullopt;
 
       start = std::stoi(std::string(trimmed.substr(0, num_end)));
       delimiter = delim;
@@ -3937,11 +5122,11 @@ class BlockParser {
         }
 
         ListItem item;
-        std::vector<std::string> item_lines;
+        std::pmr::vector<std::pmr::string> item_lines;
 
         // Get first line content with proper tab handling
         // Expand tabs in the original line, then extract content after marker
-        std::string expanded_line = detail::ExpandTabs(item_line);
+        std::pmr::string expanded_line = detail::ExpandTabs(item_line);
         std::string_view expanded_trimmed = detail::TrimLeft(expanded_line);
 
         // Calculate required indent based on content start position
@@ -3992,7 +5177,8 @@ class BlockParser {
           skip = content_pos;  // Skip to actual content
         }
 
-        std::string first_content = std::string(expanded_trimmed.substr(skip));
+        std::pmr::string first_content =
+            std::pmr::string(expanded_trimmed.substr(skip));
         item_lines.push_back(first_content);
         Advance();
         had_blank_line = false;
@@ -4048,7 +5234,7 @@ class BlockParser {
           }
 
           // Expand tabs for proper indent calculation
-          std::string expanded_cont = detail::ExpandTabs(cont_line);
+          std::pmr::string expanded_cont = detail::ExpandTabs(cont_line);
           int cont_indent = detail::CountIndent(expanded_cont);
           auto cont_trimmed = detail::TrimLeft(expanded_cont);
 
@@ -4145,10 +5331,10 @@ class BlockParser {
               // Lazy continuation - mark with \x01 to prevent block parsing
               // (but don't add if already marked)
               if (!cont_trimmed.empty() && cont_trimmed[0] == '\x01') {
-                item_lines.push_back(std::string(cont_trimmed));
+                item_lines.push_back(std::pmr::string(cont_trimmed));
               } else {
-                item_lines.push_back(std::string(1, '\x01') +
-                                     std::string(cont_trimmed));
+                item_lines.push_back(std::pmr::string(1, '\x01') +
+                                     std::pmr::string(cont_trimmed));
               }
               Advance();
             } else {
@@ -4156,7 +5342,7 @@ class BlockParser {
             }
           } else {
             // Properly indented continuation - remove required_indent spaces
-            std::string dedented =
+            std::pmr::string dedented =
                 detail::RemoveIndent(expanded_cont, required_indent);
 
             // Track fenced code blocks
@@ -4241,7 +5427,7 @@ class BlockParser {
         }
 
         // Parse item content
-        std::string item_content;
+        std::pmr::string item_content;
         for (const auto& il : item_lines) {
           item_content += il;
           item_content += '\n';
@@ -4282,9 +5468,9 @@ class BlockParser {
   std::optional<CodeBlock> TryParseIndentedCodeBlock() {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
-    if (indent < 4) return std::nullopt;
+    if (indent < 4) [[unlikely]] return std::nullopt;
 
-    std::string content;
+    std::pmr::string content;
 
     while (!AtEnd()) {
       std::string_view code_line = CurrentLine();
@@ -4319,7 +5505,7 @@ class BlockParser {
       }
     }
 
-    if (content.empty()) return std::nullopt;
+    if (content.empty()) [[unlikely]] return std::nullopt;
 
     CodeBlock block;
     block.content = content;
@@ -4328,7 +5514,7 @@ class BlockParser {
   }
 
   BlockNode ParseParagraph() {
-    std::vector<std::string> para_lines;
+    std::pmr::vector<std::pmr::string> para_lines;
 
     while (!AtEnd()) {
       std::string_view line = CurrentLine();
@@ -4365,7 +5551,7 @@ class BlockParser {
               Heading heading;
               heading.level = (underline_char == '=') ? 1 : 2;
 
-              std::string heading_content;
+              std::pmr::string heading_content;
               for (size_t j = 0; j < para_lines.size(); ++j) {
                 if (j > 0) heading_content += '\n';
                 heading_content += para_lines[j];
@@ -4465,12 +5651,12 @@ class BlockParser {
         // Check for HTML block (types 1-6 can interrupt paragraphs)
         if (trimmed.starts_with("<")) {
           // Type 1: script, pre, style, textarea
-          static const std::vector<std::string> type1_tags = {
+          static const std::pmr::vector<std::pmr::string> type1_tags = {
               "script", "pre", "style", "textarea"};
           for (const auto& tag : type1_tags) {
-            std::string open_tag = "<" + tag;
+            std::pmr::string open_tag = "<" + tag;
             if (trimmed.size() >= open_tag.size()) {
-              std::string lower;
+              std::pmr::string lower;
               for (size_t j = 0; j < open_tag.size(); ++j) {
                 lower += static_cast<char>(
                     std::tolower(static_cast<unsigned char>(trimmed[j])));
@@ -4489,7 +5675,7 @@ class BlockParser {
             goto html_interrupt;
           }
           if (trimmed.size() >= 2 && trimmed[1] == '!' && trimmed.size() >= 9) {
-            std::string upper;
+            std::pmr::string upper;
             for (size_t j = 0; j < 9; ++j) {
               upper += static_cast<char>(
                   std::toupper(static_cast<unsigned char>(trimmed[j])));
@@ -4499,7 +5685,7 @@ class BlockParser {
             }
           }
           // Type 6: block-level tags
-          static const std::vector<std::string> type6_tags = {
+          static const std::pmr::vector<std::pmr::string> type6_tags = {
               "address",    "article",  "aside",   "base",     "basefont",
               "blockquote", "body",     "caption", "center",   "col",
               "colgroup",   "dd",       "details", "dialog",   "dir",
@@ -4522,7 +5708,7 @@ class BlockParser {
             ++tag_end;
           }
           if (tag_end > tag_start) {
-            std::string tag_name;
+            std::pmr::string tag_name;
             for (size_t j = tag_start; j < tag_end; ++j) {
               tag_name += static_cast<char>(
                   std::tolower(static_cast<unsigned char>(trimmed[j])));
@@ -4546,15 +5732,15 @@ class BlockParser {
 
       // Strip \x01 marker used for lazy continuation lines
       if (!trimmed.empty() && trimmed[0] == '\x01') {
-        para_lines.push_back(std::string(trimmed.substr(1)));
+        para_lines.push_back(std::pmr::string(trimmed.substr(1)));
       } else {
-        para_lines.push_back(std::string(trimmed));
+        para_lines.push_back(std::pmr::string(trimmed));
       }
       Advance();
     }
 
     Paragraph para;
-    std::string para_content;
+    std::pmr::string para_content;
     for (size_t j = 0; j < para_lines.size(); ++j) {
       if (j > 0) para_content += '\n';
       para_content += para_lines[j];
@@ -4563,7 +5749,7 @@ class BlockParser {
     return para;
   }
 
-  void ParseInlines(std::vector<BlockNode>& blocks, InlineParser& parser) {
+  void ParseInlines(std::pmr::vector<BlockNode>& blocks, InlineParser& parser) {
     for (auto& block : blocks) {
       std::visit(
           [&parser, this](auto&& node) {
@@ -4591,8 +5777,8 @@ class BlockParser {
 
 class HtmlRenderer {
  public:
-  std::string Render(const Document& doc) {
-    std::string result;
+  std::pmr::string Render(const Document& doc) {
+    std::pmr::string result;
     // Pre-allocate based on block count heuristic (~100 chars per block)
     result.reserve(doc.children.size() * 100 + 256);
     RenderBlocks(doc.children, result, false);
@@ -4600,8 +5786,8 @@ class HtmlRenderer {
   }
 
  private:
-  void RenderBlocks(const std::vector<BlockNode>& blocks, std::string& out,
-                    bool in_tight_list) {
+  void RenderBlocks(const std::pmr::vector<BlockNode>& blocks,
+                    std::pmr::string& out, bool in_tight_list) {
     for (size_t i = 0; i < blocks.size(); ++i) {
       std::visit(
           [this, &out, in_tight_list](auto&& node) {
@@ -4628,7 +5814,7 @@ class HtmlRenderer {
     }
   }
 
-  void RenderParagraph(const Paragraph& para, std::string& out,
+  void RenderParagraph(const Paragraph& para, std::pmr::string& out,
                        bool in_tight_list) {
     if (in_tight_list) {
       RenderInlines(para.children, out);
@@ -4640,13 +5826,12 @@ class HtmlRenderer {
     }
   }
 
-  void RenderHeading(const Heading& heading, std::string& out) {
+  void RenderHeading(const Heading& heading, std::pmr::string& out) {
     // Precomputed heading tags for levels 1-6 (avoids std::to_string)
-    static constexpr const char* kOpenTags[] = {"",     "<h1>", "<h2>",
-                                                 "<h3>", "<h4>", "<h5>", "<h6>"};
-    static constexpr const char* kCloseTags[] = {"",       "</h1>\n", "</h2>\n",
-                                                  "</h3>\n", "</h4>\n", "</h5>\n",
-                                                  "</h6>\n"};
+    static constexpr const char* kOpenTags[] = {"",     "<h1>", "<h2>", "<h3>",
+                                                "<h4>", "<h5>", "<h6>"};
+    static constexpr const char* kCloseTags[] = {
+        "", "</h1>\n", "</h2>\n", "</h3>\n", "</h4>\n", "</h5>\n", "</h6>\n"};
     int level = heading.level;
     if (level >= 1 && level <= 6) {
       out += kOpenTags[level];
@@ -4655,7 +5840,7 @@ class HtmlRenderer {
     }
   }
 
-  void RenderCodeBlock(const CodeBlock& block, std::string& out) {
+  void RenderCodeBlock(const CodeBlock& block, std::pmr::string& out) {
     out += "<pre><code";
     if (!block.info_string.empty()) {
       // Extract language (first word of info string) using find
@@ -4675,18 +5860,19 @@ class HtmlRenderer {
     out += "</code></pre>\n";
   }
 
-  void RenderBlockQuote(const BlockQuote& bq, std::string& out) {
+  void RenderBlockQuote(const BlockQuote& bq, std::pmr::string& out) {
     out += "<blockquote>\n";
     RenderBlocks(bq.children, out, false);
     out += "</blockquote>\n";
   }
 
-  void RenderList(const List& list, std::string& out) {
+  void RenderList(const List& list, std::pmr::string& out) {
     if (list.is_ordered) {
       if (list.start == 1) {
         out += "<ol>\n";
       } else {
-        out += "<ol start=\"" + std::to_string(list.start) + "\">\n";
+        out += "<ol start=\"" + std::pmr::string(std::to_string(list.start)) +
+               "\">\n";
       }
     } else {
       out += "<ul>\n";
@@ -4720,7 +5906,8 @@ class HtmlRenderer {
     }
   }
 
-  void RenderInlines(const std::vector<InlineNode>& nodes, std::string& out) {
+  void RenderInlines(const std::pmr::vector<InlineNode>& nodes,
+                     std::pmr::string& out) {
     for (const auto& node : nodes) {
       std::visit(
           [this, &out](auto&& n) {
@@ -4773,33 +5960,35 @@ class HtmlRenderer {
 
 // Parse Markdown input and return an AST
 inline Document Parse(std::string_view input) {
+  std::pmr::set_default_resource(&g_arena);
   BlockParser parser;
   return parser.Parse(input);
 }
 
 // Render a document AST to HTML
-inline std::string RenderHtml(const Document& doc) {
+inline std::pmr::string RenderHtml(const Document& doc) {
+  std::pmr::set_default_resource(&g_arena);
   HtmlRenderer renderer;
   return renderer.Render(doc);
 }
 
 // Convenience function: parse Markdown and render to HTML
-inline std::string MarkdownToHtml(std::string_view input) {
+inline std::pmr::string MarkdownToHtml(std::string_view input) {
   return RenderHtml(Parse(input));
 }
 
 // Debug: print AST structure
-inline std::string DebugAst(const Document& doc, int indent = 0) {
-  std::string result;
-  std::string prefix(indent * 2, ' ');
+inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
+  std::pmr::string result;
+  std::pmr::string prefix(indent * 2, ' ');
 
   result += prefix + "Document\n";
 
-  std::function<void(const std::vector<BlockNode>&, int)> print_blocks;
-  std::function<void(const std::vector<InlineNode>&, int)> print_inlines;
+  std::function<void(const std::pmr::vector<BlockNode>&, int)> print_blocks;
+  std::function<void(const std::pmr::vector<InlineNode>&, int)> print_inlines;
 
-  print_inlines = [&](const std::vector<InlineNode>& nodes, int ind) {
-    std::string p(ind * 2, ' ');
+  print_inlines = [&](const std::pmr::vector<InlineNode>& nodes, int ind) {
+    std::pmr::string p(ind * 2, ' ');
     for (const auto& node : nodes) {
       std::visit(
           [&](auto&& n) {
@@ -4831,8 +6020,8 @@ inline std::string DebugAst(const Document& doc, int indent = 0) {
     }
   };
 
-  print_blocks = [&](const std::vector<BlockNode>& blocks, int ind) {
-    std::string p(ind * 2, ' ');
+  print_blocks = [&](const std::pmr::vector<BlockNode>& blocks, int ind) {
+    std::pmr::string p(ind * 2, ' ');
     for (const auto& block : blocks) {
       std::visit(
           [&](auto&& n) {
@@ -4841,7 +6030,8 @@ inline std::string DebugAst(const Document& doc, int indent = 0) {
               result += p + "Paragraph\n";
               print_inlines(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, Heading>) {
-              result += p + "Heading (level " + std::to_string(n.level) + ")\n";
+              result += p + "Heading (level " +
+                        std::pmr::string(std::to_string(n.level)) + ")\n";
               print_inlines(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, ThematicBreak>) {
               result += p + "ThematicBreak\n";
@@ -4852,8 +6042,8 @@ inline std::string DebugAst(const Document& doc, int indent = 0) {
               }
               result += "\n";
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
-              result +=
-                  p + "HtmlBlock (type " + std::to_string(n.block_type) + ")\n";
+              result += p + "HtmlBlock (type " +
+                        std::pmr::string(std::to_string(n.block_type)) + ")\n";
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               result += p + "BlockQuote\n";
               print_blocks(n.children, ind + 1);

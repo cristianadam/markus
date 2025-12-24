@@ -20,14 +20,14 @@ run_one_test() {
 
   output=$(timeout "$TIMEOUT_SECONDS" python3 commonmark-spec/test/spec_tests.py \
     --program bazel-bin/main \
-    -s commonmark-spec/spec.txt \
+    -s commonmark-spec/test/spec.txt \
     -n "$i" 2>&1)
   exit_code=$?
 
   if [ "$exit_code" -eq 124 ]; then
     echo "TIMEOUT: Test number $i timed out after ${TIMEOUT_SECONDS}s"
     python3 commonmark-spec/test/spec_tests.py \
-      -s commonmark-spec/spec.txt \
+      -s commonmark-spec/test/spec.txt \
       -n "$i" \
       --dump-tests 2>/dev/null
     echo "----------------------------------------------"
@@ -35,7 +35,7 @@ run_one_test() {
   elif [ "$exit_code" -ne 0 ]; then
     echo "ERROR: Test number $i exited with code ${exit_code}"
     python3 commonmark-spec/test/spec_tests.py \
-      -s commonmark-spec/spec.txt \
+      -s commonmark-spec/test/spec.txt \
       -n "$i" \
       --dump-tests 2>/dev/null
 
@@ -44,7 +44,7 @@ run_one_test() {
 import sys
 sys.path.insert(0, 'commonmark-spec/test')
 from spec_tests import get_tests
-tests = get_tests('commonmark-spec/spec.txt')
+tests = get_tests('commonmark-spec/test/spec.txt')
 for t in tests:
     if t['example'] == $i:
         print(t['markdown'], end='')

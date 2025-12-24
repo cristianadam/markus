@@ -8,4 +8,3 @@
 .vscode
 ./bazel-bin/**/*
 bazel-bin/**/*
-commonmark-spec/

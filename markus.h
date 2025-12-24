@@ -31,10 +31,10 @@ inline std::pmr::monotonic_buffer_resource g_arena{
     g_buffer, kArenaSize, std::pmr::new_delete_resource()};
 
 // Set the arena as the default memory resource for all pmr containers
-// inline const bool kArenaInitialized = []() {
-//   std::pmr::set_default_resource(&g_arena);
-//   return true;
-// };
+inline const bool kArenaInitialized = []() {
+  std::pmr::set_default_resource(&g_arena);
+  return true;
+}();
 
 namespace markus {
 
@@ -88,7 +88,7 @@ enum class NodeType {
 };
 
 // Convert NodeType to string for debugging
-inline std::pmr::string NodeTypeToString(NodeType type) {
+inline std::string_view NodeTypeToString(NodeType type) {
   switch (type) {
     case NodeType::kDocument:
       return "Document";
@@ -205,14 +205,14 @@ struct HtmlInline {
 struct Paragraph {
   static constexpr NodeType kType = NodeType::kParagraph;
   std::pmr::vector<InlineNode> children;
-  std::pmr::string raw_content;  // For debugging
+  std::pmr::string raw_content;  // Temporary storage, cleared after inline parsing
 };
 
 struct Heading {
   static constexpr NodeType kType = NodeType::kHeading;
   int level = 1;  // 1-6
   std::pmr::vector<InlineNode> children;
-  std::pmr::string raw_content;  // For debugging
+  std::pmr::string raw_content;  // Temporary storage, cleared after inline parsing
 };
 
 struct ThematicBreak {
@@ -253,14 +253,16 @@ struct BlockQuote {
   std::pmr::vector<BlockNode> children;
 };
 
+// Type alias for link references map
+using LinkRefMap = std::pmr::unordered_map<
+    std::pmr::string, std::pair<std::pmr::string, std::pmr::string>>;
+
 struct Document {
   static constexpr NodeType kType = NodeType::kDocument;
   std::pmr::vector<BlockNode> children;
 
-  // Link reference definitions
-  std::pmr::unordered_map<std::pmr::string,
-                          std::pair<std::pmr::string, std::pmr::string>>
-      link_references;  // label -> (destination, title)
+  // Link reference definitions (label -> (destination, title))
+  LinkRefMap link_references;
 };
 
 // =============================================================================
@@ -2482,10 +2484,7 @@ inline std::pmr::string DecodeEscapes(std::string_view text) {
 
 class InlineParser {
  public:
-  explicit InlineParser(
-      const std::pmr::unordered_map<
-          std::pmr::string, std::pair<std::pmr::string, std::pmr::string>>*
-          link_refs = nullptr)
+  explicit InlineParser(const LinkRefMap* link_refs = nullptr)
       : link_references_(link_refs) {}
 
   std::pmr::vector<InlineNode> Parse(std::string_view text) {
@@ -2497,9 +2496,7 @@ class InlineParser {
  private:
   std::string_view text_;
   size_t pos_ = 0;
-  const std::pmr::unordered_map<std::pmr::string,
-                                std::pair<std::pmr::string, std::pmr::string>>*
-      link_references_ = nullptr;
+  const LinkRefMap* link_references_ = nullptr;
 
   struct DelimiterNode {
     size_t pos;       // Position in result vector
@@ -3615,9 +3612,7 @@ class BlockParser {
   // pointing into single buffer, vs vector<string> with many allocations
   std::unique_ptr<detail::LineBuffer> lines_;
   size_t line_idx_ = 0;
-  std::pmr::unordered_map<std::pmr::string,
-                          std::pair<std::pmr::string, std::pmr::string>>*
-      parent_link_refs_ = nullptr;
+  LinkRefMap* parent_link_refs_ = nullptr;
 
   bool AtEnd() const { return !lines_ || line_idx_ >= lines_->size(); }
 
@@ -3643,7 +3638,7 @@ class BlockParser {
   }
 
   // Check if brackets are balanced in a label string
-  bool IsLabelBracketsBalanced(const std::pmr::string& label) {
+  bool IsLabelBracketsBalanced(std::string_view label) {
     int depth = 0;
     for (size_t i = 0; i < label.size(); ++i) {
       if (label[i] == '\\' && i + 1 < label.size()) {
@@ -5799,15 +5794,15 @@ class BlockParser {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, Paragraph>) {
               node.children = parser.Parse(node.raw_content);
+              node.raw_content.clear();
+              node.raw_content.shrink_to_fit();
             } else if constexpr (std::is_same_v<T, Heading>) {
               node.children = parser.Parse(node.raw_content);
-            } else if constexpr (std::is_same_v<T, BlockQuote>) {
-              ParseInlines(node.children, parser);
-            } else if constexpr (std::is_same_v<T, List>) {
-              for (auto& item : node.items) {
-                ParseInlines(item.children, parser);
-              }
+              node.raw_content.clear();
+              node.raw_content.shrink_to_fit();
             }
+            // BlockQuote and List children are already parsed by their nested
+            // BlockParser - do NOT recursively parse them again
           },
           block);
     }

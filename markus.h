@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <memory_resource>
@@ -144,9 +145,9 @@ using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
 
 struct Text {
   static constexpr NodeType kType = NodeType::kText;
-  std::pmr::string content;
+  std::string_view content;
 
-  explicit Text(std::pmr::string c) : content(std::move(c)) {}
+  explicit Text(std::string_view c) : content(c) {}
   Text() = default;
 };
 
@@ -263,6 +264,10 @@ struct Document {
 
   // Link reference definitions (label -> (destination, title))
   LinkRefMap link_references;
+
+  // Storage for decoded strings (entities, escapes) that inline nodes view into
+  // Using deque to avoid reference invalidation on growth
+  std::deque<std::pmr::string> string_storage;
 };
 
 // =============================================================================
@@ -2484,8 +2489,9 @@ inline std::pmr::string DecodeEscapes(std::string_view text) {
 
 class InlineParser {
  public:
-  explicit InlineParser(const LinkRefMap* link_refs = nullptr)
-      : link_references_(link_refs) {}
+  explicit InlineParser(const LinkRefMap* link_refs = nullptr,
+                        std::deque<std::pmr::string>* string_storage = nullptr)
+      : link_references_(link_refs), string_storage_(string_storage) {}
 
   std::pmr::vector<InlineNode> Parse(std::string_view text) {
     text_ = text;
@@ -2497,6 +2503,13 @@ class InlineParser {
   std::string_view text_;
   size_t pos_ = 0;
   const LinkRefMap* link_references_ = nullptr;
+  std::deque<std::pmr::string>* string_storage_ = nullptr;
+
+  // Store a string in persistent storage and return a view into it
+  std::string_view StoreString(std::pmr::string s) {
+    string_storage_->push_back(std::move(s));
+    return string_storage_->back();
+  }
 
   struct DelimiterNode {
     size_t pos;       // Position in result vector
@@ -2531,13 +2544,36 @@ class InlineParser {
     result.reserve(text_.size() / 20 + 4);
 
     std::pmr::vector<DelimiterNode> delimiter_stack;
-    std::pmr::string pending_text;
-    pending_text.reserve(text_.size() / 4);  // Reserve for pending text
+
+    // Track spans instead of accumulating text
+    size_t text_start = 0;
+    bool in_span = false;
 
     auto flush_text = [&]() {
-      if (!pending_text.empty()) {
-        result.push_back(Text(std::move(pending_text)));
-        pending_text.clear();
+      if (in_span && text_start < pos_) {
+        result.push_back(Text(text_.substr(text_start, pos_ - text_start)));
+        in_span = false;
+      }
+    };
+
+    auto flush_text_trimmed = [&]() {
+      // Flush text but trim trailing spaces (for soft breaks)
+      if (in_span && text_start < pos_) {
+        size_t end = pos_;
+        while (end > text_start && text_[end - 1] == ' ') {
+          --end;
+        }
+        if (end > text_start) {
+          result.push_back(Text(text_.substr(text_start, end - text_start)));
+        }
+        in_span = false;
+      }
+    };
+
+    auto start_span = [&]() {
+      if (!in_span) {
+        text_start = pos_;
+        in_span = true;
       }
     };
 
@@ -2549,7 +2585,8 @@ class InlineParser {
         char next = text_[pos_ + 1];
         if (detail::IsAsciiPunctuation(next)) {
           flush_text();
-          result.push_back(Text(std::pmr::string(1, next)));
+          // The escaped char is at pos_+1 in the input, use a view into it
+          result.push_back(Text(text_.substr(pos_ + 1, 1)));
           pos_ += 2;
           continue;
         } else if (next == '\n') {
@@ -2562,38 +2599,45 @@ class InlineParser {
 
       // Check for HTML entity or numeric character reference
       if (c == '&' && pos_ + 1 < text_.size()) {
+        // Flush text BEFORE trying to parse, since TryParseEntity advances pos_
+        flush_text();
         auto entity_result = TryParseEntity();
         if (entity_result) {
-          pending_text += *entity_result;
+          // Store decoded entity and create view into it
+          result.push_back(Text(StoreString(std::move(*entity_result))));
           continue;
         }
+        // Entity parse failed - start new span with the '&'
+        start_span();
       }
 
       // Check for code span
       if (c == '`') {
+        // Flush text BEFORE trying to parse, since TryParseCodeSpan advances pos_
+        flush_text();
         auto code_span = TryParseCodeSpan();
         if (code_span) {
-          flush_text();
           result.push_back(std::move(*code_span));
           continue;
         }
-        // Code span didn't match - add the entire backtick run as text
-        // and skip past it to avoid trying shorter runs
+        // Code span didn't match - include backticks in current text span
         size_t backtick_count = 0;
         while (pos_ + backtick_count < text_.size() &&
                text_[pos_ + backtick_count] == '`') {
           ++backtick_count;
         }
-        pending_text += std::pmr::string(backtick_count, '`');
+        // Start new span that includes the backticks
+        start_span();
         pos_ += backtick_count;
         continue;
       }
 
       // Check for autolink
       if (c == '<') {
+        // Flush text BEFORE trying to parse, since Try* functions advance pos_
+        flush_text();
         auto autolink = TryParseAutolink();
         if (autolink) {
-          flush_text();
           result.push_back(std::move(*autolink));
           continue;
         }
@@ -2601,10 +2645,11 @@ class InlineParser {
         // Check for HTML tag
         auto html = TryParseHtmlInline();
         if (html) {
-          flush_text();
           result.push_back(std::move(*html));
           continue;
         }
+        // Neither autolink nor HTML - treat '<' as regular text
+        start_span();
       }
 
       // Check for emphasis markers
@@ -2640,8 +2685,8 @@ class InlineParser {
         delimiter_stack.push_back({result.size(), pos_, run_length, c, can_open,
                                    can_close, true, &result});
 
-        // Add the delimiter characters as text for now
-        result.push_back(Text(std::pmr::string(run_length, c)));
+        // Add the delimiter characters as text - view into input
+        result.push_back(Text(text_.substr(pos_, run_length)));
         pos_ += run_length;
         continue;
       }
@@ -2659,10 +2704,10 @@ class InlineParser {
                                    &result});
 
         if (is_image) {
-          result.push_back(Text("!["));
+          result.push_back(Text(text_.substr(pos_, 2)));  // "!["
           pos_ += 2;
         } else {
-          result.push_back(Text("["));
+          result.push_back(Text(text_.substr(pos_, 1)));  // "["
           pos_ += 1;
         }
         continue;
@@ -2763,7 +2808,7 @@ class InlineParser {
             // Full reference was attempted but failed - don't try shortcut
             pos_ = saved_pos;
             opener->active = false;
-            result.push_back(Text("]"));
+            result.push_back(Text(text_.substr(pos_, 1)));  // "]"
             ++pos_;
             continue;
           }
@@ -2780,8 +2825,8 @@ class InlineParser {
           size_t label_start =
               opener->text_pos + (opener->delimiter == '!' ? 2 : 1);
           size_t label_end = saved_pos;  // Position of ']'
-          std::pmr::string label_text(
-              text_.substr(label_start, label_end - label_start));
+          std::string_view label_text =
+              text_.substr(label_start, label_end - label_start);
 
           auto ref_result = LookupReference(label_text);
           if (ref_result) {
@@ -2839,7 +2884,7 @@ class InlineParser {
           opener->active = false;
         }
 
-        result.push_back(Text("]"));
+        result.push_back(Text(text_.substr(pos_, 1)));  // "]"
         ++pos_;
         continue;
       }
@@ -2864,18 +2909,15 @@ class InlineParser {
 
       // Check for soft break
       if (c == '\n') {
-        // Trim trailing spaces from pending text
-        while (!pending_text.empty() && pending_text.back() == ' ') {
-          pending_text.pop_back();
-        }
-        flush_text();
+        // Trim trailing spaces from text span
+        flush_text_trimmed();
         result.push_back(SoftBreak{});
         ++pos_;
         continue;
       }
 
-      // Regular character
-      pending_text += c;
+      // Regular character - extend current span
+      start_span();
       ++pos_;
     }
 
@@ -3023,12 +3065,12 @@ class InlineParser {
     // Check for URI autolink
     static const std::regex uri_regex(
         R"(^[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^\s<>]*$)");
-    std::pmr::string content_str(content);
+    std::string content_str(content);  // For regex matching only
     if (std::regex_match(content_str, uri_regex)) {
       pos_ = end + 1;
       Link link;
       link.destination = detail::EncodeUrl(content);
-      link.children.push_back(Text(content_str));
+      link.children.push_back(Text(content));  // Use view into raw_content
       return link;
     }
 
@@ -3040,8 +3082,8 @@ class InlineParser {
     if (std::regex_match(content_str, email_regex)) {
       pos_ = end + 1;
       Link link;
-      link.destination = "mailto:" + content_str;
-      link.children.push_back(Text(content_str));
+      link.destination = "mailto:" + std::pmr::string(content);
+      link.children.push_back(Text(content));  // Use view into raw_content
       return link;
     }
 
@@ -3400,7 +3442,7 @@ class InlineParser {
   }
 
   std::optional<std::pair<std::pmr::string, std::pmr::string>> LookupReference(
-      const std::pmr::string& label) {
+      std::string_view label) {
     if (!link_references_) [[unlikely]]
       return std::nullopt;
 
@@ -3509,20 +3551,22 @@ class InlineParser {
           emph_node = std::move(em);
         }
 
-        // Update opener text
+        // Update opener text - delimiters consumed from the END of opener run
+        // Remaining delimiters are at the START of the original view
         if (opener.count > delim_count) {
-          std::get<Text>(nodes[opener.pos]).content =
-              std::pmr::string(opener.count - delim_count, opener.delimiter);
+          auto& opener_content = std::get<Text>(nodes[opener.pos]).content;
+          opener_content = opener_content.substr(0, opener.count - delim_count);
           opener.count -= delim_count;
         } else {
           nodes[opener.pos] = Text("");
           opener.active = false;
         }
 
-        // Update closer text
+        // Update closer text - delimiters consumed from the BEGINNING of closer run
+        // Remaining delimiters are at the END of the original view
         if (closer.count > delim_count) {
-          std::get<Text>(nodes[closer.pos]).content =
-              std::pmr::string(closer.count - delim_count, closer.delimiter);
+          auto& closer_content = std::get<Text>(nodes[closer.pos]).content;
+          closer_content = closer_content.substr(delim_count);
           closer.count -= delim_count;
         } else {
           nodes[closer.pos] = Text("");
@@ -3594,7 +3638,7 @@ class BlockParser {
     ParseBlocks(doc.children);
 
     // Third pass: parse inlines
-    InlineParser inline_parser(&doc.link_references);
+    InlineParser inline_parser(&doc.link_references, &doc.string_storage);
     ParseInlines(doc.children, inline_parser);
 
     return doc;
@@ -6024,7 +6068,10 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
           [&](auto&& n) {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, Text>) {
-              result += p + "Text: \"" + n.content + "\"\n";
+              result += p;
+              result += "Text: \"";
+              result += n.content;
+              result += "\"\n";
             } else if constexpr (std::is_same_v<T, SoftBreak>) {
               result += p + "SoftBreak\n";
             } else if constexpr (std::is_same_v<T, HardBreak>) {

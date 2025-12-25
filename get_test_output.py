@@ -6,7 +6,7 @@ from spec_tests import get_tests
 
 def main():
     # Parse test numbers from command-line args
-    # Example: python run_specific_tests.py 256 282 283
+    # Example: python get_test_output.py 256 282 283
     if len(sys.argv) > 1:
         try:
             selected = {int(arg) for arg in sys.argv[1:]}
@@ -16,7 +16,7 @@ def main():
     else:
         selected = None  # no filtering
 
-    tests = get_tests('commonmark-spec/spec.txt')
+    tests = get_tests()
 
     for t in tests:
         if selected is None or t['example'] in selected:

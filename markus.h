@@ -192,9 +192,9 @@ struct Image {
 
 struct HtmlInline {
   static constexpr NodeType kType = NodeType::kHtmlInline;
-  std::pmr::string content;
+  std::string_view content;
 
-  explicit HtmlInline(std::pmr::string c) : content(std::move(c)) {}
+  explicit HtmlInline(std::string_view c) : content(c) {}
   HtmlInline() = default;
 };
 
@@ -3147,22 +3147,19 @@ class InlineParser {
           if (next == '>') {
             // <!--> is a valid immediately-closed comment
             pos_ = pos_ + 5;
-            return HtmlInline(
-                std::pmr::string(text_.substr(start, pos_ - start)));
+            return HtmlInline(text_.substr(start, pos_ - start));
           }
           if (next == '-' && pos_ + 5 < text_.size() &&
               text_[pos_ + 5] == '>') {
             // <!---> is a valid immediately-closed comment
             pos_ = pos_ + 6;
-            return HtmlInline(
-                std::pmr::string(text_.substr(start, pos_ - start)));
+            return HtmlInline(text_.substr(start, pos_ - start));
           }
           // Normal comment: find -->
           end = text_.find("-->", pos_ + 4);
           if (end != std::string_view::npos) {
             pos_ = end + 3;
-            return HtmlInline(
-                std::pmr::string(text_.substr(start, pos_ - start)));
+            return HtmlInline(text_.substr(start, pos_ - start));
           }
         } else if (pos_ + 4 == text_.size()) {
           // Just "<!--" at end - not a valid comment, leave as text
@@ -3172,16 +3169,14 @@ class InlineParser {
         end = text_.find("]]>", pos_ + 9);
         if (end != std::string_view::npos) {
           pos_ = end + 3;
-          return HtmlInline(
-              std::pmr::string(text_.substr(start, pos_ - start)));
+          return HtmlInline(text_.substr(start, pos_ - start));
         }
       }
       if (text_.substr(pos_).starts_with("<?")) {
         end = text_.find("?>", pos_ + 2);
         if (end != std::string_view::npos) {
           pos_ = end + 2;
-          return HtmlInline(
-              std::pmr::string(text_.substr(start, pos_ - start)));
+          return HtmlInline(text_.substr(start, pos_ - start));
         }
       }
       if (text_.substr(pos_).starts_with("<!") && end + 1 < text_.size() &&
@@ -3189,8 +3184,7 @@ class InlineParser {
         end = text_.find('>', pos_ + 2);
         if (end != std::string_view::npos) {
           pos_ = end + 1;
-          return HtmlInline(
-              std::pmr::string(text_.substr(start, pos_ - start)));
+          return HtmlInline(text_.substr(start, pos_ - start));
         }
       }
       return std::nullopt;
@@ -3211,7 +3205,7 @@ class InlineParser {
       char c = text_[end];
       if (c == '>') {
         pos_ = end + 1;
-        return HtmlInline(std::pmr::string(text_.substr(start, pos_ - start)));
+        return HtmlInline(text_.substr(start, pos_ - start));
       } else if (is_closing) {
         // Closing tags: only whitespace allowed before >
         if (c == ' ' || c == '\t' || c == '\n') {
@@ -3223,8 +3217,7 @@ class InlineParser {
         // Self-closing: must be followed by >
         if (end + 1 < text_.size() && text_[end + 1] == '>') {
           pos_ = end + 2;
-          return HtmlInline(
-              std::pmr::string(text_.substr(start, pos_ - start)));
+          return HtmlInline(text_.substr(start, pos_ - start));
         }
         return std::nullopt;  // / not followed by >
       } else if (c == ' ' || c == '\t' || c == '\n') {
@@ -5794,12 +5787,10 @@ class BlockParser {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, Paragraph>) {
               node.children = parser.Parse(node.raw_content);
-              node.raw_content.clear();
-              node.raw_content.shrink_to_fit();
+              // Keep raw_content alive - inline nodes may hold string_views into it
             } else if constexpr (std::is_same_v<T, Heading>) {
               node.children = parser.Parse(node.raw_content);
-              node.raw_content.clear();
-              node.raw_content.shrink_to_fit();
+              // Keep raw_content alive - inline nodes may hold string_views into it
             }
             // BlockQuote and List children are already parsed by their nested
             // BlockParser - do NOT recursively parse them again
@@ -6052,7 +6043,10 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
             } else if constexpr (std::is_same_v<T, Image>) {
               result += p + "Image: " + n.destination + "\n";
             } else if constexpr (std::is_same_v<T, HtmlInline>) {
-              result += p + "HtmlInline: " + n.content + "\n";
+              result += p;
+              result += "HtmlInline: ";
+              result += n.content;
+              result += "\n";
             }
           },
           node);

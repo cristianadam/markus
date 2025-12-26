@@ -131,13 +131,14 @@ inline std::string_view NodeTypeToString(NodeType type) {
   return "Unknown";
 }
 
-// Variant type for inline content
-using InlineNode = std::variant<Text, SoftBreak, HardBreak, Code, Emphasis,
-                                Strong, Link, Image, HtmlInline>;
+// =============================================================================
+// Node ID Types - indices into node pools for compact storage
+// =============================================================================
 
-// Variant type for block content
-using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
-                               HtmlBlock, BlockQuote, List, ListItem>;
+using InlineNodeId = uint32_t;
+using BlockNodeId = uint32_t;
+constexpr InlineNodeId kInvalidInlineNodeId = ~uint32_t(0);
+constexpr BlockNodeId kInvalidBlockNodeId = ~uint32_t(0);
 
 // =============================================================================
 // Inline Node Definitions
@@ -169,19 +170,19 @@ struct Code {
 
 struct Emphasis {
   static constexpr NodeType kType = NodeType::kEmphasis;
-  std::pmr::vector<InlineNode> children;
+  std::pmr::vector<InlineNodeId> children;
 };
 
 struct Strong {
   static constexpr NodeType kType = NodeType::kStrong;
-  std::pmr::vector<InlineNode> children;
+  std::pmr::vector<InlineNodeId> children;
 };
 
 struct Link {
   static constexpr NodeType kType = NodeType::kLink;
   std::pmr::string destination;
   std::pmr::string title;
-  std::pmr::vector<InlineNode> children;
+  std::pmr::vector<InlineNodeId> children;
 };
 
 struct Image {
@@ -199,21 +200,25 @@ struct HtmlInline {
   HtmlInline() = default;
 };
 
+// Variant type for inline content
+using InlineNode = std::variant<Text, SoftBreak, HardBreak, Code, Emphasis,
+                                Strong, Link, Image, HtmlInline>;
+
 // =============================================================================
 // Block Node Definitions
 // =============================================================================
 
 struct Paragraph {
   static constexpr NodeType kType = NodeType::kParagraph;
-  std::pmr::vector<InlineNode> children;
-  std::pmr::string raw_content;  // Temporary storage, cleared after inline parsing
+  std::pmr::vector<InlineNodeId> children;
+  std::pmr::string raw_content;  // Temporary storage for inline parsing
 };
 
 struct Heading {
   static constexpr NodeType kType = NodeType::kHeading;
   int level = 1;  // 1-6
-  std::pmr::vector<InlineNode> children;
-  std::pmr::string raw_content;  // Temporary storage, cleared after inline parsing
+  std::pmr::vector<InlineNodeId> children;
+  std::pmr::string raw_content;  // Temporary storage for inline parsing
 };
 
 struct ThematicBreak {
@@ -235,7 +240,7 @@ struct HtmlBlock {
 
 struct ListItem {
   static constexpr NodeType kType = NodeType::kListItem;
-  std::pmr::vector<BlockNode> children;
+  std::pmr::vector<BlockNodeId> children;
   bool is_tight = true;
 };
 
@@ -251,8 +256,12 @@ struct List {
 
 struct BlockQuote {
   static constexpr NodeType kType = NodeType::kBlockQuote;
-  std::pmr::vector<BlockNode> children;
+  std::pmr::vector<BlockNodeId> children;
 };
+
+// Variant type for block content
+using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
+                               HtmlBlock, BlockQuote, List, ListItem>;
 
 // Type alias for link references map
 using LinkRefMap = std::pmr::unordered_map<
@@ -268,6 +277,17 @@ struct Document {
   // Storage for decoded strings (entities, escapes) that inline nodes view into
   // Using deque to avoid reference invalidation on growth
   std::deque<std::pmr::string> string_storage;
+
+  // Node pools for compact storage - nodes are referenced by ID (index)
+  std::pmr::vector<InlineNode> inline_nodes;
+  std::pmr::vector<BlockNode> block_nodes;
+
+  // Add a block to the pool and return its ID
+  BlockNodeId AddBlock(BlockNode&& node) {
+    BlockNodeId id = static_cast<BlockNodeId>(block_nodes.size());
+    block_nodes.push_back(std::move(node));
+    return id;
+  }
 };
 
 // =============================================================================
@@ -2490,10 +2510,13 @@ inline std::pmr::string DecodeEscapes(std::string_view text) {
 class InlineParser {
  public:
   explicit InlineParser(const LinkRefMap* link_refs = nullptr,
-                        std::deque<std::pmr::string>* string_storage = nullptr)
-      : link_references_(link_refs), string_storage_(string_storage) {}
+                        std::deque<std::pmr::string>* string_storage = nullptr,
+                        std::pmr::vector<InlineNode>* inline_pool = nullptr)
+      : link_references_(link_refs),
+        string_storage_(string_storage),
+        inline_pool_(inline_pool) {}
 
-  std::pmr::vector<InlineNode> Parse(std::string_view text) {
+  std::pmr::vector<InlineNodeId> Parse(std::string_view text) {
     text_ = text;
     pos_ = 0;
     return ParseInlines();
@@ -2504,11 +2527,29 @@ class InlineParser {
   size_t pos_ = 0;
   const LinkRefMap* link_references_ = nullptr;
   std::deque<std::pmr::string>* string_storage_ = nullptr;
+  std::pmr::vector<InlineNode>* inline_pool_ = nullptr;
 
   // Store a string in persistent storage and return a view into it
   std::string_view StoreString(std::pmr::string s) {
     string_storage_->push_back(std::move(s));
     return string_storage_->back();
+  }
+
+  // Add a node to the pool and return its ID
+  InlineNodeId AddToPool(InlineNode node) {
+    InlineNodeId id = static_cast<InlineNodeId>(inline_pool_->size());
+    inline_pool_->push_back(std::move(node));
+    return id;
+  }
+
+  // Convert a vector of nodes to IDs by adding them all to the pool
+  std::pmr::vector<InlineNodeId> NodesToIds(std::pmr::vector<InlineNode>& nodes) {
+    std::pmr::vector<InlineNodeId> ids;
+    ids.reserve(nodes.size());
+    for (auto& node : nodes) {
+      ids.push_back(AddToPool(std::move(node)));
+    }
+    return ids;
   }
 
   struct DelimiterNode {
@@ -2538,7 +2579,7 @@ class InlineParser {
     return depth == 0;
   }
 
-  std::pmr::vector<InlineNode> ParseInlines() {
+  std::pmr::vector<InlineNodeId> ParseInlines() {
     std::pmr::vector<InlineNode> result;
     // Reserve based on text length heuristic (~1 node per 20 chars)
     result.reserve(text_.size() / 20 + 4);
@@ -2774,7 +2815,7 @@ class InlineParser {
               Link link;
               link.destination = std::move(link_result->first);
               link.title = std::move(link_result->second);
-              link.children = std::move(link_content);
+              link.children = NodesToIds(link_content);
               result.push_back(std::move(link));
             }
 
@@ -2861,7 +2902,7 @@ class InlineParser {
               Link link;
               link.destination = std::move(ref_result->first);
               link.title = std::move(ref_result->second);
-              link.children = std::move(link_content);
+              link.children = NodesToIds(link_content);
               result.push_back(std::move(link));
             }
 
@@ -2926,7 +2967,8 @@ class InlineParser {
     // Process emphasis
     ProcessEmphasis(result, delimiter_stack);
 
-    return result;
+    // Convert local nodes to pool IDs
+    return NodesToIds(result);
   }
 
   // Find the start position of the UTF-8 character before the given position
@@ -3070,7 +3112,7 @@ class InlineParser {
       pos_ = end + 1;
       Link link;
       link.destination = detail::EncodeUrl(content);
-      link.children.push_back(Text(content));  // Use view into raw_content
+      link.children.push_back(AddToPool(Text(content)));
       return link;
     }
 
@@ -3083,7 +3125,7 @@ class InlineParser {
       pos_ = end + 1;
       Link link;
       link.destination = "mailto:" + std::pmr::string(content);
-      link.children.push_back(Text(content));  // Use view into raw_content
+      link.children.push_back(AddToPool(Text(content)));
       return link;
     }
 
@@ -3462,6 +3504,39 @@ class InlineParser {
     }
   }
 
+  // Get alt text from a vector of InlineNodeIds (nodes already in pool)
+  std::pmr::string GetAltTextFromIds(
+      const std::pmr::vector<InlineNodeId>& node_ids) {
+    std::pmr::string result;
+    for (InlineNodeId id : node_ids) {
+      const auto& node = (*inline_pool_)[id];
+      std::visit(
+          [&result, this](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, Text>) {
+              result += arg.content;
+            } else if constexpr (std::is_same_v<T, Code>) {
+              result += arg.content;
+            } else if constexpr (std::is_same_v<T, SoftBreak>) {
+              result += ' ';
+            } else if constexpr (std::is_same_v<T, HardBreak>) {
+              result += ' ';
+            } else if constexpr (std::is_same_v<T, Emphasis>) {
+              result += GetAltTextFromIds(arg.children);
+            } else if constexpr (std::is_same_v<T, Strong>) {
+              result += GetAltTextFromIds(arg.children);
+            } else if constexpr (std::is_same_v<T, Link>) {
+              result += GetAltTextFromIds(arg.children);
+            } else if constexpr (std::is_same_v<T, Image>) {
+              result += arg.alt_text;
+            }
+          },
+          node);
+    }
+    return result;
+  }
+
+  // Get alt text from a vector of local InlineNodes (not yet in pool)
   std::pmr::string GetAltText(const std::pmr::vector<InlineNode>& nodes) {
     std::pmr::string result;
     for (const auto& node : nodes) {
@@ -3477,11 +3552,11 @@ class InlineParser {
             } else if constexpr (std::is_same_v<T, HardBreak>) {
               result += ' ';
             } else if constexpr (std::is_same_v<T, Emphasis>) {
-              result += GetAltText(arg.children);
+              result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Strong>) {
-              result += GetAltText(arg.children);
+              result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Link>) {
-              result += GetAltText(arg.children);
+              result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Image>) {
               result += arg.alt_text;
             }
@@ -3539,15 +3614,15 @@ class InlineParser {
           content.push_back(std::move(nodes[i]));
         }
 
-        // Create emphasis node
+        // Create emphasis node - convert children to pool IDs
         InlineNode emph_node;
         if (is_strong) {
           Strong strong;
-          strong.children = std::move(content);
+          strong.children = NodesToIds(content);
           emph_node = std::move(strong);
         } else {
           Emphasis em;
-          em.children = std::move(content);
+          em.children = NodesToIds(content);
           emph_node = std::move(em);
         }
 
@@ -3625,6 +3700,7 @@ class BlockParser {
  public:
   Document Parse(std::string_view input) {
     Document doc;
+    doc_ = &doc;
     // Use LineBuffer for cache-friendly line storage (contiguous offsets)
     lines_ = std::make_unique<detail::LineBuffer>(input);
     line_idx_ = 0;
@@ -3638,7 +3714,8 @@ class BlockParser {
     ParseBlocks(doc.children);
 
     // Third pass: parse inlines
-    InlineParser inline_parser(&doc.link_references, &doc.string_storage);
+    InlineParser inline_parser(&doc.link_references, &doc.string_storage,
+                               &doc.inline_nodes);
     ParseInlines(doc.children, inline_parser);
 
     return doc;
@@ -3650,6 +3727,158 @@ class BlockParser {
   std::unique_ptr<detail::LineBuffer> lines_;
   size_t line_idx_ = 0;
   LinkRefMap* parent_link_refs_ = nullptr;
+  Document* doc_ = nullptr;
+
+  // Transfer blocks from a nested document to the parent's pool and return IDs
+  // Also transfers inline nodes, string storage, and remaps their IDs
+  std::pmr::vector<BlockNodeId> TransferFromNestedDoc(Document& nested_doc) {
+    // Transfer string_storage by COPYING to preserve string_view validity.
+    // SSO strings have data inside the object, so moving would invalidate views.
+    // We need to record how many strings we're copying to calculate new indices.
+    size_t string_storage_base = doc_->string_storage.size();
+    for (const auto& s : nested_doc.string_storage) {
+      doc_->string_storage.push_back(s);  // COPY, not move
+    }
+
+    // Helper to update a string_view to point to the new string location
+    auto update_string_view = [&](std::string_view& sv) {
+      const char* sv_data = sv.data();
+      // Find the original string this view points into
+      for (size_t i = 0; i < nested_doc.string_storage.size(); ++i) {
+        const auto& old_str = nested_doc.string_storage[i];
+        if (sv_data >= old_str.data() &&
+            sv_data < old_str.data() + old_str.size()) {
+          // Found it - compute offset and update to new location
+          size_t offset = sv_data - old_str.data();
+          const auto& new_str = doc_->string_storage[string_storage_base + i];
+          sv = std::string_view(new_str.data() + offset, sv.size());
+          return;
+        }
+      }
+    };
+
+    // First, transfer all inline nodes from nested to parent and build ID map
+    std::pmr::vector<InlineNodeId> inline_id_map;
+    inline_id_map.reserve(nested_doc.inline_nodes.size());
+    for (auto& inline_node : nested_doc.inline_nodes) {
+      // Update string_views in Text/HtmlInline nodes before moving
+      // (Code has pmr::string, not string_view, so it doesn't need updating)
+      std::visit(
+          [&](auto&& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, Text>) {
+              update_string_view(node.content);
+            } else if constexpr (std::is_same_v<T, HtmlInline>) {
+              update_string_view(node.content);
+            }
+          },
+          inline_node);
+      InlineNodeId new_id =
+          static_cast<InlineNodeId>(doc_->inline_nodes.size());
+      doc_->inline_nodes.push_back(std::move(inline_node));
+      inline_id_map.push_back(new_id);
+    }
+
+    // Helper to remap inline IDs in a vector
+    auto remap_inline_ids = [&](std::pmr::vector<InlineNodeId>& ids) {
+      for (auto& id : ids) {
+        id = inline_id_map[id];
+      }
+    };
+
+    // Remap inline IDs in nested inline nodes (for Emphasis/Strong/Link children)
+    // These were just moved to doc_->inline_nodes
+    size_t start_idx = doc_->inline_nodes.size() - inline_id_map.size();
+    for (size_t i = start_idx; i < doc_->inline_nodes.size(); ++i) {
+      std::visit(
+          [&](auto&& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, Emphasis> ||
+                          std::is_same_v<T, Strong> ||
+                          std::is_same_v<T, Link>) {
+              remap_inline_ids(node.children);
+            }
+          },
+          doc_->inline_nodes[i]);
+    }
+
+    // First, transfer nested block_nodes (for nested BlockQuotes/ListItems)
+    // Build block_id_map so we can remap IDs in Lists/BlockQuotes
+    std::pmr::vector<BlockNodeId> block_id_map;
+    block_id_map.reserve(nested_doc.block_nodes.size());
+    for (auto& nested_block : nested_doc.block_nodes) {
+      // Remap inline IDs in nested blocks
+      std::visit(
+          [&](auto&& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, Paragraph> ||
+                          std::is_same_v<T, Heading>) {
+              remap_inline_ids(node.children);
+            }
+          },
+          nested_block);
+      BlockNodeId new_id = doc_->AddBlock(std::move(nested_block));
+      block_id_map.push_back(new_id);
+    }
+
+    // Helper to remap block IDs using block_id_map
+    auto remap_block_ids = [&](auto& block) {
+      std::visit(
+          [&](auto&& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, BlockQuote>) {
+              for (auto& id : node.children) {
+                if (id < block_id_map.size()) {
+                  id = block_id_map[id];
+                }
+              }
+            } else if constexpr (std::is_same_v<T, List>) {
+              for (auto& item : node.items) {
+                for (auto& id : item.children) {
+                  if (id < block_id_map.size()) {
+                    id = block_id_map[id];
+                  }
+                }
+              }
+            } else if constexpr (std::is_same_v<T, ListItem>) {
+              for (auto& id : node.children) {
+                if (id < block_id_map.size()) {
+                  id = block_id_map[id];
+                }
+              }
+            }
+          },
+          block);
+    };
+
+    // Remap block IDs in the transferred block_nodes
+    size_t block_start_idx = doc_->block_nodes.size() - block_id_map.size();
+    for (size_t i = block_start_idx; i < doc_->block_nodes.size(); ++i) {
+      remap_block_ids(doc_->block_nodes[i]);
+    }
+
+    // Now transfer blocks from nested_doc.children and remap their IDs
+    std::pmr::vector<BlockNodeId> block_ids;
+    block_ids.reserve(nested_doc.children.size());
+
+    for (auto& block : nested_doc.children) {
+      // Remap inline IDs in the block
+      std::visit(
+          [&](auto&& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, Paragraph> ||
+                          std::is_same_v<T, Heading>) {
+              remap_inline_ids(node.children);
+            }
+          },
+          block);
+      // Remap block IDs in Lists/BlockQuotes
+      remap_block_ids(block);
+      block_ids.push_back(doc_->AddBlock(std::move(block)));
+    }
+
+    return block_ids;
+  }
 
   bool AtEnd() const { return !lines_ || line_idx_ >= lines_->size(); }
 
@@ -5043,8 +5272,9 @@ class BlockParser {
       }
     }
 
+    // Transfer nested doc to parent's pools and get IDs
     BlockQuote bq;
-    bq.children = std::move(nested_doc.children);
+    bq.children = TransferFromNestedDoc(nested_doc);
     return bq;
   }
 
@@ -5509,7 +5739,8 @@ class BlockParser {
         if (!item_content.empty()) {
           BlockParser item_parser;
           Document item_doc = item_parser.Parse(item_content);
-          item.children = std::move(item_doc.children);
+          // Transfer nested doc to parent's pools and get IDs
+          item.children = TransferFromNestedDoc(item_doc);
 
           // Promote link references from nested document to parent
           if (parent_link_refs_) {
@@ -5830,11 +6061,16 @@ class BlockParser {
           [&parser, this](auto&& node) {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, Paragraph>) {
-              node.children = parser.Parse(node.raw_content);
-              // Keep raw_content alive - inline nodes may hold string_views into it
+              // Store raw_content in string_storage so string_views survive moves
+              // (SSO strings have data inside the object, which becomes invalid after move)
+              doc_->string_storage.push_back(std::move(node.raw_content));
+              std::string_view stable_content = doc_->string_storage.back();
+              node.children = parser.Parse(stable_content);
             } else if constexpr (std::is_same_v<T, Heading>) {
-              node.children = parser.Parse(node.raw_content);
-              // Keep raw_content alive - inline nodes may hold string_views into it
+              // Store raw_content in string_storage so string_views survive moves
+              doc_->string_storage.push_back(std::move(node.raw_content));
+              std::string_view stable_content = doc_->string_storage.back();
+              node.children = parser.Parse(stable_content);
             }
             // BlockQuote and List children are already parsed by their nested
             // BlockParser - do NOT recursively parse them again
@@ -5851,6 +6087,7 @@ class BlockParser {
 class HtmlRenderer {
  public:
   std::pmr::string Render(const Document& doc) {
+    doc_ = &doc;
     std::pmr::string result;
     // Pre-allocate based on block count heuristic (~100 chars per block)
     result.reserve(doc.children.size() * 100 + 256);
@@ -5859,6 +6096,7 @@ class HtmlRenderer {
   }
 
  private:
+  const Document* doc_ = nullptr;
   void RenderBlocks(const std::pmr::vector<BlockNode>& blocks,
                     std::pmr::string& out, bool in_tight_list) {
     for (size_t i = 0; i < blocks.size(); ++i) {
@@ -5935,8 +6173,38 @@ class HtmlRenderer {
 
   void RenderBlockQuote(const BlockQuote& bq, std::pmr::string& out) {
     out += "<blockquote>\n";
-    RenderBlocks(bq.children, out, false);
+    RenderBlockIds(bq.children, out, false);
     out += "</blockquote>\n";
+  }
+
+  // Render blocks from a vector of BlockNodeIds
+  void RenderBlockIds(const std::pmr::vector<BlockNodeId>& block_ids,
+                      std::pmr::string& out, bool in_tight_list) {
+    for (BlockNodeId id : block_ids) {
+      const auto& block = doc_->block_nodes[id];
+      std::visit(
+          [this, &out, in_tight_list](auto&& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, Paragraph>) {
+              RenderParagraph(node, out, in_tight_list);
+            } else if constexpr (std::is_same_v<T, Heading>) {
+              RenderHeading(node, out);
+            } else if constexpr (std::is_same_v<T, ThematicBreak>) {
+              out += "<hr />\n";
+            } else if constexpr (std::is_same_v<T, CodeBlock>) {
+              RenderCodeBlock(node, out);
+            } else if constexpr (std::is_same_v<T, HtmlBlock>) {
+              out += node.content;
+            } else if constexpr (std::is_same_v<T, BlockQuote>) {
+              RenderBlockQuote(node, out);
+            } else if constexpr (std::is_same_v<T, List>) {
+              RenderList(node, out);
+            } else if constexpr (std::is_same_v<T, ListItem>) {
+              // Handled by RenderList
+            }
+          },
+          block);
+    }
   }
 
   void RenderList(const List& list, std::pmr::string& out) {
@@ -5954,19 +6222,25 @@ class HtmlRenderer {
     for (const auto& item : list.items) {
       out += "<li>";
 
-      if (list.is_tight && item.children.size() == 1 &&
-          std::holds_alternative<Paragraph>(item.children[0])) {
-        // Tight list with single paragraph - render without <p> tags
-        const auto& para = std::get<Paragraph>(item.children[0]);
-        RenderInlines(para.children, out);
+      if (list.is_tight && item.children.size() == 1) {
+        // Look up the first block by ID
+        const auto& first_block = doc_->block_nodes[item.children[0]];
+        if (std::holds_alternative<Paragraph>(first_block)) {
+          // Tight list with single paragraph - render without <p> tags
+          const auto& para = std::get<Paragraph>(first_block);
+          RenderInlines(para.children, out);
+        } else {
+          out += '\n';
+          RenderBlockIds(item.children, out, true);
+        }
       } else if (list.is_tight) {
         // Tight list with multiple blocks
         out += '\n';
-        RenderBlocks(item.children, out, true);
+        RenderBlockIds(item.children, out, true);
       } else {
         // Loose list
         out += '\n';
-        RenderBlocks(item.children, out, false);
+        RenderBlockIds(item.children, out, false);
       }
 
       out += "</li>\n";
@@ -5979,9 +6253,10 @@ class HtmlRenderer {
     }
   }
 
-  void RenderInlines(const std::pmr::vector<InlineNode>& nodes,
+  void RenderInlines(const std::pmr::vector<InlineNodeId>& node_ids,
                      std::pmr::string& out) {
-    for (const auto& node : nodes) {
+    for (InlineNodeId id : node_ids) {
+      const auto& node = doc_->inline_nodes[id];
       std::visit(
           [this, &out](auto&& n) {
             using T = std::decay_t<decltype(n)>;
@@ -6059,11 +6334,13 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
   result += prefix + "Document\n";
 
   std::function<void(const std::pmr::vector<BlockNode>&, int)> print_blocks;
-  std::function<void(const std::pmr::vector<InlineNode>&, int)> print_inlines;
+  std::function<void(const std::pmr::vector<BlockNodeId>&, int)> print_block_ids;
+  std::function<void(const std::pmr::vector<InlineNodeId>&, int)> print_inlines;
 
-  print_inlines = [&](const std::pmr::vector<InlineNode>& nodes, int ind) {
+  print_inlines = [&](const std::pmr::vector<InlineNodeId>& node_ids, int ind) {
     std::pmr::string p(ind * 2, ' ');
-    for (const auto& node : nodes) {
+    for (InlineNodeId id : node_ids) {
+      const auto& node = doc.inline_nodes[id];
       std::visit(
           [&](auto&& n) {
             using T = std::decay_t<decltype(n)>;
@@ -6100,6 +6377,52 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
     }
   };
 
+  print_block_ids = [&](const std::pmr::vector<BlockNodeId>& block_ids,
+                        int ind) {
+    std::pmr::string p(ind * 2, ' ');
+    for (BlockNodeId id : block_ids) {
+      const auto& block = doc.block_nodes[id];
+      std::visit(
+          [&](auto&& n) {
+            using T = std::decay_t<decltype(n)>;
+            if constexpr (std::is_same_v<T, Paragraph>) {
+              result += p + "Paragraph\n";
+              print_inlines(n.children, ind + 1);
+            } else if constexpr (std::is_same_v<T, Heading>) {
+              result += p + "Heading (level " +
+                        std::pmr::string(std::to_string(n.level)) + ")\n";
+              print_inlines(n.children, ind + 1);
+            } else if constexpr (std::is_same_v<T, ThematicBreak>) {
+              result += p + "ThematicBreak\n";
+            } else if constexpr (std::is_same_v<T, CodeBlock>) {
+              result += p + "CodeBlock";
+              if (!n.info_string.empty()) {
+                result += " (" + n.info_string + ")";
+              }
+              result += "\n";
+            } else if constexpr (std::is_same_v<T, HtmlBlock>) {
+              result += p + "HtmlBlock (type " +
+                        std::pmr::string(std::to_string(n.block_type)) + ")\n";
+            } else if constexpr (std::is_same_v<T, BlockQuote>) {
+              result += p + "BlockQuote\n";
+              print_block_ids(n.children, ind + 1);
+            } else if constexpr (std::is_same_v<T, List>) {
+              result += p + "List (" +
+                        (n.is_ordered ? "ordered" : "unordered") +
+                        (n.is_tight ? ", tight" : ", loose") + ")\n";
+              for (const auto& item : n.items) {
+                result += p + "  ListItem\n";
+                print_block_ids(item.children, ind + 2);
+              }
+            } else if constexpr (std::is_same_v<T, ListItem>) {
+              result += p + "ListItem\n";
+              print_block_ids(n.children, ind + 1);
+            }
+          },
+          block);
+    }
+  };
+
   print_blocks = [&](const std::pmr::vector<BlockNode>& blocks, int ind) {
     std::pmr::string p(ind * 2, ' ');
     for (const auto& block : blocks) {
@@ -6126,18 +6449,18 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
                         std::pmr::string(std::to_string(n.block_type)) + ")\n";
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               result += p + "BlockQuote\n";
-              print_blocks(n.children, ind + 1);
+              print_block_ids(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, List>) {
               result += p + "List (" +
                         (n.is_ordered ? "ordered" : "unordered") +
                         (n.is_tight ? ", tight" : ", loose") + ")\n";
               for (const auto& item : n.items) {
                 result += p + "  ListItem\n";
-                print_blocks(item.children, ind + 2);
+                print_block_ids(item.children, ind + 2);
               }
             } else if constexpr (std::is_same_v<T, ListItem>) {
               result += p + "ListItem\n";
-              print_blocks(n.children, ind + 1);
+              print_block_ids(n.children, ind + 1);
             }
           },
           block);

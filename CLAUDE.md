@@ -5,9 +5,6 @@ in one or more specific test numbers that can be run.
 
 `run_tests.sh [TEST_NUMBER] ...`
 
-You can also run`python get_test_output [TEST_NUMBER]` to get input markdown for 
-and expected HTMl output for specific tests.
-
 The file `main.cc` runs the markus.h library. The main executable to test input 
 Markdown (via stdin) and output HTML (via stdout) is built via 
 `bazel build main`.

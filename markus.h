@@ -22,7 +22,7 @@
 // Arena Allocator Setup
 // =============================================================================
 
-inline constexpr std::size_t kArenaSize = 128 * 1024 * 1024;  // 64 MiB
+inline constexpr std::size_t kArenaSize = 128 * 1024 * 1024;  // 128 MiB
 
 // The backing buffer (static storage). One per program because it's inline.
 alignas(std::max_align_t) inline std::byte g_buffer[kArenaSize];
@@ -264,8 +264,9 @@ using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
                                HtmlBlock, BlockQuote, List, ListItem>;
 
 // Type alias for link references map
-using LinkRefMap = std::pmr::unordered_map<
-    std::pmr::string, std::pair<std::pmr::string, std::pmr::string>>;
+using LinkRefMap =
+    std::pmr::unordered_map<std::pmr::string,
+                            std::pair<std::pmr::string, std::pmr::string>>;
 
 struct Document {
   static constexpr NodeType kType = NodeType::kDocument;
@@ -2543,7 +2544,8 @@ class InlineParser {
   }
 
   // Convert a vector of nodes to IDs by adding them all to the pool
-  std::pmr::vector<InlineNodeId> NodesToIds(std::pmr::vector<InlineNode>& nodes) {
+  std::pmr::vector<InlineNodeId> NodesToIds(
+      std::pmr::vector<InlineNode>& nodes) {
     std::pmr::vector<InlineNodeId> ids;
     ids.reserve(nodes.size());
     for (auto& node : nodes) {
@@ -2654,7 +2656,8 @@ class InlineParser {
 
       // Check for code span
       if (c == '`') {
-        // Flush text BEFORE trying to parse, since TryParseCodeSpan advances pos_
+        // Flush text BEFORE trying to parse, since TryParseCodeSpan advances
+        // pos_
         flush_text();
         auto code_span = TryParseCodeSpan();
         if (code_span) {
@@ -3637,8 +3640,8 @@ class InlineParser {
           opener.active = false;
         }
 
-        // Update closer text - delimiters consumed from the BEGINNING of closer run
-        // Remaining delimiters are at the END of the original view
+        // Update closer text - delimiters consumed from the BEGINNING of closer
+        // run Remaining delimiters are at the END of the original view
         if (closer.count > delim_count) {
           auto& closer_content = std::get<Text>(nodes[closer.pos]).content;
           closer_content = closer_content.substr(delim_count);
@@ -3733,8 +3736,9 @@ class BlockParser {
   // Also transfers inline nodes, string storage, and remaps their IDs
   std::pmr::vector<BlockNodeId> TransferFromNestedDoc(Document& nested_doc) {
     // Transfer string_storage by COPYING to preserve string_view validity.
-    // SSO strings have data inside the object, so moving would invalidate views.
-    // We need to record how many strings we're copying to calculate new indices.
+    // SSO strings have data inside the object, so moving would invalidate
+    // views. We need to record how many strings we're copying to calculate new
+    // indices.
     size_t string_storage_base = doc_->string_storage.size();
     for (const auto& s : nested_doc.string_storage) {
       doc_->string_storage.push_back(s);  // COPY, not move
@@ -3786,8 +3790,8 @@ class BlockParser {
       }
     };
 
-    // Remap inline IDs in nested inline nodes (for Emphasis/Strong/Link children)
-    // These were just moved to doc_->inline_nodes
+    // Remap inline IDs in nested inline nodes (for Emphasis/Strong/Link
+    // children) These were just moved to doc_->inline_nodes
     size_t start_idx = doc_->inline_nodes.size() - inline_id_map.size();
     for (size_t i = start_idx; i < doc_->inline_nodes.size(); ++i) {
       std::visit(
@@ -6061,13 +6065,15 @@ class BlockParser {
           [&parser, this](auto&& node) {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, Paragraph>) {
-              // Store raw_content in string_storage so string_views survive moves
-              // (SSO strings have data inside the object, which becomes invalid after move)
+              // Store raw_content in string_storage so string_views survive
+              // moves (SSO strings have data inside the object, which becomes
+              // invalid after move)
               doc_->string_storage.push_back(std::move(node.raw_content));
               std::string_view stable_content = doc_->string_storage.back();
               node.children = parser.Parse(stable_content);
             } else if constexpr (std::is_same_v<T, Heading>) {
-              // Store raw_content in string_storage so string_views survive moves
+              // Store raw_content in string_storage so string_views survive
+              // moves
               doc_->string_storage.push_back(std::move(node.raw_content));
               std::string_view stable_content = doc_->string_storage.back();
               node.children = parser.Parse(stable_content);
@@ -6308,14 +6314,14 @@ class HtmlRenderer {
 
 // Parse Markdown input and return an AST
 inline Document Parse(std::string_view input) {
-  std::pmr::set_default_resource(&g_arena);
+  // std::pmr::set_default_resource(&g_arena);
   BlockParser parser;
   return parser.Parse(input);
 }
 
 // Render a document AST to HTML
 inline std::pmr::string RenderHtml(const Document& doc) {
-  std::pmr::set_default_resource(&g_arena);
+  // std::pmr::set_default_resource(&g_arena);
   HtmlRenderer renderer;
   return renderer.Render(doc);
 }
@@ -6334,7 +6340,8 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
   result += prefix + "Document\n";
 
   std::function<void(const std::pmr::vector<BlockNode>&, int)> print_blocks;
-  std::function<void(const std::pmr::vector<BlockNodeId>&, int)> print_block_ids;
+  std::function<void(const std::pmr::vector<BlockNodeId>&, int)>
+      print_block_ids;
   std::function<void(const std::pmr::vector<InlineNodeId>&, int)> print_inlines;
 
   print_inlines = [&](const std::pmr::vector<InlineNodeId>& node_ids, int ind) {

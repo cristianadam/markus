@@ -3956,7 +3956,7 @@ class BlockParser {
         if (paren_depth == 0) break;
         --paren_depth;
         ++end;
-      } else if (detail::IsUnicodeWhitespace(c) || c < 0x20) {
+      } else if (detail::IsUnicodeWhitespace(c) || static_cast<unsigned char>(c) < 0x20) {
         break;
       } else {
         ++end;

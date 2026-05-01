@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Build with Bazel
+        run: bazel build main
+
+      - name: Make test script executable
+        run: chmod +x run_tests.sh
+
+      - name: Run CommonMark Tests
+        run: ./run_tests.sh
+
+      - name: Verify CLI Tool
+        run: |
+          # This ensures the build artifact is actually functional
+          echo "# Hello World" | bazel-bin/main

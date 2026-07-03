@@ -2,6 +2,7 @@
 #define MARKUS_H_
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <deque>
@@ -297,6 +298,8 @@ struct Document {
 
 namespace detail {
 
+using namespace std::literals;
+
 // =============================================================================
 // SIMD-Friendly Helper Functions
 // =============================================================================
@@ -373,23 +376,8 @@ inline size_t FindFirstUnsafeChar(const char* data, size_t len,
 }
 
 // Check if a span contains only blank characters (space, tab, \r, \n)
-// SIMD-friendly: processes 8 bytes at a time
 inline bool IsSpanBlank(const char* data, size_t len) {
-  size_t i = 0;
-  // Process 8 bytes at a time
-  for (; i + 8 <= len; i += 8) {
-    // For each byte, check if it's NOT a blank character
-    // Blank chars: space(0x20), tab(0x09), \n(0x0A), \r(0x0D)
-    bool all_blank = true;
-    for (size_t j = 0; j < 8; ++j) {
-      unsigned char c = static_cast<unsigned char>(data[i + j]);
-      bool is_blank = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-      all_blank = all_blank && is_blank;
-    }
-    if (!all_blank) return false;
-  }
-  // Handle remaining bytes
-  for (; i < len; ++i) {
+  for (size_t i = 0; i < len; ++i) {
     unsigned char c = static_cast<unsigned char>(data[i]);
     if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
       return false;
@@ -1689,6 +1677,19 @@ inline std::string_view TrimLeft(std::string_view s) {
   return s.substr(start);
 }
 
+// Case-insensitive prefix check without temporary string allocations
+inline bool StartsWithInsensitive(std::string_view str,
+                                  std::string_view prefix) {
+  if (str.size() < prefix.size()) return false;
+  for (size_t i = 0; i < prefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(str[i])) !=
+        std::tolower(static_cast<unsigned char>(prefix[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Count leading spaces (tabs count as 4 spaces to next tab stop)
 inline int CountIndent(std::string_view line, int* consumed_chars = nullptr) {
   int indent = 0;
@@ -2190,10 +2191,10 @@ class LineBuffer {
       for (size_t i = 0; i < input.size(); ++i) {
         char c = input[i];
         if (c == '\n') {
-          line_offsets_.push_back({line_start, buffer_.size() - line_start});
+          line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
           line_start = buffer_.size();
         } else if (c == '\r') {
-          line_offsets_.push_back({line_start, buffer_.size() - line_start});
+          line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
           if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
           line_start = buffer_.size();
         } else if (c == '\0') {
@@ -2204,8 +2205,8 @@ class LineBuffer {
       }
       // Add final line
       if (buffer_.size() > line_start ||
-          (!input.empty() && (input.back() == '\n' || input.back() == '\r'))) {
-        line_offsets_.push_back({line_start, buffer_.size() - line_start});
+          (input.back() == '\n' || input.back() == '\r')) {
+        line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
       }
       data_ptr_ = buffer_.data();
     } else {
@@ -2215,18 +2216,18 @@ class LineBuffer {
       for (size_t i = 0; i < input.size(); ++i) {
         char c = input[i];
         if (c == '\n') {
-          line_offsets_.push_back({line_start, i - line_start});
+          line_offsets_.emplace_back(line_start, i - line_start);
           line_start = i + 1;
         } else if (c == '\r') {
-          line_offsets_.push_back({line_start, i - line_start});
+          line_offsets_.emplace_back(line_start, i - line_start);
           if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
           line_start = i + 1;
         }
       }
       // Add final line
       if (input.size() > line_start ||
-          (!input.empty() && (input.back() == '\n' || input.back() == '\r'))) {
-        line_offsets_.push_back({line_start, input.size() - line_start});
+          (input.back() == '\n' || input.back() == '\r')) {
+        line_offsets_.emplace_back(line_start, input.size() - line_start);
       }
     }
   }
@@ -4087,7 +4088,6 @@ class BlockParser {
 
       // Link ref definitions cannot follow non-blank paragraph content
       if (prev_line_had_content) {
-        prev_line_had_content = true;  // This line also has content
         Advance();
         continue;
       }
@@ -4665,10 +4665,7 @@ class BlockParser {
 
     Advance();
 
-    Heading heading;
-    heading.level = level;
-    heading.raw_content = content;
-    return heading;
+    return Heading{.level = level, .raw_content = std::move(content)};
   }
 
   std::optional<CodeBlock> TryParseFencedCodeBlock() {
@@ -4757,11 +4754,8 @@ class BlockParser {
       content.pop_back();
     }
 
-    CodeBlock block;
-    block.info_string = info_string;
-    block.content = content;
-    block.is_fenced = true;
-    return block;
+    return CodeBlock{.info_string = std::move(info_string),
+                     .content = std::move(content), .is_fenced = true};
   }
 
   std::optional<HtmlBlock> TryParseHtmlBlock() {
@@ -4778,29 +4772,22 @@ class BlockParser {
     std::pmr::string end_condition;
 
     // Type 1: <script>, <pre>, <style>, <textarea>
-    static const std::pmr::vector<std::pmr::string> type1_tags = {
-        "script", "pre", "style", "textarea"};
-    for (const auto& tag : type1_tags) {
-      std::pmr::string open_tag = "<" + tag;
-      if (trimmed.size() >= open_tag.size()) {
-        std::pmr::string lower;
-        for (size_t j = 0; j < open_tag.size(); ++j) {
-          lower += static_cast<char>(
-              std::tolower(static_cast<unsigned char>(trimmed[j])));
+    static constexpr std::array type1_tags = {
+        std::string_view("<script"), std::string_view("<pre"),
+        std::string_view("<style"), std::string_view("<textarea")};
+    for (auto tag : type1_tags) {
+      if (detail::StartsWithInsensitive(trimmed, tag)) {
+        // Tag at end of line, or followed by space/tab/>/newline
+        if (trimmed.size() == tag.size()) {
+          block_type = 1;
+          end_condition = "</" + std::pmr::string(tag.substr(1)) + ">";
+          break;
         }
-        if (lower == open_tag) {
-          // Tag at end of line, or followed by space/tab/>/newline
-          if (trimmed.size() == open_tag.size()) {
-            block_type = 1;
-            end_condition = "</" + tag + ">";
-            break;
-          }
-          char next = trimmed[open_tag.size()];
-          if (next == ' ' || next == '>' || next == '\t' || next == '\n') {
-            block_type = 1;
-            end_condition = "</" + tag + ">";
-            break;
-          }
+        char next = trimmed[tag.size()];
+        if (next == ' ' || next == '>' || next == '\t' || next == '\n') {
+          block_type = 1;
+          end_condition = "</" + std::pmr::string(tag.substr(1)) + ">";
+          break;
         }
       }
     }
@@ -4830,17 +4817,9 @@ class BlockParser {
     }
 
     // Type 4: <!DOCTYPE
-    if (block_type == 0 && trimmed.size() >= 2 && trimmed[0] == '<' &&
-        trimmed[1] == '!') {
-      std::pmr::string prefix;
-      for (size_t j = 0; j < std::min(size_t(9), trimmed.size()); ++j) {
-        prefix += static_cast<char>(
-            std::toupper(static_cast<unsigned char>(trimmed[j])));
-      }
-      if (prefix.starts_with("<!DOCTYPE")) {
-        block_type = 4;
-        end_condition = ">";
-      }
+    if (block_type == 0 && detail::StartsWithInsensitive(trimmed, "<!doctype")) {
+      block_type = 4;
+      end_condition = ">";
     }
 
     // Type 5: <![CDATA[
@@ -4850,20 +4829,20 @@ class BlockParser {
     }
 
     // Type 6: Block-level HTML tags
-    static const std::pmr::vector<std::pmr::string> type6_tags = {
-        "address",    "article",  "aside",   "base",     "basefont",
-        "blockquote", "body",     "caption", "center",   "col",
-        "colgroup",   "dd",       "details", "dialog",   "dir",
-        "div",        "dl",       "dt",      "fieldset", "figcaption",
-        "figure",     "footer",   "form",    "frame",    "frameset",
-        "h1",         "h2",       "h3",      "h4",       "h5",
-        "h6",         "head",     "header",  "hr",       "html",
-        "iframe",     "legend",   "li",      "link",     "main",
-        "menu",       "menuitem", "nav",     "noframes", "ol",
-        "optgroup",   "option",   "p",       "param",    "search",
-        "section",    "summary",  "table",   "tbody",    "td",
-        "tfoot",      "th",       "thead",   "title",    "tr",
-        "track",      "ul"};
+    static constexpr std::array type6_tags = {
+        std::string_view("address"),    std::string_view("article"),  std::string_view("aside"),   std::string_view("base"),     std::string_view("basefont"),
+        std::string_view("blockquote"), std::string_view("body"),     std::string_view("caption"), std::string_view("center"),   std::string_view("col"),
+        std::string_view("colgroup"),   std::string_view("dd"),       std::string_view("details"), std::string_view("dialog"),   std::string_view("dir"),
+        std::string_view("div"),        std::string_view("dl"),       std::string_view("dt"),      std::string_view("fieldset"), std::string_view("figcaption"),
+        std::string_view("figure"),     std::string_view("footer"),   std::string_view("form"),    std::string_view("frame"),    std::string_view("frameset"),
+        std::string_view("h1"),         std::string_view("h2"),       std::string_view("h3"),      std::string_view("h4"),       std::string_view("h5"),
+        std::string_view("h6"),         std::string_view("head"),     std::string_view("header"),  std::string_view("hr"),       std::string_view("html"),
+        std::string_view("iframe"),     std::string_view("legend"),   std::string_view("li"),      std::string_view("link"),     std::string_view("main"),
+        std::string_view("menu"),       std::string_view("menuitem"), std::string_view("nav"),     std::string_view("noframes"), std::string_view("ol"),
+        std::string_view("optgroup"),   std::string_view("option"),   std::string_view("p"),       std::string_view("param"),    std::string_view("search"),
+        std::string_view("section"),    std::string_view("summary"),  std::string_view("table"),   std::string_view("tbody"),    std::string_view("td"),
+        std::string_view("tfoot"),      std::string_view("th"),       std::string_view("thead"),   std::string_view("title"),    std::string_view("tr"),
+        std::string_view("track"),      std::string_view("ul")};
 
     if (block_type == 0) {
       bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
@@ -4877,14 +4856,11 @@ class BlockParser {
       }
 
       if (tag_end > tag_start) {
-        std::pmr::string tag_name;
-        for (size_t j = tag_start; j < tag_end; ++j) {
-          tag_name += static_cast<char>(
-              std::tolower(static_cast<unsigned char>(trimmed[j])));
-        }
+        std::string_view tag_name_sv = trimmed.substr(tag_start, tag_end - tag_start);
 
-        for (const auto& t : type6_tags) {
-          if (tag_name == t) {
+        for (auto t : type6_tags) {
+          if (detail::StartsWithInsensitive(tag_name_sv, t) &&
+              tag_name_sv.size() == t.size()) {
             // Check for valid tag ending
             if (tag_end < trimmed.size()) {
               char next = trimmed[tag_end];
@@ -5097,10 +5073,7 @@ class BlockParser {
       }
     }
 
-    HtmlBlock block;
-    block.content = content;
-    block.block_type = block_type;
-    return block;
+    return HtmlBlock{.content = std::move(content), .block_type = block_type};
   }
 
   std::optional<BlockQuote> TryParseBlockQuote() {
@@ -5817,10 +5790,7 @@ class BlockParser {
     if (content.empty()) [[unlikely]]
       return std::nullopt;
 
-    CodeBlock block;
-    block.content = content;
-    block.is_fenced = false;
-    return block;
+    return CodeBlock{.content = std::move(content), .is_fenced = false};
   }
 
   BlockNode ParseParagraph() {
@@ -5961,22 +5931,13 @@ class BlockParser {
         // Check for HTML block (types 1-6 can interrupt paragraphs)
         if (trimmed.starts_with("<")) {
           // Type 1: script, pre, style, textarea
-          static const std::pmr::vector<std::pmr::string> type1_tags = {
-              "script", "pre", "style", "textarea"};
-          for (const auto& tag : type1_tags) {
-            std::pmr::string open_tag = "<" + tag;
-            if (trimmed.size() >= open_tag.size()) {
-              std::pmr::string lower;
-              for (size_t j = 0; j < open_tag.size(); ++j) {
-                lower += static_cast<char>(
-                    std::tolower(static_cast<unsigned char>(trimmed[j])));
-              }
-              if (lower == open_tag && (trimmed.size() == open_tag.size() ||
-                                        trimmed[open_tag.size()] == ' ' ||
-                                        trimmed[open_tag.size()] == '>' ||
-                                        trimmed[open_tag.size()] == '\t')) {
-                goto html_interrupt;
-              }
+          static constexpr std::array type1_tags = {
+              std::string_view("<script"), std::string_view("<pre"), std::string_view("<style"), std::string_view("<textarea")};
+          for (auto tag : type1_tags) {
+            if (detail::StartsWithInsensitive(trimmed, tag) &&
+                (trimmed.size() == tag.size() || trimmed[tag.size()] == ' ' ||
+                 trimmed[tag.size()] == '>' || trimmed[tag.size()] == '\t')) {
+              goto html_interrupt;
             }
           }
           // Type 2-5
@@ -5984,31 +5945,24 @@ class BlockParser {
               trimmed.starts_with("<![CDATA[")) {
             goto html_interrupt;
           }
-          if (trimmed.size() >= 2 && trimmed[1] == '!' && trimmed.size() >= 9) {
-            std::pmr::string upper;
-            for (size_t j = 0; j < 9; ++j) {
-              upper += static_cast<char>(
-                  std::toupper(static_cast<unsigned char>(trimmed[j])));
-            }
-            if (upper.starts_with("<!DOCTYPE")) {
-              goto html_interrupt;
-            }
+          if (detail::StartsWithInsensitive(trimmed, "<!doctype")) {
+            goto html_interrupt;
           }
           // Type 6: block-level tags
-          static const std::pmr::vector<std::pmr::string> type6_tags = {
-              "address",    "article",  "aside",   "base",     "basefont",
-              "blockquote", "body",     "caption", "center",   "col",
-              "colgroup",   "dd",       "details", "dialog",   "dir",
-              "div",        "dl",       "dt",      "fieldset", "figcaption",
-              "figure",     "footer",   "form",    "frame",    "frameset",
-              "h1",         "h2",       "h3",      "h4",       "h5",
-              "h6",         "head",     "header",  "hr",       "html",
-              "iframe",     "legend",   "li",      "link",     "main",
-              "menu",       "menuitem", "nav",     "noframes", "ol",
-              "optgroup",   "option",   "p",       "param",    "search",
-              "section",    "summary",  "table",   "tbody",    "td",
-              "tfoot",      "th",       "thead",   "title",    "tr",
-              "track",      "ul"};
+          static constexpr std::array type6_tags = {
+              std::string_view("address"),    std::string_view("article"),  std::string_view("aside"),   std::string_view("base"),     std::string_view("basefont"),
+              std::string_view("blockquote"), std::string_view("body"),     std::string_view("caption"), std::string_view("center"),   std::string_view("col"),
+              std::string_view("colgroup"),   std::string_view("dd"),       std::string_view("details"), std::string_view("dialog"),   std::string_view("dir"),
+              std::string_view("div"),        std::string_view("dl"),       std::string_view("dt"),      std::string_view("fieldset"), std::string_view("figcaption"),
+              std::string_view("figure"),     std::string_view("footer"),   std::string_view("form"),    std::string_view("frame"),    std::string_view("frameset"),
+              std::string_view("h1"),         std::string_view("h2"),       std::string_view("h3"),      std::string_view("h4"),       std::string_view("h5"),
+              std::string_view("h6"),         std::string_view("head"),     std::string_view("header"),  std::string_view("hr"),       std::string_view("html"),
+              std::string_view("iframe"),     std::string_view("legend"),   std::string_view("li"),      std::string_view("link"),     std::string_view("main"),
+              std::string_view("menu"),       std::string_view("menuitem"), std::string_view("nav"),     std::string_view("noframes"), std::string_view("ol"),
+              std::string_view("optgroup"),   std::string_view("option"),   std::string_view("p"),       std::string_view("param"),    std::string_view("search"),
+              std::string_view("section"),    std::string_view("summary"),  std::string_view("table"),   std::string_view("tbody"),    std::string_view("td"),
+              std::string_view("tfoot"),      std::string_view("th"),       std::string_view("thead"),   std::string_view("title"),    std::string_view("tr"),
+              std::string_view("track"),      std::string_view("ul")};
           bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
           size_t tag_start = is_closing ? 2 : 1;
           size_t tag_end = tag_start;
@@ -6018,13 +5972,10 @@ class BlockParser {
             ++tag_end;
           }
           if (tag_end > tag_start) {
-            std::pmr::string tag_name;
-            for (size_t j = tag_start; j < tag_end; ++j) {
-              tag_name += static_cast<char>(
-                  std::tolower(static_cast<unsigned char>(trimmed[j])));
-            }
-            for (const auto& t : type6_tags) {
-              if (tag_name == t) {
+            std::string_view tag_name_sv = trimmed.substr(tag_start, tag_end - tag_start);
+            for (auto t : type6_tags) {
+              if (detail::StartsWithInsensitive(tag_name_sv, t) &&
+                  tag_name_sv.size() == t.size()) {
                 if (tag_end >= trimmed.size() || trimmed[tag_end] == ' ' ||
                     trimmed[tag_end] == '>' || trimmed[tag_end] == '\t' ||
                     trimmed[tag_end] == '/') {

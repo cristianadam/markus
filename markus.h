@@ -10,7 +10,6 @@
 #include <memory>
 #include <memory_resource>
 #include <optional>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -3118,30 +3117,117 @@ class InlineParser {
       return std::nullopt;
 
     std::string_view content = text_.substr(start, end - start);
+    if (content.empty()) [[unlikely]]
+      return std::nullopt;
 
-    // Check for URI autolink
-    static const std::regex uri_regex(
-        R"(^[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^\s<>]*$)");
-    std::string content_str(content);  // For regex matching only
-    if (std::regex_match(content_str, uri_regex)) {
-      pos_ = end + 1;
-      Link link;
-      link.destination = detail::EncodeUrl(content);
-      link.children.push_back(AddToPool(Text(content)));
-      return link;
+    // Check for URI autolink: [a-zA-Z][a-zA-Z0-9+.-]{1,31}:
+    // Manual parsing replaces std::regex for massive speedup
+    if (std::isalpha(static_cast<unsigned char>(content[0]))) {
+      size_t i = 1;
+      // Consume 1-31 chars of [a-zA-Z0-9+.-]
+      while (i < content.size() && i - 1 < 32) {
+        unsigned char c = static_cast<unsigned char>(content[i]);
+        if (std::isalnum(c) || c == '+' || c == '.' || c == '-') {
+          ++i;
+        } else {
+          break;
+        }
+      }
+      // Must have at least 1 scheme char and a colon
+      if (i > 1 && i < content.size() && content[i] == ':') {
+        // Rest must be non-whitespace, non-<>, non-null
+        bool valid_uri = true;
+        for (size_t j = i + 1; j < content.size(); ++j) {
+          unsigned char c = static_cast<unsigned char>(content[j]);
+          if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\0') {
+            valid_uri = false;
+            break;
+          }
+        }
+        if (valid_uri) {
+          pos_ = end + 1;
+          Link link;
+          link.destination = detail::EncodeUrl(content);
+          link.children.push_back(AddToPool(Text(content)));
+          return link;
+        }
+      }
     }
 
-    // Check for email autolink
-    static const std::regex email_regex(
-        R"(^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9])"
-        R"((?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)"
-        R"((?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$)");
-    if (std::regex_match(content_str, email_regex)) {
-      pos_ = end + 1;
-      Link link;
-      link.destination = "mailto:" + std::pmr::string(content);
-      link.children.push_back(AddToPool(Text(content)));
-      return link;
+    // Check for email autolink: localpart@domain
+    // Manual parsing replaces std::regex
+    size_t at_pos = content.find('@');
+    if (at_pos != std::string_view::npos && at_pos > 0) {
+      // Validate local part: [a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+
+      static constexpr uint8_t kEmailLocalTable[256] = {
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1,  // !"#$%&'*+/-
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1,  // 0-9;=?~
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // A-O
+           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1,  // P-^
+          0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // a-o
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0,  // p-z|}~
+      };
+      bool valid_local = true;
+      for (size_t j = 0; j < at_pos; ++j) {
+        if (!kEmailLocalTable[static_cast<unsigned char>(content[j])]) {
+          valid_local = false;
+          break;
+        }
+      }
+
+      if (valid_local) {
+        // Validate domain: [a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[...])*
+        size_t d = at_pos + 1;
+        bool valid_domain = true;
+        if (d < content.size() && std::isalnum(static_cast<unsigned char>(content[d]))) {
+          while (d < content.size()) {
+            // Label start
+            size_t label_start = d;
+            if (!std::isalnum(static_cast<unsigned char>(content[d]))) {
+              valid_domain = false;
+              break;
+            }
+            ++d;
+            while (d < content.size() &&
+                   (std::isalnum(static_cast<unsigned char>(content[d])) ||
+                    content[d] == '-')) {
+              ++d;
+            }
+            // Label end must be alphanumeric
+            if (d > label_start + 1 &&
+                !std::isalnum(static_cast<unsigned char>(content[d - 1]))) {
+              valid_domain = false;
+              break;
+            }
+            // Label length check (max 63)
+            if (d - label_start > 63) {
+              valid_domain = false;
+              break;
+            }
+            if (d < content.size() && content[d] == '.') {
+              ++d;
+              // Next label must start with alnum
+              if (d >= content.size() ||
+                  !std::isalnum(static_cast<unsigned char>(content[d]))) {
+                valid_domain = false;
+                break;
+              }
+            }
+          }
+        } else {
+          valid_domain = false;
+        }
+
+        if (valid_domain && d == content.size()) {
+          pos_ = end + 1;
+          Link link;
+          link.destination = "mailto:" + std::pmr::string(content);
+          link.children.push_back(AddToPool(Text(content)));
+          return link;
+        }
+      }
     }
 
     return std::nullopt;
@@ -3663,17 +3749,13 @@ class InlineParser {
           closer.active = false;
         }
 
-        // Insert emphasis node, removing the content in between
-        // Reserve capacity: opener nodes + 1 emph node + nodes after closer
-        std::pmr::vector<InlineNode> new_nodes;
-        new_nodes.reserve(opener.pos + 1 + 1 + (nodes.size() - closer.pos));
-        for (size_t i = 0; i <= opener.pos; ++i) {
-          new_nodes.push_back(std::move(nodes[i]));
-        }
-        new_nodes.push_back(std::move(emph_node));
-        for (size_t i = closer.pos; i < nodes.size(); ++i) {
-          new_nodes.push_back(std::move(nodes[i]));
-        }
+        // Use in-place erase+insert instead of building a new vector
+        // Erase content between opener and closer (keep opener and closer)
+        nodes.erase(nodes.begin() + static_cast<ptrdiff_t>(opener.pos) + 1,
+                    nodes.begin() + static_cast<ptrdiff_t>(closer.pos));
+        // Insert emphasis node right after opener
+        nodes.insert(nodes.begin() + static_cast<ptrdiff_t>(opener.pos) + 1,
+                     std::move(emph_node));
 
         // Adjust positions in delimiter stack
         size_t removed = closer.pos - opener.pos - 1;
@@ -3686,7 +3768,6 @@ class InlineParser {
           }
         }
 
-        nodes = std::move(new_nodes);
         break;
       }
 

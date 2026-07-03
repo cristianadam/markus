@@ -2595,7 +2595,8 @@ class InlineParser {
 
     auto flush_text = [&]() {
       if (in_span && text_start < pos_) {
-        result.push_back(Text(text_.substr(text_start, pos_ - text_start)));
+        result.emplace_back(std::in_place_type<Text>,
+                           text_.substr(text_start, pos_ - text_start));
         in_span = false;
       }
     };
@@ -2608,7 +2609,8 @@ class InlineParser {
           --end;
         }
         if (end > text_start) {
-          result.push_back(Text(text_.substr(text_start, end - text_start)));
+          result.emplace_back(std::in_place_type<Text>,
+                             text_.substr(text_start, end - text_start));
         }
         in_span = false;
       }
@@ -2630,12 +2632,13 @@ class InlineParser {
         if (detail::IsAsciiPunctuation(next)) {
           flush_text();
           // The escaped char is at pos_+1 in the input, use a view into it
-          result.push_back(Text(text_.substr(pos_ + 1, 1)));
+          result.emplace_back(std::in_place_type<Text>,
+                             text_.substr(pos_ + 1, 1));
           pos_ += 2;
           continue;
         } else if (next == '\n') {
           flush_text();
-          result.push_back(HardBreak{});
+          result.emplace_back(std::in_place_type<HardBreak>);
           pos_ += 2;
           continue;
         }
@@ -2648,7 +2651,8 @@ class InlineParser {
         auto entity_result = TryParseEntity();
         if (entity_result) {
           // Store decoded entity and create view into it
-          result.push_back(Text(StoreString(std::move(*entity_result))));
+          result.emplace_back(std::in_place_type<Text>,
+                             StoreString(std::move(*entity_result)));
           continue;
         }
         // Entity parse failed - start new span with the '&'
@@ -2727,11 +2731,12 @@ class InlineParser {
         flush_text();
 
         // Add delimiter to stack
-        delimiter_stack.push_back({result.size(), pos_, run_length, c, can_open,
-                                   can_close, true, &result});
+        delimiter_stack.emplace_back(result.size(), pos_, run_length, c, can_open,
+                                     can_close, true, &result);
 
         // Add the delimiter characters as text - view into input
-        result.push_back(Text(text_.substr(pos_, run_length)));
+        result.emplace_back(std::in_place_type<Text>,
+                           text_.substr(pos_, run_length));
         pos_ += run_length;
         continue;
       }
@@ -2744,15 +2749,17 @@ class InlineParser {
 
         size_t bracket_pos = result.size();
         size_t bracket_text_pos = pos_;  // Position in original text
-        delimiter_stack.push_back({bracket_pos, bracket_text_pos, 1,
-                                   is_image ? '!' : '[', true, false, true,
-                                   &result});
+        delimiter_stack.emplace_back(bracket_pos, bracket_text_pos, 1,
+                                     is_image ? '!' : '[', true, false, true,
+                                     &result);
 
         if (is_image) {
-          result.push_back(Text(text_.substr(pos_, 2)));  // "!["
+          result.emplace_back(std::in_place_type<Text>,
+                             text_.substr(pos_, 2));  // "!["
           pos_ += 2;
         } else {
-          result.push_back(Text(text_.substr(pos_, 1)));  // "["
+          result.emplace_back(std::in_place_type<Text>,
+                             text_.substr(pos_, 1));  // "["
           pos_ += 1;
         }
         continue;
@@ -2790,8 +2797,9 @@ class InlineParser {
 
             // Collect inline content between opener and closer
             std::pmr::vector<InlineNode> link_content;
+            link_content.reserve(result.size() - opener->pos - 1);
             for (size_t i = opener->pos + 1; i < result.size(); ++i) {
-              link_content.push_back(std::move(result[i]));
+              link_content.emplace_back(std::move(result[i]));
             }
 
             // Extract delimiters that belong to link content and process
@@ -2801,7 +2809,7 @@ class InlineParser {
               if (it->pos > opener->pos && it->pos < result.size()) {
                 DelimiterNode d = *it;
                 d.pos -= (opener->pos + 1);  // Adjust to link_content indices
-                link_delimiters.push_back(d);
+                link_delimiters.emplace_back(d);
               }
             }
             ProcessEmphasis(link_content, link_delimiters);
@@ -2853,7 +2861,8 @@ class InlineParser {
             // Full reference was attempted but failed - don't try shortcut
             pos_ = saved_pos;
             opener->active = false;
-            result.push_back(Text(text_.substr(pos_, 1)));  // "]"
+            result.emplace_back(std::in_place_type<Text>,
+                               text_.substr(pos_, 1));  // "]"
             ++pos_;
             continue;
           }
@@ -2878,8 +2887,9 @@ class InlineParser {
             bool is_image = (opener->delimiter == '!');
 
             std::pmr::vector<InlineNode> link_content;
+            link_content.reserve(result.size() - opener->pos - 1);
             for (size_t i = opener->pos + 1; i < result.size(); ++i) {
-              link_content.push_back(std::move(result[i]));
+              link_content.emplace_back(std::move(result[i]));
             }
 
             // Extract delimiters that belong to link content and process
@@ -2889,7 +2899,7 @@ class InlineParser {
               if (it->pos > opener->pos && it->pos < result.size()) {
                 DelimiterNode d = *it;
                 d.pos -= (opener->pos + 1);  // Adjust to link_content indices
-                link_delimiters.push_back(d);
+                link_delimiters.emplace_back(d);
               }
             }
             ProcessEmphasis(link_content, link_delimiters);
@@ -2929,7 +2939,8 @@ class InlineParser {
           opener->active = false;
         }
 
-        result.push_back(Text(text_.substr(pos_, 1)));  // "]"
+        result.emplace_back(std::in_place_type<Text>,
+                           text_.substr(pos_, 1));  // "]"
         ++pos_;
         continue;
       }
@@ -2945,7 +2956,7 @@ class InlineParser {
             text_[pos_ + space_count] == '\n') {
           if (space_count >= 2) {
             flush_text();
-            result.push_back(HardBreak{});
+            result.emplace_back(std::in_place_type<HardBreak>);
             pos_ += space_count + 1;
             continue;
           }
@@ -2956,7 +2967,7 @@ class InlineParser {
       if (c == '\n') {
         // Trim trailing spaces from text span
         flush_text_trimmed();
-        result.push_back(SoftBreak{});
+        result.emplace_back(std::in_place_type<SoftBreak>);
         ++pos_;
         continue;
       }

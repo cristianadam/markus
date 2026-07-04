@@ -422,7 +422,23 @@ inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
 
   while (i < len) {
     // Fast path: find next character needing escape using lookup table
+    // 4-wide unrolled scan for better throughput (md4c optimization)
     size_t start = i;
+    while (i + 3 < len) {
+      uint8_t e0 = kEscapeTableV2[static_cast<unsigned char>(text[i])];
+      uint8_t e1 = kEscapeTableV2[static_cast<unsigned char>(text[i + 1])];
+      uint8_t e2 = kEscapeTableV2[static_cast<unsigned char>(text[i + 2])];
+      uint8_t e3 = kEscapeTableV2[static_cast<unsigned char>(text[i + 3])];
+      if (e0 || e1 || e2 || e3) {
+        if (e0) { i += 0; break; }
+        if (e1) { i += 1; break; }
+        if (e2) { i += 2; break; }
+        i += 3;
+        break;
+      }
+      i += 4;
+    }
+    // Scalar fallback for remaining characters
     while (i < len) {
       uint8_t e = kEscapeTableV2[static_cast<unsigned char>(text[i])];
       if (e != 0) break;
@@ -717,12 +733,27 @@ inline std::pair<uint32_t, size_t> DecodeUtf8At(std::string_view s,
   return {c, 1};
 }
 
+// Fast ASCII path for Unicode punctuation - inlined constexpr for compile-time
+// evaluation of the most common case (ASCII characters make up >95% of text)
+// Matches the original kPunctuationTable exactly
+inline constexpr bool IsAsciiPunctuationFast(char c) {
+  unsigned char uc = static_cast<unsigned char>(c);
+  // ASCII punctuation ranges: 0x21-0x2F, 0x3A-0x40, 0x5B-0x60, 0x7B-0x7E
+  return (uc >= 0x21 && uc <= 0x2F) || (uc >= 0x3A && uc <= 0x40) ||
+         (uc >= 0x5B && uc <= 0x60) || (uc >= 0x7B && uc <= 0x7E);
+}
+
+// Fast ASCII path for Unicode whitespace - inlined constexpr
+inline constexpr bool IsAsciiWhitespaceFast(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+}
+
 // Check if a Unicode code point is in P (punctuation) or S (symbol) categories
 // This is used for CommonMark's definition of "Unicode punctuation character"
 inline bool IsUnicodePunctuation(uint32_t cp) {
-  // ASCII punctuation
-  if (cp < 0x80) {
-    return IsAsciiPunctuation(static_cast<char>(cp));
+  // Fast ASCII path using constexpr inline check (covers >95% of cases)
+  if (cp <= 0x7E) [[likely]] {
+    return IsAsciiPunctuationFast(static_cast<char>(cp));
   }
   // Common Unicode punctuation and symbols (P and S categories)
   // This covers the most common cases; a full implementation would need
@@ -770,9 +801,9 @@ inline bool IsUnicodePunctuation(uint32_t cp) {
 
 // Check if code point is Unicode whitespace (Zs category + ASCII whitespace)
 inline bool IsUnicodeWhitespaceCodepoint(uint32_t cp) {
-  // ASCII whitespace
-  if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f') {
-    return true;
+  // Fast ASCII path using constexpr inline check (covers >95% of cases)
+  if (cp <= 0x7E) [[likely]] {
+    return IsAsciiWhitespaceFast(static_cast<char>(cp));
   }
   // Unicode Zs (space separator) category
   if (cp == 0x00A0) return true;                  // NO-BREAK SPACE
@@ -1798,6 +1829,49 @@ inline bool IsBlankLine(std::string_view line) {
 }
 
 // =============================================================================
+// Inline Parser Special Character Lookup Table (cmark-style optimization)
+// Marks characters that require special handling in inline parsing
+// This enables bulk scanning of "safe" text runs in the hot path
+// =============================================================================
+
+inline constexpr auto MakeInlineSpecialTable() {
+  std::array<uint8_t, 256> table{};
+  // Characters that trigger special inline parsing logic:
+  // backslash (escape), ampersand (entity), backtick (code span),
+  // less-than (autolink/HTML), asterisk/underscore (emphasis),
+  // brackets (links), exclamation (image), space (hard break),
+  // newline (soft break)
+  table['\\'] = 1;  // Escape character
+  table['&'] = 1;   // Entity reference
+  table['`'] = 1;   // Code span
+  table['<'] = 1;   // Autolink / HTML inline
+  table['*'] = 1;   // Emphasis / strong
+  table['_'] = 1;   // Emphasis / strong
+  table['['] = 1;   // Link open
+  table[']'] = 1;   // Link close
+  table['!'] = 1;   // Image prefix
+  table[' '] = 1;   // Hard break (2+ spaces before newline)
+  table['\n'] = 1;  // Soft break
+  return table;
+}
+
+inline constexpr auto kInlineSpecialTable = MakeInlineSpecialTable();
+
+// Fast path: find next special character position using lookup table
+// Scans ahead past runs of "safe" (non-special) characters in bulk
+inline size_t FindNextSpecialChar(std::string_view text, size_t start) {
+  size_t i = start;
+  const size_t len = text.size();
+
+  // Bulk scan: skip runs of non-special characters using lookup table
+  // This is the hot path - handles >90% of characters in typical text
+  while (i < len && !kInlineSpecialTable[static_cast<unsigned char>(text[i])]) {
+    ++i;
+  }
+  return i;
+}
+
+// =============================================================================
 // LineBuffer - Cache-friendly line storage
 // =============================================================================
 // Instead of vector<string> (many allocations, poor cache locality),
@@ -1927,70 +2001,84 @@ struct StringEqual {
 // Uses transparent lookup to avoid string_view->string conversion
 inline std::string_view LookupHtmlEntity(std::string_view name) {
   // This is a subset - full CommonMark compliance requires all HTML5 entities
-  static const std::pmr::unordered_map<std::pmr::string, std::string_view,
-                                       StringHash, StringEqual>
-      entities = {
-          {"nbsp", "\xC2\xA0"},
-          {"amp", "&"},
-          {"lt", "<"},
-          {"gt", ">"},
-          {"quot", "\""},
-          {"apos", "'"},
-          {"copy", "\xC2\xA9"},
-          {"reg", "\xC2\xAE"},
-          {"AElig", "\xC3\x86"},
-          {"Dcaron", "\xC4\x8E"},
-          {"frac34", "\xC2\xBE"},
-          {"HilbertSpace", "\xE2\x84\x8B"},
-          {"DifferentialD", "\xE2\x85\x86"},
-          {"ClockwiseContourIntegral", "\xE2\x88\xB2"},
-          {"ngE", "\xE2\x89\xA7\xCC\xB8"},
-          {"ouml", "\xC3\xB6"},
-          {"Ouml", "\xC3\x96"},
-          {"auml", "\xC3\xA4"},
-          {"Auml", "\xC3\x84"},
-          {"uuml", "\xC3\xBC"},
-          {"Uuml", "\xC3\x9C"},
-          {"szlig", "\xC3\x9F"},
-          {"euro", "\xE2\x82\xAC"},
-          {"pound", "\xC2\xA3"},
-          {"yen", "\xC2\xA5"},
-          {"cent", "\xC2\xA2"},
-          {"deg", "\xC2\xB0"},
-          {"plusmn", "\xC2\xB1"},
-          {"times", "\xC3\x97"},
-          {"divide", "\xC3\xB7"},
-          {"frac12", "\xC2\xBD"},
-          {"frac14", "\xC2\xBC"},
-          {"para", "\xC2\xB6"},
-          {"sect", "\xC2\xA7"},
-          {"dagger", "\xE2\x80\xA0"},
-          {"Dagger", "\xE2\x80\xA1"},
-          {"bull", "\xE2\x80\xA2"},
-          {"hellip", "\xE2\x80\xA6"},
-          {"ndash", "\xE2\x80\x93"},
-          {"mdash", "\xE2\x80\x94"},
-          {"lsquo", "\xE2\x80\x98"},
-          {"rsquo", "\xE2\x80\x99"},
-          {"ldquo", "\xE2\x80\x9C"},
-          {"rdquo", "\xE2\x80\x9D"},
-          {"laquo", "\xC2\xAB"},
-          {"raquo", "\xC2\xBB"},
-          {"trade", "\xE2\x84\xA2"},
-          {"larr", "\xE2\x86\x90"},
-          {"rarr", "\xE2\x86\x92"},
-          {"uarr", "\xE2\x86\x91"},
-          {"darr", "\xE2\x86\x93"},
-          {"harr", "\xE2\x86\x94"},
-          {"spades", "\xE2\x99\xA0"},
-          {"clubs", "\xE2\x99\xA3"},
-          {"hearts", "\xE2\x99\xA5"},
-          {"diams", "\xE2\x99\xA6"},
-      };
+  // Sorted array + binary search (md4c pattern): avoids unordered_map allocation
+  // overhead and provides better cache locality for the small entity table
+  struct EntityEntry {
+    const char* name;
+    std::string_view value;
+  };
 
-  auto it = entities.find(name);
-  if (it != entities.end()) {
-    return it->second;
+  static constexpr EntityEntry kEntities[] = {
+      {"AElig", "\xC3\x86"},
+      {"Auml", "\xC3\x84"},
+      {"ClockwiseContourIntegral", "\xE2\x88\xB2"},
+      {"Dagger", "\xE2\x80\xA1"},
+      {"Dcaron", "\xC4\x8E"},
+      {"DifferentialD", "\xE2\x85\x86"},
+      {"HilbertSpace", "\xE2\x84\x8B"},
+      {"Ouml", "\xC3\x96"},
+      {"Uuml", "\xC3\x9C"},
+      {"amp", "&"},
+      {"apos", "'"},
+      {"auml", "\xC3\xA4"},
+      {"bull", "\xE2\x80\xA2"},
+      {"cent", "\xC2\xA2"},
+      {"clubs", "\xE2\x99\xA3"},
+      {"copy", "\xC2\xA9"},
+      {"dagger", "\xE2\x80\xA0"},
+      {"darr", "\xE2\x86\x93"},
+      {"deg", "\xC2\xB0"},
+      {"diams", "\xE2\x99\xA6"},
+      {"divide", "\xC3\xB7"},
+      {"euro", "\xE2\x82\xAC"},
+      {"frac12", "\xC2\xBD"},
+      {"frac14", "\xC2\xBC"},
+      {"frac34", "\xC2\xBE"},
+      {"gt", ">"},
+      {"harr", "\xE2\x86\x94"},
+      {"hearts", "\xE2\x99\xA5"},
+      {"hellip", "\xE2\x80\xA6"},
+      {"laquo", "\xC2\xAB"},
+      {"larr", "\xE2\x86\x90"},
+      {"ldquo", "\xE2\x80\x9C"},
+      {"lsquo", "\xE2\x80\x98"},
+      {"lt", "<"},
+      {"mdash", "\xE2\x80\x94"},
+      {"nbsp", "\xC2\xA0"},
+      {"ndash", "\xE2\x80\x93"},
+      {"ngE", "\xE2\x89\xA7\xCC\xB8"},
+      {"ouml", "\xC3\xB6"},
+      {"para", "\xC2\xB6"},
+      {"plusmn", "\xC2\xB1"},
+      {"pound", "\xC2\xA3"},
+      {"quot", "\""},
+      {"raquo", "\xC2\xBB"},
+      {"rarr", "\xE2\x86\x92"},
+      {"rdquo", "\xE2\x80\x9D"},
+      {"reg", "\xC2\xAE"},
+      {"rsquo", "\xE2\x80\x99"},
+      {"sect", "\xC2\xA7"},
+      {"spades", "\xE2\x99\xA0"},
+      {"szlig", "\xC3\x9F"},
+      {"times", "\xC3\x97"},
+      {"trade", "\xE2\x84\xA2"},
+      {"uarr", "\xE2\x86\x91"},
+      {"uuml", "\xC3\xBC"},
+      {"yen", "\xC2\xA5"},
+  };
+
+  // Binary search over sorted entity array (md4c-style lookup table)
+  size_t lo = 0, hi = sizeof(kEntities) / sizeof(kEntities[0]);
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int cmp_result = name.compare(kEntities[mid].name);
+    if (cmp_result < 0) {
+      hi = mid;
+    } else if (cmp_result > 0) {
+      lo = mid + 1;
+    } else {
+      return kEntities[mid].value;
+    }
   }
   return "";
 }
@@ -2613,9 +2701,13 @@ class InlineParser {
         continue;
       }
 
-      // Regular character - extend current span (most common case)
-      start_span();
-      ++pos_;
+      // Fast path: scan ahead past runs of regular characters (cmark-style bulk scan)
+      // Handles >90% of characters in typical text without per-character branching
+      {
+        size_t next_special = detail::FindNextSpecialChar(text_, pos_ + 1);
+        start_span();
+        pos_ = next_special;
+      }
     }
 
     flush_text();
@@ -4321,8 +4413,14 @@ class BlockParser {
     if (count >= 3) {
       Advance();
       blocks.emplace_back(std::in_place_type<ThematicBreak>);
-      return true;
-    }
+  return true;
+}
+
+// =============================================================================
+// Inline Parser Special Character Lookup Table (cmark-style optimization)
+// Marks characters that require special handling in inline parsing
+// This enables bulk scanning of "safe" text runs in the hot path
+// =============================================================================
 
     return false;
   }

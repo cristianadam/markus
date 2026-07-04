@@ -15,6 +15,13 @@ set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 add_subdirectory(commonmark-spec cmark-build EXCLUDE_FROM_ALL)
 set(BUILD_TESTING ${BUILD_TESTING_SAVE} CACHE BOOL "Build tests" FORCE)
 
+# Add md4c as subdirectory for benchmark (EXCLUDE_FROM_ALL so it only builds when needed)
+# Disable md4c's own executables since we only need the libraries
+set(BUILD_MD2HTML_EXECUTABLE_SAVE ${BUILD_MD2HTML_EXECUTABLE})
+set(BUILD_MD2HTML_EXECUTABLE OFF CACHE BOOL "" FORCE)
+add_subdirectory(md4c md4c-build EXCLUDE_FROM_ALL)
+set(BUILD_MD2HTML_EXECUTABLE ${BUILD_MD2HTML_EXECUTABLE_SAVE} CACHE BOOL "" FORCE)
+
 # Markus header-only library
 add_library(markus INTERFACE)
 target_include_directories(markus INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -57,7 +64,8 @@ endif()
 
 # Benchmark executable
 add_executable(bench bench.cc)
-target_link_libraries(bench PRIVATE markus cmark)
+target_link_libraries(bench PRIVATE markus cmark md4c md4c-html)
+target_include_directories(bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/commonmark-spec/src ${CMAKE_BINARY_DIR}/cmark-build/src)
 set_target_properties(bench PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )

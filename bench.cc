@@ -16,6 +16,10 @@
 // cmark headers
 #include "commonmark-spec/src/cmark.h"
 
+// md4c headers
+#include "md4c.h"
+#include "md4c-html.h"
+
 namespace {
 
 std::string ReadFile(const std::string& path) {
@@ -52,6 +56,48 @@ double TimeCmark(const std::string& input, int iterations) {
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+struct Md4cBuffer {
+  char* data;
+  MD_SIZE size;
+  MD_SIZE capacity;
+
+  Md4cBuffer() : data(nullptr), size(0), capacity(0) {}
+
+  ~Md4cBuffer() { free(data); }
+
+  void append(const char* text, MD_SIZE sz) {
+    if (sz == 0) return;
+    if (this->size + sz > this->capacity) {
+      this->capacity = std::max(this->capacity * 2, this->size + sz);
+      this->data = static_cast<char*>(realloc(this->data, this->capacity));
+    }
+    std::memcpy(this->data + this->size, text, sz);
+    this->size += sz;
+  }
+
+  static void output_callback(const char* text, MD_SIZE size, void* userdata) {
+    static_cast<Md4cBuffer*>(userdata)->append(text, size);
+  }
+};
+
+double TimeMd4c(const std::string& input, int iterations) {
+  auto start = std::chrono::high_resolution_clock::now();
+  for (int i = 0; i < iterations; ++i) {
+    Md4cBuffer buf;
+    int ret = md_html(input.c_str(), static_cast<MD_SIZE>(input.size()),
+                      Md4cBuffer::output_callback, &buf,
+                      MD_DIALECT_COMMONMARK, 0);
+    if (ret != 0) {
+      std::cerr << "md4c returned error\n";
+    }
+    if (buf.size == 0 && !input.empty()) {
+      std::cerr << "md4c produced empty output\n";
+    }
+  }
+  auto end = std::chrono::high_resolution_clock::now();
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 double CalcMean(const std::vector<double>& data) {
   if (data.empty()) return 0.0;
   double sum = 0.0;
@@ -79,7 +125,9 @@ struct BenchResult {
   size_t bytes;
   double markus_ms;
   double cmark_ms;
-  double ratio;
+  double md4c_ms;
+  double ratio_markus_cmark;
+  double ratio_markus_md4c;
 };
 
 std::vector<std::string> GetSampleFiles(const std::string& dir) {
@@ -134,7 +182,7 @@ int main(int argc, char* argv[]) {
     std::string arg = argv[i];
     if (arg == "--help" || arg == "-h") {
       std::cerr << "Usage: bench [--iterations N] [--input FILE] [--rounds N] [SAMPLES_DIR]\n";
-      std::cerr << "\nBenchmarks markus vs cmark on markdown samples.\n";
+      std::cerr << "\nBenchmarks markus vs cmark vs md4c on markdown samples.\n";
       std::cerr << "\nOptions:\n";
       std::cerr << "  --iterations N   Number of iterations per sample (default: 100)\n";
       std::cerr << "  --rounds N       Number of benchmark rounds for statistics (default: 5)\n";
@@ -174,13 +222,14 @@ int main(int argc, char* argv[]) {
   std::vector<BenchResult> results;
 
   // Print header
-  printf("%-30s %8s  %10s  %10s  %8s\n", "Sample", "Bytes", "Markus ms",
-         "Cmark ms", "Ratio");
-  printf("%-30s %8s  %10s  %10s  %8s\n", "------------------------------",
-         "--------", "----------", "----------", "--------");
+  printf("%-30s %8s  %10s  %10s  %10s  %8s  %8s\n", "Sample", "Bytes",
+         "Markus ms", "Cmark ms", "Md4c ms", "M/C", "M/D");
+  printf("%-30s %8s  %10s  %10s  %10s  %8s  %8s\n", "------------------------------",
+         "--------", "----------", "----------", "----------", "--------", "--------");
 
   double total_markus = 0;
   double total_cmark = 0;
+  double total_md4c = 0;
   size_t total_bytes = 0;
 
   for (const auto& [name, content] : inputs) {
@@ -199,47 +248,63 @@ int main(int argc, char* argv[]) {
       free(html);
       cmark_node_free(doc);
     }
+    {
+      Md4cBuffer buf;
+      md_html(content.c_str(), static_cast<MD_SIZE>(content.size()),
+              Md4cBuffer::output_callback, &buf, MD_DIALECT_COMMONMARK, 0);
+    }
 
     // Run multiple rounds for statistics
     std::vector<double> markus_times;
     std::vector<double> cmark_times;
+    std::vector<double> md4c_times;
     markus_times.reserve(num_rounds);
     cmark_times.reserve(num_rounds);
+    md4c_times.reserve(num_rounds);
 
     for (int round = 0; round < num_rounds; ++round) {
       markus_times.push_back(TimeMarkus(content, iterations));
       cmark_times.push_back(TimeCmark(content, iterations));
+      md4c_times.push_back(TimeMd4c(content, iterations));
     }
 
     double markus_ms = CalcMean(markus_times);
     double cmark_ms = CalcMean(cmark_times);
+    double md4c_ms = CalcMean(md4c_times);
 
     BenchResult r;
     r.name = short_name;
     r.bytes = content.size();
     r.markus_ms = markus_ms;
     r.cmark_ms = cmark_ms;
-    r.ratio = cmark_ms > 0 ? markus_ms / cmark_ms : 0;
+    r.md4c_ms = md4c_ms;
+    r.ratio_markus_cmark = cmark_ms > 0 ? markus_ms / cmark_ms : 0;
+    r.ratio_markus_md4c = md4c_ms > 0 ? markus_ms / md4c_ms : 0;
 
-    printf("%-30s %8zu  %10.2f  %10.2f  %7.2fx\n", r.name.c_str(), r.bytes,
-           r.markus_ms, r.cmark_ms, r.ratio);
+    printf("%-30s %8zu  %10.2f  %10.2f  %10.2f  %7.2fx  %7.2fx\n",
+           r.name.c_str(), r.bytes, r.markus_ms, r.cmark_ms, r.md4c_ms,
+           r.ratio_markus_cmark, r.ratio_markus_md4c);
 
     PrintStats("markus", markus_times);
     PrintStats("cmark", cmark_times);
+    PrintStats("md4c", md4c_times);
     printf("\n");
 
     total_markus += r.markus_ms;
     total_cmark += r.cmark_ms;
+    total_md4c += r.md4c_ms;
     total_bytes += r.bytes;
 
     results.push_back(std::move(r));
   }
 
-  printf("%-30s %8s  %10s  %10s  %8s\n", "------------------------------",
-         "--------", "----------", "----------", "--------");
-  double total_ratio = total_cmark > 0 ? total_markus / total_cmark : 0;
-  printf("%-30s %8zu  %10.2f  %10.2f  %7.2fx\n", "TOTAL", total_bytes,
-         total_markus, total_cmark, total_ratio);
+  printf("%-30s %8s  %10s  %10s  %10s  %8s  %8s\n", "------------------------------",
+         "--------", "----------", "----------", "----------", "--------", "--------");
+  double total_ratio_mc = total_cmark > 0 ? total_markus / total_cmark : 0;
+  double total_ratio_md = total_md4c > 0 ? total_markus / total_md4c : 0;
+  printf("%-30s %8zu  %10.2f  %10.2f  %10.2f  %7.2fx  %7.2fx\n",
+         "TOTAL", total_bytes, total_markus, total_cmark, total_md4c,
+         total_ratio_mc, total_ratio_md);
   printf("\nIterations: %d, Rounds: %d\n", iterations, num_rounds);
 
   return 0;

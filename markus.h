@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdint>
 #include <deque>
+#include <format>
 #include <functional>
 #include <memory>
 #include <memory_resource>
@@ -1679,9 +1680,7 @@ inline std::pmr::string EncodeUrl(std::string_view url) {
     // Encode unsafe character
     if (i < url.size()) {
       unsigned char c = static_cast<unsigned char>(url[i]);
-      result += '%';
-      result += kHexChars[c >> 4];
-      result += kHexChars[c & 0x0F];
+      result.append(std::format("%{:02X}", c));
       ++i;
     }
   }
@@ -6257,21 +6256,21 @@ class HtmlRenderer {
   }
 
   void RenderCodeBlock(const CodeBlock& block, std::pmr::string& out) {
-    out += "<pre><code";
     if (!block.info_string.empty()) {
-      // Extract language (first word of info string) using find
       size_t end = block.info_string.find_first_of(" \t");
       std::string_view lang =
           (end == std::string::npos)
               ? std::string_view(block.info_string)
               : std::string_view(block.info_string).substr(0, end);
       if (!lang.empty()) {
-        out += " class=\"language-";
-        out += detail::EscapeHtml(lang);
-        out += "\"";
+        out += std::format("<pre><code class=\"language-{}\">",
+                           detail::EscapeHtml(lang));
+        out += detail::EscapeHtml(block.content);
+        out += "</code></pre>\n";
+        return;
       }
     }
-    out += ">";
+    out += "<pre><code>";
     out += detail::EscapeHtml(block.content);
     out += "</code></pre>\n";
   }
@@ -6317,8 +6316,7 @@ class HtmlRenderer {
       if (list.start == 1) {
         out += "<ol>\n";
       } else {
-        out += "<ol start=\"" + std::pmr::string(std::to_string(list.start)) +
-               "\">\n";
+        out += std::format("<ol start=\"{}\">\n", list.start);
       }
     } else {
       out += "<ul>\n";
@@ -6384,20 +6382,23 @@ class HtmlRenderer {
               RenderInlines(n.children, out);
               out += "</strong>";
             } else if constexpr (std::is_same_v<T, Link>) {
-              out += "<a href=\"" + detail::EscapeHtml(n.destination) + "\"";
-              if (!n.title.empty()) {
-                out += " title=\"" + detail::EscapeHtml(n.title) + "\"";
-              }
-              out += ">";
+              std::pmr::string escaped_dest = detail::EscapeHtml(n.destination);
+              std::string title_attr = n.title.empty()
+                                           ? ""
+                                           : std::format(" title=\"{}\"",
+                                                         detail::EscapeHtml(n.title));
+              out += std::format("<a href=\"{}\"{}>", escaped_dest, title_attr);
               RenderInlines(n.children, out);
               out += "</a>";
             } else if constexpr (std::is_same_v<T, Image>) {
-              out += "<img src=\"" + detail::EscapeHtml(n.destination) + "\"";
-              out += " alt=\"" + detail::EscapeHtml(n.alt_text) + "\"";
-              if (!n.title.empty()) {
-                out += " title=\"" + detail::EscapeHtml(n.title) + "\"";
-              }
-              out += " />";
+              std::pmr::string escaped_dest = detail::EscapeHtml(n.destination);
+              std::pmr::string escaped_alt = detail::EscapeHtml(n.alt_text);
+              std::string title_attr = n.title.empty()
+                                           ? ""
+                                           : std::format(" title=\"{}\"",
+                                                         detail::EscapeHtml(n.title));
+              out += std::format("<img src=\"{}\" alt=\"{}\"{} />", escaped_dest,
+                                 escaped_alt, title_attr);
             } else if constexpr (std::is_same_v<T, HtmlInline>) {
               out += n.content;
             }
@@ -6492,20 +6493,17 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
               result += p + "Paragraph\n";
               print_inlines(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, Heading>) {
-              result += p + "Heading (level " +
-                        std::pmr::string(std::to_string(n.level)) + ")\n";
+              result += std::format("{}Heading (level {})\n", p, n.level);
               print_inlines(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, ThematicBreak>) {
               result += p + "ThematicBreak\n";
             } else if constexpr (std::is_same_v<T, CodeBlock>) {
-              result += p + "CodeBlock";
-              if (!n.info_string.empty()) {
-                result += " (" + n.info_string + ")";
-              }
+              result += std::format("{}CodeBlock{}", p,
+                                    n.info_string.empty() ? ""
+                                                          : std::format(" ({})", n.info_string));
               result += "\n";
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
-              result += p + "HtmlBlock (type " +
-                        std::pmr::string(std::to_string(n.block_type)) + ")\n";
+              result += std::format("{}HtmlBlock (type {})\n", p, n.block_type);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               result += p + "BlockQuote\n";
               print_block_ids(n.children, ind + 1);
@@ -6536,20 +6534,17 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
               result += p + "Paragraph\n";
               print_inlines(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, Heading>) {
-              result += p + "Heading (level " +
-                        std::pmr::string(std::to_string(n.level)) + ")\n";
+              result += std::format("{}Heading (level {})\n", p, n.level);
               print_inlines(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, ThematicBreak>) {
               result += p + "ThematicBreak\n";
             } else if constexpr (std::is_same_v<T, CodeBlock>) {
-              result += p + "CodeBlock";
-              if (!n.info_string.empty()) {
-                result += " (" + n.info_string + ")";
-              }
+              result += std::format("{}CodeBlock{}", p,
+                                    n.info_string.empty() ? ""
+                                                          : std::format(" ({})", n.info_string));
               result += "\n";
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
-              result += p + "HtmlBlock (type " +
-                        std::pmr::string(std::to_string(n.block_type)) + ")\n";
+              result += std::format("{}HtmlBlock (type {})\n", p, n.block_type);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               result += p + "BlockQuote\n";
               print_block_ids(n.children, ind + 1);

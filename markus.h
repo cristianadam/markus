@@ -2264,6 +2264,16 @@ class InlineParser {
   std::deque<std::pmr::string>* string_storage_ = nullptr;
   std::pmr::vector<InlineNode>* inline_pool_ = nullptr;
 
+  // Backtick position cache (cmark optimization): caches positions of closing
+  // backtick sequences by length to avoid rescanning. When a backtick length
+  // has been scanned and no closer found, subsequent scans return immediately.
+  static constexpr size_t kMaxBacktickLength = 1000;
+  struct BacktickCache {
+    size_t position = 0;
+    bool scanned = false;
+  };
+  std::pmr::vector<BacktickCache> backtick_cache_;
+
   // Store a string in persistent storage and return a view into it
   std::string_view StoreString(std::pmr::string s) {
     string_storage_->push_back(std::move(s));
@@ -2791,8 +2801,21 @@ class InlineParser {
     size_t start = pos_;
     size_t backtick_count = 0;
     while (pos_ + backtick_count < text_.size() &&
-           text_[pos_ + backtick_count] == '`') {
+            text_[pos_ + backtick_count] == '`') {
       ++backtick_count;
+    }
+
+    // Backtick position cache (cmark optimization): avoid rescanning for
+    // closing backticks of a length we've already checked without success
+    if (backtick_count <= kMaxBacktickLength &&
+        backtick_cache_.size() > backtick_count &&
+        backtick_cache_[backtick_count].scanned) {
+      size_t cached_pos = backtick_cache_[backtick_count].position;
+      if (cached_pos >= pos_) {
+        // Already know there's no matching closer at or after this position
+        pos_ = start;
+        return {};
+      }
     }
 
     size_t content_start = pos_ + backtick_count;
@@ -2829,6 +2852,15 @@ class InlineParser {
       } else {
         ++search_pos;
       }
+    }
+
+    // Cache the failed scan result for this backtick length
+    if (backtick_count <= kMaxBacktickLength) {
+      if (backtick_cache_.size() <= backtick_count) {
+        backtick_cache_.resize(backtick_count + 1);
+      }
+      backtick_cache_[backtick_count].position = pos_;
+      backtick_cache_[backtick_count].scanned = true;
     }
 
     pos_ = start;

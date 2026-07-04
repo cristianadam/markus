@@ -465,6 +465,68 @@ inline bool IsAsciiPunctuation(char c) {
   return kPunctuationTable[static_cast<unsigned char>(c)] != 0;
 }
 
+// Case-fold lookup table: maps each byte to its lowercase equivalent
+// Replaces std::tolower() calls for O(1) case-insensitive comparisons
+inline constexpr auto MakeCaseFoldTable() {
+  std::array<uint8_t, 256> table{};
+  for (int i = 0; i < 256; ++i) {
+    table[i] = static_cast<uint8_t>(i);
+    if (i >= 'A' && i <= 'Z') {
+      table[i] = static_cast<uint8_t>(i + ('a' - 'A'));
+    }
+  }
+  return table;
+}
+
+inline constexpr auto kCaseFoldTable = MakeCaseFoldTable();
+
+inline uint8_t CaseFold(uint8_t c) { return kCaseFoldTable[c]; }
+
+// Character classification lookup table: bit flags per byte
+// Bit 0: isalpha, Bit 1: isdigit, Bit 2: isalnum, Bit 3: isxdigit
+inline constexpr auto MakeCharClassTable() {
+  std::array<uint8_t, 256> table{};
+  for (int i = 0; i < 256; ++i) {
+    uint8_t flags = 0;
+    if ((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z')) flags |= 1;
+    if (i >= '0' && i <= '9') flags |= 2;
+    if (flags & 1 || (flags & 2)) flags |= 4;
+    if ((i >= 'a' && i <= 'f') || (i >= 'A' && i <= 'F') ||
+        (i >= '0' && i <= '9'))
+      flags |= 8;
+    table[i] = flags;
+  }
+  return table;
+}
+
+inline constexpr auto kCharClassTable = MakeCharClassTable();
+
+inline bool IsAlpha(uint8_t c) { return (kCharClassTable[c] & 1) != 0; }
+inline bool IsDigit(uint8_t c) { return (kCharClassTable[c] & 2) != 0; }
+inline bool IsAlnum(uint8_t c) { return (kCharClassTable[c] & 4) != 0; }
+inline bool IsXDigit(uint8_t c) { return (kCharClassTable[c] & 8) != 0; }
+
+// Parse unsigned integer directly from string_view without temporary allocation
+inline bool ParseUint(std::string_view sv, uint32_t &out, int base) {
+  if (sv.empty()) return false;
+  uint32_t result = 0;
+  for (char c : sv) {
+    int digit = 0;
+    if (c >= '0' && c <= '9')
+      digit = c - '0';
+    else if (base == 16 && c >= 'a' && c <= 'f')
+      digit = c - 'a' + 10;
+    else if (base == 16 && c >= 'A' && c <= 'F')
+      digit = c - 'A' + 10;
+    else
+      return false;
+    if (digit >= base) return false;
+    result = result * base + digit;
+  }
+  out = result;
+  return true;
+}
+
 // Get the byte length of a UTF-8 character starting at the given byte
 inline size_t Utf8CharLen(unsigned char c) {
   if ((c & 0x80) == 0) return 1;     // ASCII
@@ -2415,21 +2477,13 @@ inline std::pmr::string DecodeEscapesAndEntities(std::string_view text) {
 
         if (num_end > num_start && num_end < text.size() &&
             text[num_end] == ';') {
-          std::string num_str(text.substr(num_start, num_end - num_start));
-          try {
-            uint32_t code_point;
-            if (is_hex) {
-              code_point =
-                  static_cast<uint32_t>(std::stoul(num_str, nullptr, 16));
-            } else {
-              code_point =
-                  static_cast<uint32_t>(std::stoul(num_str, nullptr, 10));
-            }
+          std::string_view num_sv(text.data() + num_start,
+                                  num_end - num_start);
+          uint32_t code_point;
+          if (ParseUint(num_sv, code_point, is_hex ? 16 : 10)) {
             result += CodePointToUtf8(code_point);
             i = num_end + 1;
             continue;
-          } catch (...) {
-            // Invalid number, treat as literal
           }
         }
       } else {
@@ -2499,6 +2553,15 @@ inline std::pmr::string DecodeEscapes(std::string_view text) {
 }
 
 }  // namespace detail
+
+using detail::CaseFold;
+using detail::IsAlpha;
+using detail::IsAlnum;
+using detail::IsDigit;
+using detail::IsXDigit;
+using detail::ParseUint;
+using detail::StartsWithInsensitive;
+using detail::StringContainsInsensitive;
 
 // =============================================================================
 // Inline Parser
@@ -3261,23 +3324,13 @@ class InlineParser {
 
       if (num_end > num_start && num_end < text_.size() &&
           text_[num_end] == ';') {
-        std::string num_str(text_.substr(num_start, num_end - num_start));
-        try {
-          unsigned long code_point_ul;
-          if (is_hex) {
-            code_point_ul = std::stoul(num_str, nullptr, 16);
-          } else {
-            code_point_ul = std::stoul(num_str, nullptr, 10);
-          }
-          // Only decode valid Unicode code points (0 to 0x10FFFF)
-          if (code_point_ul <= 0x10FFFF) {
-            pos_ = num_end + 1;
-            return detail::CodePointToUtf8(
-                static_cast<uint32_t>(code_point_ul));
-          }
-          // Invalid code point - leave as literal
-        } catch (...) {
-          // Invalid number, treat as literal
+        std::string_view num_sv(text_.data() + num_start,
+                                num_end - num_start);
+        uint32_t code_point;
+        if (ParseUint(num_sv, code_point, is_hex ? 16 : 10) &&
+            code_point <= 0x10FFFF) {
+          pos_ = num_end + 1;
+          return detail::CodePointToUtf8(code_point);
         }
       }
     } else if (start < text_.size()) {
@@ -3566,7 +3619,7 @@ class InlineParser {
       if (pos_ >= text_.size()) [[unlikely]]
         return {};
 
-      std::pmr::string label(text_.substr(label_start, pos_ - label_start));
+      std::string_view label(text_.data() + label_start, pos_ - label_start);
       ++pos_;
 
       if (label.empty()) [[unlikely]] {
@@ -5389,7 +5442,9 @@ class BlockParser {
       if (delim != '.' && delim != ')') [[unlikely]]
         return false;
 
-      start = std::stoi(std::string(trimmed.substr(0, num_end)));
+      uint32_t start_val;
+      if (!ParseUint(trimmed.substr(0, num_end), start_val, 10)) return false;
+      start = static_cast<int>(start_val);
       delimiter = delim;
 
       // Marker can be followed by space, or be at end of line (empty item)

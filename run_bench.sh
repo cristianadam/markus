@@ -1,22 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
-# Build cmark if not already built
-CMARK_BUILD="bazel-cmark"
-if [ ! -f "$CMARK_BUILD/src/cmark" ]; then
-  echo "Building cmark..."
-  cmake -S commonmark-spec -B "$CMARK_BUILD" -DCMAKE_BUILD_TYPE=Release
-  cmake --build "$CMARK_BUILD" -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="${SCRIPT_DIR}/build"
+
+# Build if needed
+if [ ! -f "${BUILD_DIR}/bench" ]; then
+  echo "Building benchmark..."
+  cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
+  cmake --build "${BUILD_DIR}" --target bench -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
   echo ""
 fi
 
-# Build benchmark
-echo "Building benchmark..."
-CXX=${CXX:-clang++}
-$CXX -std=c++20 -O2 -I. -Icommonmark-spec/src -I"$CMARK_BUILD/src" \
-  bench.cc "$CMARK_BUILD/src/libcmark.a" \
-  -o bazel-bin/bench
-
+# Run benchmark
 echo "Running benchmark..."
 echo ""
-bazel-bin/bench "$@"
+"${BUILD_DIR}/bench" "$@"

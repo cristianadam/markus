@@ -16,22 +16,19 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Bazel
-        uses: bazel-contrib/setup-bazel@0.19.0
-
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake python3
 
-      - name: Build with Bazel
-        run: bazel build main
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 
-      - name: Make test script executable
-        run: chmod +x run_tests.sh
+      - name: Build
+        run: cmake --build build -j$(nproc)
 
       - name: Run CommonMark Tests
-        run: ./run_tests.sh
+        run: ctest --test-dir build --output-on-failure
 
       - name: Make bench script executable
         run: chmod +x run_bench.sh
@@ -42,4 +39,4 @@ jobs:
       - name: Verify CLI Tool
         run: |
           # This ensures the build artifact is actually functional
-          echo "# Hello World" | bazel-bin/main
+          echo "# Hello World" | build/main

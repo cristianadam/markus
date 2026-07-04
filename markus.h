@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <deque>
 #include <format>
@@ -315,12 +317,26 @@ struct BlockQuote {
 
 // Variant type for block content
 using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
-                               HtmlBlock, BlockQuote, List, ListItem>;
+                                HtmlBlock, BlockQuote, List, ListItem>;
 
-// Type alias for link references map
-using LinkRefMap =
-    std::pmr::unordered_map<std::pmr::string,
-                            std::pair<std::pmr::string, std::pmr::string>>;
+// Type alias for link references - sorted vector with binary search
+// Much faster than unordered_map for typical document sizes (< 50 refs)
+using LinkRefMap = std::pmr::vector<std::pair<std::pmr::string,
+                                               std::pair<std::pmr::string, std::pmr::string>>>;
+
+// Comparator for link reference binary search - works with both (elem, key) and (key, elem)
+struct LinkRefComparator {
+  bool operator()(const std::pair<std::pmr::string,
+                 std::pair<std::pmr::string, std::pmr::string>>& a,
+                  std::string_view key) const {
+    return a.first < key;
+  }
+  bool operator()(std::string_view key,
+                  const std::pair<std::pmr::string,
+                  std::pair<std::pmr::string, std::pmr::string>>& a) const {
+    return key < a.first;
+  }
+};
 
 struct Document {
   std::pmr::vector<BlockNode> children;
@@ -353,11 +369,145 @@ namespace detail {
 using namespace std::literals;
 
 // =============================================================================
+// Compile-Time Utilities
+// =============================================================================
+
+// Generate escape table at compile time using constexpr
+inline constexpr auto MakeEscapeTable() {
+  std::array<uint8_t, 256> table{};
+  // & (0x26) -> 1, < (0x3C) -> 2, > (0x3E) -> 3, " (0x22) -> 4
+  table[0x26] = 1;  // &
+  table[0x3C] = 2;  // <
+  table[0x3E] = 3;  // >
+  table[0x22] = 4;  // "
+  return table;
+}
+
+inline constexpr auto kEscapeTableV2 = MakeEscapeTable();
+
+// Generate hex digit table at compile time
+inline constexpr auto MakeHexDigitTable() {
+  std::array<char, 256> table{};
+  for (int i = 0; i < 16; ++i) {
+    table[i] = "0123456789ABCDEF"[i];
+    table[i + 16] = "0123456789abcdef"[i];
+    table[i + 32] = "0123456789ABCDEF"[i];
+    table[i + 48] = "0123456789ABCDEF"[i];
+  }
+  return table;
+}
+
+inline constexpr auto kHexDigitTable = MakeHexDigitTable();
+
+// Generate escape string lengths at compile time
+inline constexpr auto MakeEscapeLens() {
+  std::array<uint8_t, 5> lens{};
+  lens[1] = 5;  // &amp;
+  lens[2] = 4;  // &lt;
+  lens[3] = 4;  // &gt;
+  lens[4] = 6;  // &quot;
+  return lens;
+}
+
+inline constexpr auto kEscapeLens = MakeEscapeLens();
+
+// =============================================================================
+// Optimized HTML Escaping - In-place variant (hot path)
+// =============================================================================
+
+// Writes escaped HTML directly to output buffer - eliminates temp string allocation
+inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
+  size_t i = 0;
+  const size_t len = text.size();
+
+  while (i < len) {
+    // Fast path: find next character needing escape using lookup table
+    size_t start = i;
+    while (i < len) {
+      uint8_t e = kEscapeTableV2[static_cast<unsigned char>(text[i])];
+      if (e != 0) break;
+      ++i;
+    }
+
+    // Batch copy safe span
+    if (i > start) {
+      out.append(text.data() + start, i - start);
+    }
+
+    // Handle escaped character
+    if (i < len) {
+      uint8_t e = kEscapeTableV2[static_cast<unsigned char>(text[i])];
+      // Write escape string directly using precomputed lengths
+      switch (e) {
+        case 1: out.append("&amp;"); break;
+        case 2: out.append("&lt;"); break;
+        case 3: out.append("&gt;"); break;
+        case 4: out.append("&quot;"); break;
+      }
+      ++i;
+    }
+  }
+}
+
+// =============================================================================
+// Optimized URL Encoding - In-place variant
+// =============================================================================
+
+// URL safe character table (same as original kSafeTable)
+inline constexpr auto MakeUrlSafeTable() {
+  std::array<uint8_t, 256> table{};
+  // Alphanumeric
+  for (int i = '0'; i <= '9'; ++i) table[i] = 1;
+  for (int i = 'a'; i <= 'z'; ++i) table[i] = 1;
+  for (int i = 'A'; i <= 'Z'; ++i) table[i] = 1;
+  // Safe chars: -_.~:/?#@!$&'()*+,;=%
+  const char safe[] = "-_.~:/?#@!$&'()*+,;=%";
+  for (char c : safe) table[static_cast<unsigned char>(c)] = 1;
+  return table;
+}
+
+inline constexpr auto kSafeTable = MakeUrlSafeTable();
+
+inline void EncodeUrlTo(std::string_view url, std::pmr::string& out) {
+  size_t i = 0;
+  const size_t len = url.size();
+
+  while (i < len) {
+    size_t start = i;
+    while (i < len) {
+      if (!kSafeTable[static_cast<unsigned char>(url[i])]) break;
+      ++i;
+    }
+
+    if (i > start) {
+      out.append(url.data() + start, i - start);
+    }
+
+    if (i < len) {
+      unsigned char c = static_cast<unsigned char>(url[i]);
+      out += '%';
+      out += kHexDigitTable[c >> 4];
+      out += kHexDigitTable[c & 0xF];
+      ++i;
+    }
+  }
+}
+
+// =============================================================================
+// Integer formatting with std::to_chars (no allocation)
+// =============================================================================
+
+inline char* AppendIntToBuffer(int value, char* buf) {
+  auto [ptr, ec] = std::to_chars(buf, buf + 12, value);
+  return ptr;
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
 inline size_t FindFirstSpecialChar(const char* data, size_t len,
-                                    const uint8_t* special_table) {
+                                     const uint8_t* special_table) {
   for (size_t i = 0; i < len; ++i) {
     if (special_table[static_cast<unsigned char>(data[i])]) {
       return i;
@@ -1108,582 +1258,20 @@ inline std::pmr::string NormalizeLinkLabel(std::string_view label) {
 }
 
 // HTML entity escaping - optimized with lookup table and batch copying
+// For in-place rendering (no temp allocation), use EscapeHtmlTo instead
 inline std::pmr::string EscapeHtml(std::string_view text) {
-  // Lookup table: 0 = no escape needed, non-zero = escape index
-  // 1=&, 2=<, 3=>, 4="
-  static constexpr uint8_t kEscapeTable[256] = {
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x00-0x0F
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x10-0x1F
-      0,
-      0,
-      4,
-      0,
-      0,
-      0,
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x20-0x2F: " at 0x22,
-          // & at 0x26
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      2,
-      0,
-      3,
-      0,  // 0x30-0x3F: < at 0x3C,
-          // > at 0x3E
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x40-0x4F
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x50-0x5F
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x60-0x6F
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x70-0x7F
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x80-0xFF (high bytes)
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-  };
-  static constexpr const char* kEscapeStrings[] = {nullptr, "&amp;", "&lt;",
-                                                   "&gt;", "&quot;"};
-
   std::pmr::string result;
-  result.reserve(text.size() + text.size() / 8);  // Slightly over-reserve
-
-  size_t i = 0;
-  while (i < text.size()) {
-    // Use helper to find next character needing escape
-    size_t next_special =
-        FindFirstSpecialChar(text.data() + i, text.size() - i, kEscapeTable);
-    // Batch copy non-escaped span
-    if (next_special > 0) {
-      result.append(text.data() + i, next_special);
-    }
-    i += next_special;
-    // Handle escaped character
-    if (i < text.size()) {
-      result +=
-          kEscapeStrings[kEscapeTable[static_cast<unsigned char>(text[i])]];
-      ++i;
-    }
-  }
+  result.reserve(text.size() + text.size() / 8);
+  EscapeHtmlTo(text, result);
   return result;
 }
 
-// URL encoding for link destinations
+// URL encoding for link destinations - optimized with in-place variant
 // Uses lookup table for O(1) character classification and precomputed hex table
 inline std::pmr::string EncodeUrl(std::string_view url) {
-  // Lookup table: 1 = character is safe (no encoding needed), 0 = needs
-  // encoding Safe chars: alphanumeric and -_.~/:?#@!$&'()*+,;=%
-  static constexpr uint8_t kSafeTable[256] = {
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x00-0x0F
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x10-0x1F
-      0,
-      1,
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,  // 0x20-0x2F:
-          // !#$%&'()*+,-./
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      1,
-      0,
-      1,  // 0x30-0x3F: 0-9:;=?
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,  // 0x40-0x4F: @A-O
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      0,
-      1,  // 0x50-0x5F: P-Z_
-      0,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,  // 0x60-0x6F: a-o
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      1,
-      0,
-      0,
-      0,
-      1,
-      0,  // 0x70-0x7F: p-z~
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,  // 0x80-0xFF
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-  };
-  // Hex encoding lookup (avoids snprintf)
-  static constexpr char kHexChars[] = "0123456789ABCDEF";
-
   std::pmr::string result;
   result.reserve(url.size() + url.size() / 4);
-
-  size_t i = 0;
-  while (i < url.size()) {
-    // Use efficient helper to find first unsafe character
-    size_t next_unsafe =
-        FindFirstUnsafeChar(url.data() + i, url.size() - i, kSafeTable);
-    // Batch copy safe span
-    if (next_unsafe > 0) {
-      result.append(url.data() + i, next_unsafe);
-    }
-    i += next_unsafe;
-    // Encode unsafe character
-    if (i < url.size()) {
-      unsigned char c = static_cast<unsigned char>(url[i]);
-      result.append(std::format("%{:02X}", c));
-      ++i;
-    }
-  }
+  EncodeUrlTo(url, result);
   return result;
 }
 
@@ -2683,12 +2271,11 @@ class InlineParser {
     while (pos_ < text_.size()) {
       char c = text_[pos_];
 
-      // Check for backslash escape
-      if (c == '\\' && pos_ + 1 < text_.size()) {
+      // Fast path: backslash escape (common in markdown)
+      [[likely]] if (c == '\\' && pos_ + 1 < text_.size()) {
         char next = text_[pos_ + 1];
         if (detail::IsAsciiPunctuation(next)) {
           flush_text();
-          // The escaped char is at pos_+1 in the input, use a view into it
           result.emplace_back(std::in_place_type<Text>,
                              text_.substr(pos_ + 1, 1));
           pos_ += 2;
@@ -2701,22 +2288,19 @@ class InlineParser {
         }
       }
 
-      // Check for HTML entity or numeric character reference
-      if (c == '&' && pos_ + 1 < text_.size()) {
-        // Flush text BEFORE trying to parse, since TryParseEntity advances pos_
+      // HTML entity or numeric character reference
+      [[likely]] if (c == '&' && pos_ + 1 < text_.size()) {
         flush_text();
         auto entity_result = TryParseEntity();
         if (entity_result) {
-          // Store decoded entity and create view into it
           result.emplace_back(std::in_place_type<Text>,
                              StoreString(std::move(*entity_result)));
           continue;
         }
-        // Entity parse failed - start new span with the '&'
         start_span();
       }
 
-      // Check for code span
+      // Code span
       if (c == '`') {
         // Flush text BEFORE trying to parse, since TryParseCodeSpan advances
         // pos_
@@ -3029,7 +2613,7 @@ class InlineParser {
         continue;
       }
 
-      // Regular character - extend current span
+      // Regular character - extend current span (most common case)
       start_span();
       ++pos_;
     }
@@ -3638,8 +3222,9 @@ class InlineParser {
       return {};
 
     std::pmr::string normalized = detail::NormalizeLinkLabel(label);
-    auto it = link_references_->find(normalized);
-    if (it != link_references_->end()) {
+    auto it = std::lower_bound(link_references_->begin(), link_references_->end(),
+                               normalized, LinkRefComparator{});
+    if (it != link_references_->end() && !(normalized < it->first)) {
       return Result<std::pair<std::pmr::string, std::pmr::string>>::emplace(
           it->second);
     }
@@ -4462,10 +4047,14 @@ class BlockParser {
         continue;
       }
 
-      // Only add if not already defined
-      if (doc.link_references.find(normalized) == doc.link_references.end()) {
-        doc.link_references[normalized] = {detail::EncodeUrl(destination),
-                                           title};
+      // Only add if not already defined (sorted insertion)
+      auto ref_it = std::lower_bound(doc.link_references.begin(),
+                                     doc.link_references.end(), normalized,
+                                     LinkRefComparator{});
+      if (ref_it == doc.link_references.end() || ref_it->first != normalized) {
+        // Insert in sorted position
+        doc.link_references.emplace(ref_it, std::move(normalized),
+                                    std::pair{detail::EncodeUrl(destination), title});
       }
       // After successful link ref extraction, next line starts fresh
       prev_line_had_content = false;
@@ -5384,10 +4973,15 @@ class BlockParser {
     BlockParser nested_parser;
     Document nested_doc = nested_parser.Parse(quote_content);
 
-    // Promote link references from nested document to parent
+    // Promote link references from nested document to parent (sorted merge)
     if (parent_link_refs_) {
       for (const auto& [label, dest_title] : nested_doc.link_references) {
-        parent_link_refs_->try_emplace(label, dest_title);
+        auto it = std::lower_bound(parent_link_refs_->begin(),
+                                   parent_link_refs_->end(), label,
+                                   LinkRefComparator{});
+        if (it == parent_link_refs_->end() || it->first != label) {
+          parent_link_refs_->emplace(it, label, dest_title);
+        }
       }
     }
 
@@ -5864,10 +5458,15 @@ class BlockParser {
           // Transfer nested doc to parent's pools and get IDs
           item.children = TransferFromNestedDoc(item_doc);
 
-          // Promote link references from nested document to parent
+          // Promote link references from nested document to parent (sorted merge)
           if (parent_link_refs_) {
             for (const auto& [label, dest_title] : item_doc.link_references) {
-              parent_link_refs_->try_emplace(label, dest_title);
+              auto it = std::lower_bound(parent_link_refs_->begin(),
+                                         parent_link_refs_->end(), label,
+                                         LinkRefComparator{});
+              if (it == parent_link_refs_->end() || it->first != label) {
+                parent_link_refs_->emplace(it, label, dest_title);
+              }
             }
           }
         }
@@ -6263,15 +5862,16 @@ class HtmlRenderer {
               ? std::string_view(block.info_string)
               : std::string_view(block.info_string).substr(0, end);
       if (!lang.empty()) {
-        out += std::format("<pre><code class=\"language-{}\">",
-                           detail::EscapeHtml(lang));
-        out += detail::EscapeHtml(block.content);
+        out += "<pre><code class=\"language-";
+        detail::EscapeHtmlTo(lang, out);
+        out += "\">";
+        detail::EscapeHtmlTo(block.content, out);
         out += "</code></pre>\n";
         return;
       }
     }
     out += "<pre><code>";
-    out += detail::EscapeHtml(block.content);
+    detail::EscapeHtmlTo(block.content, out);
     out += "</code></pre>\n";
   }
 
@@ -6316,7 +5916,11 @@ class HtmlRenderer {
       if (list.start == 1) {
         out += "<ol>\n";
       } else {
-        out += std::format("<ol start=\"{}\">\n", list.start);
+        out += "<ol start=\"";
+        char buf[12];
+        auto [ptr, ec] = std::to_chars(buf, buf + 12, list.start);
+        out.append(buf, ptr - buf);
+        out += "\">\n";
       }
     } else {
       out += "<ul>\n";
@@ -6364,14 +5968,14 @@ class HtmlRenderer {
           [this, &out](auto&& n) {
             using T = std::decay_t<decltype(n)>;
             if constexpr (std::is_same_v<T, Text>) {
-              out += detail::EscapeHtml(n.content);
+              detail::EscapeHtmlTo(n.content, out);
             } else if constexpr (std::is_same_v<T, SoftBreak>) {
               out += '\n';
             } else if constexpr (std::is_same_v<T, HardBreak>) {
               out += "<br />\n";
             } else if constexpr (std::is_same_v<T, Code>) {
               out += "<code>";
-              out += detail::EscapeHtml(n.content);
+              detail::EscapeHtmlTo(n.content, out);
               out += "</code>";
             } else if constexpr (std::is_same_v<T, Emphasis>) {
               out += "<em>";
@@ -6397,9 +6001,9 @@ class HtmlRenderer {
                                            ? ""
                                            : std::format(" title=\"{}\"",
                                                          detail::EscapeHtml(n.title));
-              out += std::format("<img src=\"{}\" alt=\"{}\"{} />", escaped_dest,
-                                 escaped_alt, title_attr);
-            } else if constexpr (std::is_same_v<T, HtmlInline>) {
+               out += std::format("<img src=\"{}\" alt=\"{}\"{} />", escaped_dest,
+                                  escaped_alt, title_attr);
+             } else if constexpr (std::is_same_v<T, HtmlInline>) {
               out += n.content;
             }
           },

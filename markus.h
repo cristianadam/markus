@@ -145,23 +145,17 @@ constexpr BlockNodeId kInvalidBlockNodeId = ~uint32_t(0);
 // =============================================================================
 
 struct Text {
-  static constexpr NodeType kType = NodeType::kText;
   std::string_view content;
 
   explicit Text(std::string_view c) : content(c) {}
   Text() = default;
 };
 
-struct SoftBreak {
-  static constexpr NodeType kType = NodeType::kSoftBreak;
-};
+struct SoftBreak {};
 
-struct HardBreak {
-  static constexpr NodeType kType = NodeType::kHardBreak;
-};
+struct HardBreak {};
 
 struct Code {
-  static constexpr NodeType kType = NodeType::kCode;
   std::pmr::string content;
 
   explicit Code(std::pmr::string c) : content(std::move(c)) {}
@@ -169,31 +163,26 @@ struct Code {
 };
 
 struct Emphasis {
-  static constexpr NodeType kType = NodeType::kEmphasis;
   std::pmr::vector<InlineNodeId> children;
 };
 
 struct Strong {
-  static constexpr NodeType kType = NodeType::kStrong;
   std::pmr::vector<InlineNodeId> children;
 };
 
 struct Link {
-  static constexpr NodeType kType = NodeType::kLink;
   std::pmr::string destination;
   std::pmr::string title;
   std::pmr::vector<InlineNodeId> children;
 };
 
 struct Image {
-  static constexpr NodeType kType = NodeType::kImage;
   std::pmr::string destination;
   std::pmr::string title;
   std::pmr::string alt_text;
 };
 
 struct HtmlInline {
-  static constexpr NodeType kType = NodeType::kHtmlInline;
   std::string_view content;
 
   explicit HtmlInline(std::string_view c) : content(c) {}
@@ -209,43 +198,35 @@ using InlineNode = std::variant<Text, SoftBreak, HardBreak, Code, Emphasis,
 // =============================================================================
 
 struct Paragraph {
-  static constexpr NodeType kType = NodeType::kParagraph;
   std::pmr::vector<InlineNodeId> children;
   std::pmr::string raw_content;  // Temporary storage for inline parsing
 };
 
 struct Heading {
-  static constexpr NodeType kType = NodeType::kHeading;
   int level = 1;  // 1-6
   std::pmr::vector<InlineNodeId> children;
   std::pmr::string raw_content;  // Temporary storage for inline parsing
 };
 
-struct ThematicBreak {
-  static constexpr NodeType kType = NodeType::kThematicBreak;
-};
+struct ThematicBreak {};
 
 struct CodeBlock {
-  static constexpr NodeType kType = NodeType::kCodeBlock;
   std::pmr::string info_string;  // Language hint (e.g., "cpp", "python")
   std::pmr::string content;
   bool is_fenced = false;
 };
 
 struct HtmlBlock {
-  static constexpr NodeType kType = NodeType::kHtmlBlock;
   std::pmr::string content;
   int block_type = 0;  // CommonMark HTML block type (1-7)
 };
 
 struct ListItem {
-  static constexpr NodeType kType = NodeType::kListItem;
   std::pmr::vector<BlockNodeId> children;
   bool is_tight = true;
 };
 
 struct List {
-  static constexpr NodeType kType = NodeType::kList;
   bool is_ordered = false;
   int start = 1;           // Starting number for ordered lists
   char delimiter = '.';    // '.' or ')' for ordered lists
@@ -255,7 +236,6 @@ struct List {
 };
 
 struct BlockQuote {
-  static constexpr NodeType kType = NodeType::kBlockQuote;
   std::pmr::vector<BlockNodeId> children;
 };
 
@@ -269,7 +249,6 @@ using LinkRefMap =
                             std::pair<std::pmr::string, std::pmr::string>>;
 
 struct Document {
-  static constexpr NodeType kType = NodeType::kDocument;
   std::pmr::vector<BlockNode> children;
 
   // Link reference definitions (label -> (destination, title))
@@ -1689,6 +1668,30 @@ inline bool StartsWithInsensitive(std::string_view str,
   return true;
 }
 
+// Case-insensitive substring search without temporary string allocations
+inline bool StringContainsInsensitive(std::string_view str,
+                                      std::string_view substr) {
+  if (substr.empty() || str.size() < substr.size()) return false;
+  // Fast path: find first character of substr in str
+  char first = static_cast<char>(
+      std::tolower(static_cast<unsigned char>(substr[0])));
+  for (size_t i = 0; i <= str.size() - substr.size(); ++i) {
+    if (static_cast<char>(std::tolower(static_cast<unsigned char>(str[i]))) !=
+        first)
+      continue;
+    bool match = true;
+    for (size_t j = 1; j < substr.size(); ++j) {
+      if (static_cast<char>(std::tolower(static_cast<unsigned char>(str[i + j]))) !=
+          static_cast<char>(std::tolower(static_cast<unsigned char>(substr[j])))) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
 // Count leading spaces (tabs count as 4 spaces to next tab stop)
 inline int CountIndent(std::string_view line, int* consumed_chars = nullptr) {
   int indent = 0;
@@ -2665,7 +2668,7 @@ class InlineParser {
         flush_text();
         auto code_span = TryParseCodeSpan();
         if (code_span) {
-          result.push_back(std::move(*code_span));
+          result.emplace_back(std::in_place_type<Code>, std::move(code_span->content));
           continue;
         }
         // Code span didn't match - include backticks in current text span
@@ -2693,7 +2696,7 @@ class InlineParser {
         // Check for HTML tag
         auto html = TryParseHtmlInline();
         if (html) {
-          result.push_back(std::move(*html));
+          result.emplace_back(std::in_place_type<HtmlInline>, html->content);
           continue;
         }
         // Neither autolink nor HTML - treat '<' as regular text
@@ -4861,24 +4864,29 @@ class BlockParser {
       return std::nullopt;
 
     int block_type = 0;
-    std::pmr::string end_condition;
+    std::pmr::string end_condition_storage;  // Only used for types 2-5
+    std::string_view end_condition_sv;       // Points to storage or static array
 
     // Type 1: <script>, <pre>, <style>, <textarea>
+    // Each entry is {opening tag prefix, closing tag end condition}
     static constexpr std::array type1_tags = {
-        std::string_view("<script"), std::string_view("<pre"),
-        std::string_view("<style"), std::string_view("<textarea")};
-    for (auto tag : type1_tags) {
-      if (detail::StartsWithInsensitive(trimmed, tag)) {
+        std::pair(std::string_view("<script"), std::string_view("</script>")),
+        std::pair(std::string_view("<pre"), std::string_view("</pre>")),
+        std::pair(std::string_view("<style"), std::string_view("</style>")),
+        std::pair(std::string_view("<textarea"),
+                  std::string_view("</textarea>"))};
+    for (auto [open_prefix, close_cond] : type1_tags) {
+      if (detail::StartsWithInsensitive(trimmed, open_prefix)) {
         // Tag at end of line, or followed by space/tab/>/newline
-        if (trimmed.size() == tag.size()) {
+        if (trimmed.size() == open_prefix.size()) {
           block_type = 1;
-          end_condition = "</" + std::pmr::string(tag.substr(1)) + ">";
+          end_condition_sv = close_cond;
           break;
         }
-        char next = trimmed[tag.size()];
+        char next = trimmed[open_prefix.size()];
         if (next == ' ' || next == '>' || next == '\t' || next == '\n') {
           block_type = 1;
-          end_condition = "</" + std::pmr::string(tag.substr(1)) + ">";
+          end_condition_sv = close_cond;
           break;
         }
       }
@@ -4893,31 +4901,36 @@ class BlockParser {
         if (next != '>' &&
             !(next == '-' && trimmed.size() > 5 && trimmed[5] == '>')) {
           block_type = 2;
-          end_condition = "-->";
+          end_condition_storage = "-->";
+          end_condition_sv = end_condition_storage;
         }
       } else if (trimmed.size() == 4) {
         // Just "<!--" with nothing after - valid start
         block_type = 2;
-        end_condition = "-->";
+        end_condition_storage = "-->";
+        end_condition_sv = end_condition_storage;
       }
     }
 
     // Type 3: <? processing instruction ?>
     if (block_type == 0 && trimmed.starts_with("<?")) {
       block_type = 3;
-      end_condition = "?>";
+      end_condition_storage = "?>";
+      end_condition_sv = end_condition_storage;
     }
 
     // Type 4: <!DOCTYPE
     if (block_type == 0 && detail::StartsWithInsensitive(trimmed, "<!doctype")) {
       block_type = 4;
-      end_condition = ">";
+      end_condition_storage = ">";
+      end_condition_sv = end_condition_storage;
     }
 
     // Type 5: <![CDATA[
     if (block_type == 0 && trimmed.starts_with("<![CDATA[")) {
       block_type = 5;
-      end_condition = "]]>";
+      end_condition_storage = "]]>";
+      end_condition_sv = end_condition_storage;
     }
 
     // Type 6: Block-level HTML tags
@@ -5143,17 +5156,11 @@ class BlockParser {
       content += html_line;
       content += '\n';
 
-      // Check for end condition
-      if (block_type <= 5) {
-        std::pmr::string lower_line;
-        for (char c : html_line) {
-          lower_line +=
-              static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        if (lower_line.find(end_condition) != std::string::npos) {
-          Advance();
-          break;
-        }
+      // Check for end condition using case-insensitive search (no temp string)
+      if (block_type <= 5 &&
+          detail::StringContainsInsensitive(html_line, end_condition_sv)) {
+        Advance();
+        break;
       }
 
       Advance();
@@ -5335,9 +5342,7 @@ class BlockParser {
     // Promote link references from nested document to parent
     if (parent_link_refs_) {
       for (const auto& [label, dest_title] : nested_doc.link_references) {
-        if (parent_link_refs_->find(label) == parent_link_refs_->end()) {
-          parent_link_refs_->insert({label, dest_title});
-        }
+        parent_link_refs_->try_emplace(label, dest_title);
       }
     }
 
@@ -5814,9 +5819,7 @@ class BlockParser {
           // Promote link references from nested document to parent
           if (parent_link_refs_) {
             for (const auto& [label, dest_title] : item_doc.link_references) {
-              if (parent_link_refs_->find(label) == parent_link_refs_->end()) {
-                parent_link_refs_->insert({label, dest_title});
-              }
+              parent_link_refs_->try_emplace(label, dest_title);
             }
           }
         }
@@ -5928,7 +5931,7 @@ class BlockParser {
                 if (j > 0) heading_content += '\n';
                 heading_content += para_lines[j];
               }
-              heading.raw_content = heading_content;
+              heading.raw_content = std::move(heading_content);
               return heading;
             }
           }
@@ -6098,7 +6101,7 @@ class BlockParser {
       if (j > 0) para_content += '\n';
       para_content += para_lines[j];
     }
-    para.raw_content = para_content;
+    para.raw_content = std::move(para_content);
     return para;
   }
 

@@ -34,7 +34,7 @@ jobs:
         run: chmod +x run_bench.sh
 
       - name: Run Benchmark
-        run: ./run_bench.sh --iterations 200 --rounds 3
+        run: ./run_bench.sh --rounds 2 --benchmark_min_time=0.5
 
       - name: Verify CLI Tool
         run: |

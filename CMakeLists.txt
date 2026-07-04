@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(markus LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -62,9 +63,20 @@ if(BUILD_TESTING)
   )
 endif()
 
+# Google Benchmark
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+include(FetchContent)
+FetchContent_Declare(
+  googlebenchmark
+  GIT_REPOSITORY https://github.com/google/benchmark.git
+  GIT_TAG v1.9.1
+)
+FetchContent_MakeAvailable(googlebenchmark)
+
 # Benchmark executable
 add_executable(bench bench.cc)
-target_link_libraries(bench PRIVATE markus cmark md4c md4c-html)
+target_link_libraries(bench PRIVATE markus cmark md4c md4c-html benchmark::benchmark)
 target_include_directories(bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/commonmark-spec/src ${CMAKE_BINARY_DIR}/cmark-build/src)
 set_target_properties(bench PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
@@ -72,7 +84,7 @@ set_target_properties(bench PROPERTIES
 
 # Custom target to run benchmark
 add_custom_target(run_bench
-  COMMAND bench --iterations 100
+  COMMAND bench --rounds 2 --benchmark_min_time=0.5
   DEPENDS bench
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   COMMENT "Running benchmark..."

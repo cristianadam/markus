@@ -35,7 +35,8 @@ std::string RunPythonTest(int test_number, const std::string& main_path,
   cmd << "python3 commonmark-spec/test/spec_tests.py"
       << " --program " << main_path
       << " -s " << spec_path
-      << " -n " << test_number;
+      << " -n " << test_number
+      << " 2>&1";
 
   FILE* pipe = popen(cmd.str().c_str(), "r");
   if (!pipe) return "ERROR: Failed to start python3";
@@ -43,7 +44,13 @@ std::string RunPythonTest(int test_number, const std::string& main_path,
   std::string output;
   char buffer[256];
   while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-    output += buffer;
+    std::string line(buffer);
+    if (line.find(" passed, ") != std::string::npos &&
+        line.find(" failed, ") != std::string::npos &&
+        line.find(" skipped") != std::string::npos) {
+      continue;
+    }
+    output += line;
   }
 
   int status = pclose(pipe);

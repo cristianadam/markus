@@ -18,25 +18,6 @@
 #include <variant>
 #include <vector>
 
-// =============================================================================
-// Arena Allocator Setup
-// =============================================================================
-
-inline constexpr std::size_t kArenaSize = 128 * 1024 * 1024;  // 128 MiB
-
-// The backing buffer (static storage). One per program because it's inline.
-alignas(std::max_align_t) inline std::byte g_buffer[kArenaSize];
-
-// The arena spills to heap via upstream new_delete_resource().
-inline std::pmr::monotonic_buffer_resource g_arena{
-    g_buffer, kArenaSize, std::pmr::new_delete_resource()};
-
-// Set the arena as the default memory resource for all pmr containers
-inline const bool kArenaInitialized = []() {
-  std::pmr::set_default_resource(&g_arena);
-  return true;
-}();
-
 namespace markus {
 
 // =============================================================================
@@ -279,38 +260,12 @@ namespace detail {
 using namespace std::literals;
 
 // =============================================================================
-// SIMD-Friendly Helper Functions
+// Helper Functions
 // =============================================================================
 
-// Find first occurrence of any byte from a set in a chunk of data
-// Returns position relative to start, or len if not found
-// Designed for auto-vectorization by processing without early exits
 inline size_t FindFirstSpecialChar(const char* data, size_t len,
-                                   const uint8_t* special_table) {
-  size_t i = 0;
-  // Process 8 bytes at a time - compiler can vectorize this
-  for (; i + 8 <= len; i += 8) {
-    // Check 8 bytes - any special character found?
-    uint8_t found = 0;
-    found |= special_table[static_cast<unsigned char>(data[i])];
-    found |= special_table[static_cast<unsigned char>(data[i + 1])];
-    found |= special_table[static_cast<unsigned char>(data[i + 2])];
-    found |= special_table[static_cast<unsigned char>(data[i + 3])];
-    found |= special_table[static_cast<unsigned char>(data[i + 4])];
-    found |= special_table[static_cast<unsigned char>(data[i + 5])];
-    found |= special_table[static_cast<unsigned char>(data[i + 6])];
-    found |= special_table[static_cast<unsigned char>(data[i + 7])];
-    if (found) {
-      // Found something in this chunk, find exact position
-      for (size_t j = i; j < i + 8; ++j) {
-        if (special_table[static_cast<unsigned char>(data[j])]) {
-          return j;
-        }
-      }
-    }
-  }
-  // Handle remaining bytes
-  for (; i < len; ++i) {
+                                    const uint8_t* special_table) {
+  for (size_t i = 0; i < len; ++i) {
     if (special_table[static_cast<unsigned char>(data[i])]) {
       return i;
     }
@@ -318,34 +273,9 @@ inline size_t FindFirstSpecialChar(const char* data, size_t len,
   return len;
 }
 
-// Find first byte where safe_table[byte] == 0 (i.e., needs encoding)
-// Used for URL encoding where table has 1 for safe, 0 for unsafe
 inline size_t FindFirstUnsafeChar(const char* data, size_t len,
-                                  const uint8_t* safe_table) {
-  size_t i = 0;
-  // Process 8 bytes at a time
-  for (; i + 8 <= len; i += 8) {
-    // Check 8 bytes - all safe?
-    uint8_t all_safe = 1;
-    all_safe &= safe_table[static_cast<unsigned char>(data[i])];
-    all_safe &= safe_table[static_cast<unsigned char>(data[i + 1])];
-    all_safe &= safe_table[static_cast<unsigned char>(data[i + 2])];
-    all_safe &= safe_table[static_cast<unsigned char>(data[i + 3])];
-    all_safe &= safe_table[static_cast<unsigned char>(data[i + 4])];
-    all_safe &= safe_table[static_cast<unsigned char>(data[i + 5])];
-    all_safe &= safe_table[static_cast<unsigned char>(data[i + 6])];
-    all_safe &= safe_table[static_cast<unsigned char>(data[i + 7])];
-    if (!all_safe) {
-      // Found something unsafe, find exact position
-      for (size_t j = i; j < i + 8; ++j) {
-        if (!safe_table[static_cast<unsigned char>(data[j])]) {
-          return j;
-        }
-      }
-    }
-  }
-  // Handle remaining bytes
-  for (; i < len; ++i) {
+                                   const uint8_t* safe_table) {
+  for (size_t i = 0; i < len; ++i) {
     if (!safe_table[static_cast<unsigned char>(data[i])]) {
       return i;
     }
@@ -364,39 +294,11 @@ inline bool IsSpanBlank(const char* data, size_t len) {
   return true;
 }
 
-// Count occurrences and check for special bytes in a span
-// Returns: pair<line_count, has_special>
-// Looks for \n, \r (line endings) and \0 (null)
-// SIMD-friendly: accumulates without branching in inner loop
 inline std::pair<size_t, bool> ScanForLinesAndNulls(const char* data,
-                                                    size_t len) {
+                                                     size_t len) {
   size_t line_count = 0;
   bool has_nulls = false;
-  size_t i = 0;
-
-  // Process 8 bytes at a time, accumulating counts
-  for (; i + 8 <= len; i += 8) {
-    // Check each byte for line endings and nulls
-    for (size_t j = 0; j < 8; ++j) {
-      char c = data[i + j];
-      if (c == '\n') {
-        ++line_count;
-      } else if (c == '\r') {
-        ++line_count;
-        // Check for \r\n (but be careful at chunk boundary)
-        if (j + 1 < 8 && data[i + j + 1] == '\n') {
-          ++j;  // Skip the \n
-        } else if (i + j + 1 < len && data[i + j + 1] == '\n') {
-          // Will be handled in next iteration or remainder
-        }
-      } else if (c == '\0') {
-        has_nulls = true;
-      }
-    }
-  }
-
-  // Handle remaining bytes
-  for (; i < len; ++i) {
+  for (size_t i = 0; i < len; ++i) {
     char c = data[i];
     if (c == '\n') {
       ++line_count;
@@ -409,7 +311,6 @@ inline std::pair<size_t, bool> ScanForLinesAndNulls(const char* data,
       has_nulls = true;
     }
   }
-
   return {line_count, has_nulls};
 }
 
@@ -1323,7 +1224,7 @@ inline std::pmr::string EscapeHtml(std::string_view text) {
 
   size_t i = 0;
   while (i < text.size()) {
-    // Use SIMD-friendly helper to find next character needing escape
+    // Use helper to find next character needing escape
     size_t next_special =
         FindFirstSpecialChar(text.data() + i, text.size() - i, kEscapeTable);
     // Batch copy non-escaped span
@@ -1613,7 +1514,7 @@ inline std::pmr::string EncodeUrl(std::string_view url) {
 
   size_t i = 0;
   while (i < url.size()) {
-    // Use SIMD-friendly helper to find first unsafe character
+    // Use efficient helper to find first unsafe character
     size_t next_unsafe =
         FindFirstUnsafeChar(url.data() + i, url.size() - i, kSafeTable);
     // Batch copy safe span
@@ -2142,7 +2043,7 @@ inline bool IsBlankLine(std::string_view line) {
       0,
       0,
   };
-  // Use SIMD-friendly helper for bulk processing
+  // Use efficient helper for bulk processing
   if (line.size() >= 8) {
     return IsSpanBlank(line.data(), line.size());
   }
@@ -6360,21 +6261,18 @@ class HtmlRenderer {
 
 // Parse Markdown input and return an AST
 inline Document Parse(std::string_view input) {
-  // std::pmr::set_default_resource(&g_arena);
   BlockParser parser;
   return parser.Parse(input);
 }
 
 // Render a document AST to HTML
 inline std::pmr::string RenderHtml(const Document& doc) {
-  // std::pmr::set_default_resource(&g_arena);
   HtmlRenderer renderer;
   return renderer.Render(doc);
 }
 
 // Convenience function: parse Markdown and render to HTML
 inline std::pmr::string MarkdownToHtml(std::string_view input) {
-  std::pmr::set_default_resource(&g_arena);
   return RenderHtml(Parse(input));
 }
 

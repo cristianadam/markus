@@ -15,7 +15,7 @@ any reviews for memory safety. Its performance is also 2-3x slower than cmark.
 - **Single Header**: Just include `markus.h` - no linking required
 - **Zero Dependencies**: Uses only the C++20 standard library
 - **CommonMark Compliant**: Passes the full CommonMark spec test suite (655 tests)
-- **High Performance**: Arena allocator, SIMD-friendly algorithms, and lookup tables
+- **High Performance**: Efficient parsing with lookup tables and inline optimizations
 - **Full Unicode Support**: UTF-8 encoding/decoding, case folding, punctuation detection
 - **AST Access**: Parse to an Abstract Syntax Tree for inspection or custom rendering
 - **Google Style**: Clean, readable codebase following Google C++ Style Guide
@@ -189,10 +189,8 @@ The test suite uses the official CommonMark spec tests:
 
 Markus is optimized for speed through several techniques:
 
-- **Arena Allocator**: Uses `std::pmr::monotonic_buffer_resource` with a 128 MiB pre-allocated buffer to minimize allocation overhead
 - **String Views**: Avoids unnecessary string copies using `std::string_view`
 - **Lookup Tables**: O(1) character classification for punctuation, whitespace, and HTML escaping
-- **SIMD-Friendly Algorithms**: Scanning functions process 8 bytes at a time for auto-vectorization
 - **Compact Node Storage**: AST nodes use 32-bit IDs instead of pointers
 
 ## Unicode Support

@@ -12,7 +12,10 @@ if [ ! -f "${BUILD_DIR}/bench" ]; then
   echo ""
 fi
 
-# Run benchmark
+# Run benchmark (from repo root so relative paths work)
+SCRIPT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "${SCRIPT_ROOT}"
+
 echo "Running benchmark..."
 echo ""
 "${BUILD_DIR}/bench" "$@"

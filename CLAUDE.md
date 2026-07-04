@@ -42,7 +42,7 @@ cmake --build build
 ```
 
 ## Key files
-- `markus.h` — single-header C++20 Markdown-to-HTML library (arena-allocated AST, SIMD helpers)
+- `markus.h` — single-header C++20 Markdown-to-HTML library (lookup tables, inline optimizations)
 - `main.cc` — CLI entry point: reads Markdown from stdin, outputs HTML to stdout (`--ast` flag for AST debug output)
 - `bench.cc` — benchmark comparing markus vs cmark performance
 - `tests/test_markus.cc` — gtest-based test suite wrapping Python spec_tests.py (655 examples)

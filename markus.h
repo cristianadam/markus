@@ -9,7 +9,6 @@
 #include <functional>
 #include <memory>
 #include <memory_resource>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -19,6 +18,71 @@
 #include <vector>
 
 namespace markus {
+
+// Lightweight result type optimized for parser functions.
+// Replaces std::optional<T> to avoid overhead from type tracking
+// and enable better compiler optimization for in-place construction.
+// Key benefit: avoids double-check pattern (has_value + dereference)
+// and enables emplace_back with in_place_type for variant containers.
+template <typename T>
+struct Result {
+  bool has_value = false;
+  alignas(T) unsigned char storage[sizeof(T)];
+
+  Result() = default;
+  Result(const Result &) = delete;
+  Result &operator=(const Result &) = delete;
+
+  Result(Result &&other) noexcept : has_value(other.has_value) {
+    if (has_value) {
+      new (storage) T(std::move(*reinterpret_cast<T *>(other.storage)));
+      other.has_value = false;
+    }
+  }
+
+  Result &operator=(Result &&other) noexcept {
+    if (this != &other) {
+      if (has_value) {
+        reinterpret_cast<T *>(storage)->~T();
+      }
+      has_value = other.has_value;
+      if (has_value) {
+        new (storage) T(std::move(*reinterpret_cast<T *>(other.storage)));
+        other.has_value = false;
+      }
+    }
+    return *this;
+  }
+
+  Result(T &&value) {
+    new (storage) T(std::move(value));
+    has_value = true;
+  }
+
+  ~Result() {
+    if (has_value) {
+      reinterpret_cast<T *>(storage)->~T();
+    }
+  }
+
+  template <typename... Args>
+  static Result emplace(Args &&...args) {
+    Result r;
+    new (r.storage) T(std::forward<Args>(args)...);
+    r.has_value = true;
+    return r;
+  }
+
+  static Result none() { return Result{}; }
+
+  explicit operator bool() const { return has_value; }
+  T &operator*() { return *reinterpret_cast<T *>(storage); }
+  const T &operator*() const { return *reinterpret_cast<const T *>(storage); }
+  T *operator->() { return reinterpret_cast<T *>(storage); }
+  const T *operator->() const { return reinterpret_cast<const T *>(storage); }
+  T &value() { return *reinterpret_cast<T *>(storage); }
+  const T &value() const { return *reinterpret_cast<const T *>(storage); }
+};
 
 // =============================================================================
 // Forward Declarations
@@ -187,6 +251,10 @@ struct Heading {
   int level = 1;  // 1-6
   std::pmr::vector<InlineNodeId> children;
   std::pmr::string raw_content;  // Temporary storage for inline parsing
+
+  Heading() = default;
+  Heading(int lvl, std::pmr::string content)
+      : level(lvl), raw_content(std::move(content)) {}
 };
 
 struct ThematicBreak {};
@@ -195,11 +263,21 @@ struct CodeBlock {
   std::pmr::string info_string;  // Language hint (e.g., "cpp", "python")
   std::pmr::string content;
   bool is_fenced = false;
+
+  CodeBlock() = default;
+  CodeBlock(std::pmr::string info, std::pmr::string content, bool fenced)
+      : info_string(std::move(info)),
+        content(std::move(content)),
+        is_fenced(fenced) {}
 };
 
 struct HtmlBlock {
   std::pmr::string content;
   int block_type = 0;  // CommonMark HTML block type (1-7)
+
+  HtmlBlock() = default;
+  HtmlBlock(std::pmr::string content, int type)
+      : content(std::move(content)), block_type(type) {}
 };
 
 struct ListItem {
@@ -214,10 +292,24 @@ struct List {
   char bullet_char = '-';  // '-', '+', or '*' for unordered lists
   bool is_tight = true;
   std::pmr::vector<ListItem> items;
+
+  List() = default;
+  List(bool ordered, int start_num, char delim, char bullet, bool tight,
+       std::pmr::vector<ListItem> items)
+      : is_ordered(ordered),
+        start(start_num),
+        delimiter(delim),
+        bullet_char(bullet),
+        is_tight(tight),
+        items(std::move(items)) {}
 };
 
 struct BlockQuote {
   std::pmr::vector<BlockNodeId> children;
+
+  BlockQuote() = default;
+  explicit BlockQuote(std::pmr::vector<BlockNodeId> children)
+      : children(std::move(children)) {}
 };
 
 // Variant type for block content
@@ -2590,7 +2682,7 @@ class InlineParser {
         flush_text();
         auto autolink = TryParseAutolink();
         if (autolink) {
-          result.push_back(std::move(*autolink));
+          result.emplace_back(std::in_place_type<Link>, std::move(*autolink));
           continue;
         }
 
@@ -2957,7 +3049,7 @@ class InlineParser {
     return stack.end();
   }
 
-  std::optional<Code> TryParseCodeSpan() {
+  Result<Code> TryParseCodeSpan() {
     size_t start = pos_;
     size_t backtick_count = 0;
     while (pos_ + backtick_count < text_.size() &&
@@ -3002,12 +3094,12 @@ class InlineParser {
     }
 
     pos_ = start;
-    return std::nullopt;
+    return {};
   }
 
-  std::optional<InlineNode> TryParseAutolink() {
+  Result<Link> TryParseAutolink() {
     if (pos_ >= text_.size() || text_[pos_] != '<') [[unlikely]]
-      return std::nullopt;
+      return {};
 
     size_t start = pos_ + 1;
     size_t end = start;
@@ -3018,11 +3110,11 @@ class InlineParser {
     }
 
     if (end >= text_.size() || text_[end] != '>') [[unlikely]]
-      return std::nullopt;
+      return {};
 
     std::string_view content = text_.substr(start, end - start);
     if (content.empty()) [[unlikely]]
-      return std::nullopt;
+      return {};
 
     // Check for URI autolink: [a-zA-Z][a-zA-Z0-9+.-]{1,31}:
     // Manual parsing replaces std::regex for massive speedup
@@ -3134,12 +3226,12 @@ class InlineParser {
       }
     }
 
-    return std::nullopt;
+    return {};
   }
 
-  std::optional<std::pmr::string> TryParseEntity() {
+  Result<std::pmr::string> TryParseEntity() {
     if (pos_ >= text_.size() || text_[pos_] != '&') [[unlikely]]
-      return std::nullopt;
+      return {};
 
     size_t start = pos_ + 1;
 
@@ -3207,19 +3299,19 @@ class InlineParser {
       }
     }
 
-    return std::nullopt;
+    return {};
   }
 
-  std::optional<HtmlInline> TryParseHtmlInline() {
+  Result<HtmlInline> TryParseHtmlInline() {
     if (pos_ >= text_.size() || text_[pos_] != '<') [[unlikely]]
-      return std::nullopt;
+      return {};
 
     size_t start = pos_;
     size_t end = pos_ + 1;
 
     // Simple HTML tag detection
     if (end >= text_.size()) [[unlikely]]
-      return std::nullopt;
+      return {};
 
     bool is_closing = (text_[end] == '/');
     if (is_closing) ++end;
@@ -3276,7 +3368,7 @@ class InlineParser {
           return HtmlInline(text_.substr(start, pos_ - start));
         }
       }
-      return std::nullopt;
+      return {};
     }
 
     // Parse tag name
@@ -3300,7 +3392,7 @@ class InlineParser {
         if (c == ' ' || c == '\t' || c == '\n') {
           ++end;
         } else {
-          return std::nullopt;  // Invalid char in closing tag
+          return {};  // Invalid char in closing tag
         }
       } else if (c == '/') {
         // Self-closing: must be followed by >
@@ -3308,7 +3400,7 @@ class InlineParser {
           pos_ = end + 2;
           return HtmlInline(text_.substr(start, pos_ - start));
         }
-        return std::nullopt;  // / not followed by >
+        return {};  // / not followed by >
       } else if (c == ' ' || c == '\t' || c == '\n') {
         seen_whitespace = true;
         ++end;
@@ -3343,7 +3435,7 @@ class InlineParser {
             ++end;
           }
           if (end >= text_.size()) [[unlikely]]
-            return std::nullopt;
+            return {};
           if (text_[end] == '"' || text_[end] == '\'') {
             char quote = text_[end];
             ++end;
@@ -3351,7 +3443,7 @@ class InlineParser {
               ++end;
             }
             if (end >= text_.size()) [[unlikely]]
-              return std::nullopt;
+              return {};
             ++end;
           } else {
             // Unquoted value - no spaces, quotes, =, <, >, or `
@@ -3368,17 +3460,17 @@ class InlineParser {
         }
       } else {
         // Invalid character in tag
-        return std::nullopt;
+        return {};
       }
     }
 
-    return std::nullopt;
+    return {};
   }
 
-  std::optional<std::pair<std::pmr::string, std::pmr::string>>
+  Result<std::pair<std::pmr::string, std::pmr::string>>
   TryParseLinkTail() {
     if (pos_ >= text_.size()) [[unlikely]]
-      return std::nullopt;
+      return {};
 
     // Inline link: (destination "title")
     if (text_[pos_] == '(') {
@@ -3401,7 +3493,7 @@ class InlineParser {
           ++pos_;
         }
         if (pos_ >= text_.size() || text_[pos_] != '>') [[unlikely]]
-          return std::nullopt;
+          return {};
         destination = detail::DecodeEscapesAndEntities(
             text_.substr(dest_start, pos_ - dest_start));
         ++pos_;
@@ -3441,7 +3533,7 @@ class InlineParser {
           ++pos_;
         }
         if (pos_ >= text_.size()) [[unlikely]]
-          return std::nullopt;
+          return {};
         title = detail::DecodeEscapesAndEntities(
             text_.substr(title_start, pos_ - title_start));
         ++pos_;
@@ -3449,7 +3541,7 @@ class InlineParser {
       }
 
       if (pos_ >= text_.size() || text_[pos_] != ')') [[unlikely]]
-        return std::nullopt;
+        return {};
       ++pos_;
 
       return std::make_pair(detail::EncodeUrl(destination), title);
@@ -3472,33 +3564,34 @@ class InlineParser {
       }
 
       if (pos_ >= text_.size()) [[unlikely]]
-        return std::nullopt;
+        return {};
 
       std::pmr::string label(text_.substr(label_start, pos_ - label_start));
       ++pos_;
 
       if (label.empty()) [[unlikely]] {
         // Collapsed reference - label comes from link text
-        return std::nullopt;  // Need to look up later
+        return {};  // Need to look up later
       }
 
       return LookupReference(label);
     }
 
-    return std::nullopt;
+    return {};
   }
 
-  std::optional<std::pair<std::pmr::string, std::pmr::string>> LookupReference(
+  Result<std::pair<std::pmr::string, std::pmr::string>> LookupReference(
       std::string_view label) {
     if (!link_references_) [[unlikely]]
-      return std::nullopt;
+      return {};
 
     std::pmr::string normalized = detail::NormalizeLinkLabel(label);
     auto it = link_references_->find(normalized);
     if (it != link_references_->end()) {
-      return it->second;
+      return Result<std::pair<std::pmr::string, std::pmr::string>>::emplace(
+          it->second);
     }
-    return std::nullopt;
+    return {};
   }
 
   void SkipWhitespace() {
@@ -4340,38 +4433,31 @@ class BlockParser {
       }
 
       // Check for various block types
-      if (auto block = TryParseThematicBreak()) {
-        blocks.push_back(std::move(*block));
+      if (TryParseThematicBreak(blocks)) {
         continue;
       }
 
-      if (auto block = TryParseAtxHeading()) {
-        blocks.push_back(std::move(*block));
+      if (TryParseAtxHeading(blocks)) {
         continue;
       }
 
-      if (auto block = TryParseFencedCodeBlock()) {
-        blocks.push_back(std::move(*block));
+      if (TryParseFencedCodeBlock(blocks)) {
         continue;
       }
 
-      if (auto block = TryParseHtmlBlock()) {
-        blocks.push_back(std::move(*block));
+      if (TryParseHtmlBlock(blocks)) {
         continue;
       }
 
-      if (auto block = TryParseBlockQuote()) {
-        blocks.push_back(std::move(*block));
+      if (TryParseBlockQuote(blocks)) {
         continue;
       }
 
-      if (auto block = TryParseList()) {
-        blocks.push_back(std::move(*block));
+      if (TryParseList(blocks)) {
         continue;
       }
 
-      if (auto block = TryParseIndentedCodeBlock()) {
-        blocks.push_back(std::move(*block));
+      if (TryParseIndentedCodeBlock(blocks)) {
         continue;
       }
 
@@ -4568,46 +4654,47 @@ class BlockParser {
     return true;
   }
 
-  std::optional<ThematicBreak> TryParseThematicBreak() {
+  bool TryParseThematicBreak(std::pmr::vector<BlockNode> &blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     auto trimmed = detail::TrimLeft(line);
     if (trimmed.empty()) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     char marker = trimmed[0];
     if (marker != '-' && marker != '*' && marker != '_') [[unlikely]]
-      return std::nullopt;
+      return false;
 
     int count = 0;
     for (char c : trimmed) {
       if (c == marker) {
         ++count;
       } else if (c != ' ' && c != '\t') {
-        return std::nullopt;
+        return false;
       }
     }
 
     if (count >= 3) {
       Advance();
-      return ThematicBreak{};
+      blocks.emplace_back(std::in_place_type<ThematicBreak>);
+      return true;
     }
 
-    return std::nullopt;
+    return false;
   }
 
-  std::optional<Heading> TryParseAtxHeading() {
+  bool TryParseAtxHeading(std::pmr::vector<BlockNode> &blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     auto trimmed = detail::TrimLeft(line);
     if (trimmed.empty() || trimmed[0] != '#') [[unlikely]]
-      return std::nullopt;
+      return false;
 
     int level = 0;
     size_t i = 0;
@@ -4617,9 +4704,9 @@ class BlockParser {
     }
 
     if (level > 6) [[unlikely]]
-      return std::nullopt;
+      return false;
     if (i < trimmed.size() && trimmed[i] != ' ' && trimmed[i] != '\t') {
-      return std::nullopt;
+      return false;
     }
 
     // Skip space after #'s
@@ -4661,22 +4748,24 @@ class BlockParser {
 
     Advance();
 
-    return Heading{.level = level, .raw_content = std::move(content)};
+    blocks.emplace_back(std::in_place_type<Heading>, level,
+                        std::move(content));
+    return true;
   }
 
-  std::optional<CodeBlock> TryParseFencedCodeBlock() {
+  bool TryParseFencedCodeBlock(std::pmr::vector<BlockNode> &blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     auto trimmed = detail::TrimLeft(line);
     if (trimmed.empty()) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     char fence_char = trimmed[0];
     if (fence_char != '`' && fence_char != '~') [[unlikely]]
-      return std::nullopt;
+      return false;
 
     size_t fence_length = 0;
     while (fence_length < trimmed.size() &&
@@ -4685,13 +4774,13 @@ class BlockParser {
     }
 
     if (fence_length < 3) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     // Check for backtick in info string (not allowed for backtick fences)
     std::pmr::string info_string(detail::Trim(trimmed.substr(fence_length)));
     if (fence_char == '`' && info_string.find('`') != std::string::npos)
         [[unlikely]] {
-      return std::nullopt;
+      return false;
     }
     // Decode backslash escapes in info string
     info_string = detail::DecodeEscapesAndEntities(info_string);
@@ -4750,19 +4839,20 @@ class BlockParser {
       content.pop_back();
     }
 
-    return CodeBlock{.info_string = std::move(info_string),
-                     .content = std::move(content), .is_fenced = true};
+    blocks.emplace_back(std::in_place_type<CodeBlock>, std::move(info_string),
+                        std::move(content), true);
+    return true;
   }
 
-  std::optional<HtmlBlock> TryParseHtmlBlock() {
+  bool TryParseHtmlBlock(std::pmr::vector<BlockNode> &blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     auto trimmed = detail::TrimLeft(line);
     if (trimmed.empty() || trimmed[0] != '<') [[unlikely]]
-      return std::nullopt;
+      return false;
 
     int block_type = 0;
     std::pmr::string end_condition_storage;  // Only used for types 2-5
@@ -5047,7 +5137,7 @@ class BlockParser {
     }
 
     if (block_type == 0) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     // Collect HTML block content
     std::pmr::string content;
@@ -5073,18 +5163,20 @@ class BlockParser {
       }
     }
 
-    return HtmlBlock{.content = std::move(content), .block_type = block_type};
+    blocks.emplace_back(std::in_place_type<HtmlBlock>, std::move(content),
+                        block_type);
+    return true;
   }
 
-  std::optional<BlockQuote> TryParseBlockQuote() {
+  bool TryParseBlockQuote(std::pmr::vector<BlockNode> &blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     auto trimmed = detail::TrimLeft(line);
     if (trimmed.empty() || trimmed[0] != '>') [[unlikely]]
-      return std::nullopt;
+      return false;
 
     // Collect block quote lines
     std::pmr::vector<std::pmr::string> quote_lines;
@@ -5228,7 +5320,7 @@ class BlockParser {
     }
 
     if (quote_lines.empty()) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     // Parse the content of the block quote
     std::pmr::string quote_content;
@@ -5250,18 +5342,19 @@ class BlockParser {
     // Transfer nested doc to parent's pools and get IDs
     BlockQuote bq;
     bq.children = TransferFromNestedDoc(nested_doc);
-    return bq;
+    blocks.emplace_back(std::in_place_type<BlockQuote>, std::move(bq.children));
+    return true;
   }
 
-  std::optional<List> TryParseList() {
+  bool TryParseList(std::pmr::vector<BlockNode> &blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     auto trimmed = detail::TrimLeft(line);
     if (trimmed.empty()) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     // Check for bullet list
     bool is_ordered = false;
@@ -5277,7 +5370,7 @@ class BlockParser {
       } else if (trimmed[1] == ' ' || trimmed[1] == '\t') {
         // Bullet + space - valid
       } else {
-        return std::nullopt;  // Not a list marker
+        return false;  // Not a list marker
       }
     } else if (std::isdigit(static_cast<unsigned char>(trimmed[0]))) {
       // Ordered list
@@ -5288,13 +5381,13 @@ class BlockParser {
         ++num_end;
       }
       if (num_end == 0 || num_end > 9) [[unlikely]]
-        return std::nullopt;
+        return false;
       if (num_end >= trimmed.size()) [[unlikely]]
-        return std::nullopt;
+        return false;
 
       char delim = trimmed[num_end];
       if (delim != '.' && delim != ')') [[unlikely]]
-        return std::nullopt;
+        return false;
 
       start = std::stoi(std::string(trimmed.substr(0, num_end)));
       delimiter = delim;
@@ -5305,10 +5398,10 @@ class BlockParser {
       } else if (trimmed[num_end + 1] == ' ' || trimmed[num_end + 1] == '\t') {
         // Number + delimiter + space - valid
       } else {
-        return std::nullopt;  // Not a list marker
+        return false;  // Not a list marker
       }
     } else {
-      return std::nullopt;
+      return false;
     }
 
     // Parse list items
@@ -5729,9 +5822,9 @@ class BlockParser {
       }
     }
 
-    // Return nullopt if no items were collected
+    // Return false if no items were collected
     if (list.items.empty()) {
-      return std::nullopt;
+      return false;
     }
 
     // Check for loose list (items separated by blank lines)
@@ -5739,14 +5832,16 @@ class BlockParser {
       item.is_tight = list.is_tight;
     }
 
-    return list;
+    blocks.emplace_back(std::in_place_type<List>, is_ordered, start, delimiter,
+                        bullet_char, list.is_tight, std::move(list.items));
+    return true;
   }
 
-  std::optional<CodeBlock> TryParseIndentedCodeBlock() {
+  bool TryParseIndentedCodeBlock(std::pmr::vector<BlockNode> &blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent < 4) [[unlikely]]
-      return std::nullopt;
+      return false;
 
     std::pmr::string content;
 
@@ -5784,9 +5879,11 @@ class BlockParser {
     }
 
     if (content.empty()) [[unlikely]]
-      return std::nullopt;
+      return false;
 
-    return CodeBlock{.content = std::move(content), .is_fenced = false};
+    blocks.emplace_back(std::in_place_type<CodeBlock>, std::pmr::string{},
+                        std::move(content), false);
+    return true;
   }
 
   BlockNode ParseParagraph() {

@@ -2,6 +2,11 @@
 #include <sstream>
 #include <string>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 #include "markus.h"
 
 namespace {
@@ -25,6 +30,11 @@ std::string ReadStdin() {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+  _setmode(_fileno(stdout), _O_BINARY);
+  _setmode(_fileno(stdin), _O_BINARY);
+#endif
+
   bool ast_mode = false;
 
   for (int i = 1; i < argc; ++i) {

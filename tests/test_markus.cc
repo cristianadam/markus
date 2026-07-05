@@ -6,6 +6,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#define popen _popen
+#define pclose _pclose
 #else
 #include <sys/wait.h>
 #endif
@@ -61,7 +63,7 @@ std::string RunPythonTest(int test_number, const std::string& main_path,
 
   int exit_code;
 #ifdef _WIN32
-  exit_code = _pclose(pipe);
+  exit_code = pclose(pipe);
 #else
   int status = pclose(pipe);
   if (WIFEXITED(status)) {

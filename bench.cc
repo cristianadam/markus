@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dirent.h>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -12,6 +11,13 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
 
 #include "benchmark/benchmark.h"
 #include "markus.h"
@@ -33,6 +39,19 @@ std::string ReadFile(const std::string& path) {
 
 std::vector<std::string> GetSampleFiles(const std::string& dir) {
   std::vector<std::string> files;
+#ifdef _WIN32
+  std::string pattern = dir + "\\*.md";
+  WIN32_FIND_DATAA findData;
+  HANDLE hFind = FindFirstFileA(pattern.c_str(), &findData);
+  if (hFind == INVALID_HANDLE_VALUE) return files;
+  do {
+    std::string name = findData.cFileName;
+    if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+      files.push_back(dir + "\\" + name);
+    }
+  } while (FindNextFileA(hFind, &findData));
+  FindClose(hFind);
+#else
   DIR* d = opendir(dir.c_str());
   if (!d) return files;
   struct dirent* entry;
@@ -43,6 +62,7 @@ std::vector<std::string> GetSampleFiles(const std::string& dir) {
     }
   }
   closedir(d);
+#endif
   std::sort(files.begin(), files.end());
   return files;
 }

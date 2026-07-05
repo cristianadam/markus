@@ -34,43 +34,43 @@ struct Result {
   alignas(T) unsigned char storage[sizeof(T)];
 
   Result() = default;
-  Result(const Result &) = delete;
-  Result &operator=(const Result &) = delete;
+  Result(const Result&) = delete;
+  Result& operator=(const Result&) = delete;
 
-  Result(Result &&other) noexcept : has_value(other.has_value) {
+  Result(Result&& other) noexcept : has_value(other.has_value) {
     if (has_value) {
-      new (storage) T(std::move(*reinterpret_cast<T *>(other.storage)));
+      new (storage) T(std::move(*reinterpret_cast<T*>(other.storage)));
       other.has_value = false;
     }
   }
 
-  Result &operator=(Result &&other) noexcept {
+  Result& operator=(Result&& other) noexcept {
     if (this != &other) {
       if (has_value) {
-        reinterpret_cast<T *>(storage)->~T();
+        reinterpret_cast<T*>(storage)->~T();
       }
       has_value = other.has_value;
       if (has_value) {
-        new (storage) T(std::move(*reinterpret_cast<T *>(other.storage)));
+        new (storage) T(std::move(*reinterpret_cast<T*>(other.storage)));
         other.has_value = false;
       }
     }
     return *this;
   }
 
-  Result(T &&value) {
+  Result(T&& value) {
     new (storage) T(std::move(value));
     has_value = true;
   }
 
   ~Result() {
     if (has_value) {
-      reinterpret_cast<T *>(storage)->~T();
+      reinterpret_cast<T*>(storage)->~T();
     }
   }
 
   template <typename... Args>
-  static Result emplace(Args &&...args) {
+  static Result emplace(Args&&... args) {
     Result r;
     new (r.storage) T(std::forward<Args>(args)...);
     r.has_value = true;
@@ -80,12 +80,12 @@ struct Result {
   static Result none() { return Result{}; }
 
   explicit operator bool() const { return has_value; }
-  T &operator*() { return *reinterpret_cast<T *>(storage); }
-  const T &operator*() const { return *reinterpret_cast<const T *>(storage); }
-  T *operator->() { return reinterpret_cast<T *>(storage); }
-  const T *operator->() const { return reinterpret_cast<const T *>(storage); }
-  T &value() { return *reinterpret_cast<T *>(storage); }
-  const T &value() const { return *reinterpret_cast<const T *>(storage); }
+  T& operator*() { return *reinterpret_cast<T*>(storage); }
+  const T& operator*() const { return *reinterpret_cast<const T*>(storage); }
+  T* operator->() { return reinterpret_cast<T*>(storage); }
+  const T* operator->() const { return reinterpret_cast<const T*>(storage); }
+  T& value() { return *reinterpret_cast<T*>(storage); }
+  const T& value() const { return *reinterpret_cast<const T*>(storage); }
 };
 
 // =============================================================================
@@ -318,23 +318,26 @@ struct BlockQuote {
 
 // Variant type for block content
 using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
-                                HtmlBlock, BlockQuote, List, ListItem>;
+                               HtmlBlock, BlockQuote, List, ListItem>;
 
 // Type alias for link references - sorted vector with binary search
 // Much faster than unordered_map for typical document sizes (< 50 refs)
-using LinkRefMap = std::pmr::vector<std::pair<std::pmr::string,
-                                               std::pair<std::pmr::string, std::pmr::string>>>;
+using LinkRefMap = std::pmr::vector<
+    std::pair<std::pmr::string, std::pair<std::pmr::string, std::pmr::string>>>;
 
-// Comparator for link reference binary search - works with both (elem, key) and (key, elem)
+// Comparator for link reference binary search - works with both (elem, key) and
+// (key, elem)
 struct LinkRefComparator {
-  bool operator()(const std::pair<std::pmr::string,
-                 std::pair<std::pmr::string, std::pmr::string>>& a,
-                  std::string_view key) const {
+  bool operator()(
+      const std::pair<std::pmr::string,
+                      std::pair<std::pmr::string, std::pmr::string>>& a,
+      std::string_view key) const {
     return a.first < key;
   }
-  bool operator()(std::string_view key,
-                  const std::pair<std::pmr::string,
-                  std::pair<std::pmr::string, std::pmr::string>>& a) const {
+  bool operator()(
+      std::string_view key,
+      const std::pair<std::pmr::string,
+                      std::pair<std::pmr::string, std::pmr::string>>& a) const {
     return key < a.first;
   }
 };
@@ -416,8 +419,8 @@ inline constexpr auto kEscapeLens = MakeEscapeLens();
 // Optimized HTML Escaping - In-place variant (hot path)
 // =============================================================================
 
-// Writes escaped HTML directly to output buffer - eliminates temp string allocation
-// C++20: 8-wide unrolled scan for significantly better throughput
+// Writes escaped HTML directly to output buffer - eliminates temp string
+// allocation C++20: 8-wide unrolled scan for significantly better throughput
 inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
   size_t i = 0;
   const size_t len = text.size();
@@ -432,7 +435,10 @@ inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
       uint8_t e3 = kEscapeTableV2[static_cast<unsigned char>(text[i + 3])];
       if (e0 || e1 || e2 || e3) {
         if (e0) break;
-        if (e1) { ++i; break; }
+        if (e1) {
+          ++i;
+          break;
+        }
         i += 2;
         break;
       }
@@ -441,8 +447,14 @@ inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
       uint8_t e6 = kEscapeTableV2[static_cast<unsigned char>(text[i + 6])];
       uint8_t e7 = kEscapeTableV2[static_cast<unsigned char>(text[i + 7])];
       if (e4 || e5 || e6 || e7) {
-        if (e4) { i += 4; break; }
-        if (e5) { i += 5; break; }
+        if (e4) {
+          i += 4;
+          break;
+        }
+        if (e5) {
+          i += 5;
+          break;
+        }
         i += 6;
         break;
       }
@@ -464,10 +476,18 @@ inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
     if (i < len) {
       uint8_t e = kEscapeTableV2[static_cast<unsigned char>(text[i])];
       switch (e) {
-        case 1: out.append("&amp;"); break;
-        case 2: out.append("&lt;"); break;
-        case 3: out.append("&gt;"); break;
-        case 4: out.append("&quot;"); break;
+        case 1:
+          out.append("&amp;");
+          break;
+        case 2:
+          out.append("&lt;");
+          break;
+        case 3:
+          out.append("&gt;");
+          break;
+        case 4:
+          out.append("&quot;");
+          break;
       }
       ++i;
     }
@@ -544,16 +564,18 @@ inline char* AppendIntToBuffer(int value, char* buf) {
 // =============================================================================
 
 inline size_t FindFirstSpecialChar(const char* data, size_t len,
-                                      const uint8_t* special_table) {
-  auto it = std::find_if(data, data + len,
-      [special_table](char c) { return special_table[static_cast<unsigned char>(c)]; });
+                                   const uint8_t* special_table) {
+  auto it = std::find_if(data, data + len, [special_table](char c) {
+    return special_table[static_cast<unsigned char>(c)];
+  });
   return static_cast<size_t>(it - data);
 }
 
 inline size_t FindFirstUnsafeChar(const char* data, size_t len,
-                                    const uint8_t* safe_table) {
-  auto it = std::find_if(data, data + len,
-      [safe_table](char c) { return !safe_table[static_cast<unsigned char>(c)]; });
+                                  const uint8_t* safe_table) {
+  auto it = std::find_if(data, data + len, [safe_table](char c) {
+    return !safe_table[static_cast<unsigned char>(c)];
+  });
   return static_cast<size_t>(it - data);
 }
 
@@ -566,7 +588,8 @@ inline bool IsSpanBlank(std::string_view sv) {
   });
 }
 
-// Legacy overload for raw pointer + length (deprecated - use string_view version)
+// Legacy overload for raw pointer + length (deprecated - use string_view
+// version)
 inline bool IsSpanBlank(const char* data, size_t len) {
   return std::ranges::all_of(std::string_view(data, len), [](char c) {
     unsigned char uc = static_cast<unsigned char>(c);
@@ -575,7 +598,7 @@ inline bool IsSpanBlank(const char* data, size_t len) {
 }
 
 inline std::pair<size_t, bool> ScanForLinesAndNulls(const char* data,
-                                                     size_t len) {
+                                                    size_t len) {
   size_t line_count = 0;
   bool has_nulls = false;
   for (size_t i = 0; i < len; ++i) {
@@ -695,7 +718,7 @@ inline bool IsAlnum(uint8_t c) { return (kCharClassTable[c] & 4) != 0; }
 inline bool IsXDigit(uint8_t c) { return (kCharClassTable[c] & 8) != 0; }
 
 // Parse unsigned integer directly from string_view without temporary allocation
-inline bool ParseUint(std::string_view sv, uint32_t &out, int base) {
+inline bool ParseUint(std::string_view sv, uint32_t& out, int base) {
   if (sv.empty()) return false;
   uint32_t result = 0;
   for (char c : sv) {
@@ -1227,9 +1250,8 @@ inline uint32_t UnicodeCaseFold(uint32_t cp) {
 // C++20: optimized with fast path for ASCII-only labels using ranges::any_of
 inline std::pmr::string NormalizeLinkLabel(std::string_view label) {
   // Fast path: check if label is ASCII-only (common case) using ranges::any_of
-  bool all_ascii = !std::ranges::any_of(label, [](unsigned char c) {
-    return c >= 0x80;
-  });
+  bool all_ascii =
+      !std::ranges::any_of(label, [](unsigned char c) { return c >= 0x80; });
 
   std::pmr::string result;
   result.reserve(label.size());
@@ -1363,16 +1385,18 @@ inline bool StringContainsInsensitive(std::string_view str,
                                       std::string_view substr) {
   if (substr.empty() || str.size() < substr.size()) return false;
   // Fast path: find first character of substr in str
-  char first = static_cast<char>(
-      std::tolower(static_cast<unsigned char>(substr[0])));
+  char first =
+      static_cast<char>(std::tolower(static_cast<unsigned char>(substr[0])));
   for (size_t i = 0; i <= str.size() - substr.size(); ++i) {
     if (static_cast<char>(std::tolower(static_cast<unsigned char>(str[i]))) !=
         first)
       continue;
     bool match = true;
     for (size_t j = 1; j < substr.size(); ++j) {
-      if (static_cast<char>(std::tolower(static_cast<unsigned char>(str[i + j]))) !=
-          static_cast<char>(std::tolower(static_cast<unsigned char>(substr[j])))) {
+      if (static_cast<char>(
+              std::tolower(static_cast<unsigned char>(str[i + j]))) !=
+          static_cast<char>(
+              std::tolower(static_cast<unsigned char>(substr[j])))) {
         match = false;
         break;
       }
@@ -2044,8 +2068,9 @@ struct StringEqual {
 // Uses transparent lookup to avoid string_view->string conversion
 inline std::string_view LookupHtmlEntity(std::string_view name) {
   // This is a subset - full CommonMark compliance requires all HTML5 entities
-  // Sorted array + binary search (md4c pattern): avoids unordered_map allocation
-  // overhead and provides better cache locality for the small entity table
+  // Sorted array + binary search (md4c pattern): avoids unordered_map
+  // allocation overhead and provides better cache locality for the small entity
+  // table
   struct EntityEntry {
     const char* name;
     std::string_view value;
@@ -2194,8 +2219,7 @@ inline std::pmr::string DecodeEscapesAndEntities(std::string_view text) {
 
         if (num_end > num_start && num_end < text.size() &&
             text[num_end] == ';') {
-          std::string_view num_sv(text.data() + num_start,
-                                  num_end - num_start);
+          std::string_view num_sv(text.data() + num_start, num_end - num_start);
           uint32_t code_point;
           if (ParseUint(num_sv, code_point, is_hex ? 16 : 10)) {
             result += CodePointToUtf8(code_point);
@@ -2276,8 +2300,8 @@ inline std::pmr::string DecodeEscapes(std::string_view text) {
 }  // namespace detail
 
 using detail::CaseFold;
-using detail::IsAlpha;
 using detail::IsAlnum;
+using detail::IsAlpha;
 using detail::IsDigit;
 using detail::IsXDigit;
 using detail::ParseUint;
@@ -2385,7 +2409,7 @@ class InlineParser {
     auto flush_text = [&]() {
       if (in_span && text_start < pos_) {
         result.emplace_back(std::in_place_type<Text>,
-                           text_.substr(text_start, pos_ - text_start));
+                            text_.substr(text_start, pos_ - text_start));
         in_span = false;
       }
     };
@@ -2399,7 +2423,7 @@ class InlineParser {
         }
         if (end > text_start) {
           result.emplace_back(std::in_place_type<Text>,
-                             text_.substr(text_start, end - text_start));
+                              text_.substr(text_start, end - text_start));
         }
         in_span = false;
       }
@@ -2421,7 +2445,7 @@ class InlineParser {
         if (detail::IsAsciiPunctuation(next)) {
           flush_text();
           result.emplace_back(std::in_place_type<Text>,
-                             text_.substr(pos_ + 1, 1));
+                              text_.substr(pos_ + 1, 1));
           pos_ += 2;
           continue;
         } else if (next == '\n') {
@@ -2438,7 +2462,7 @@ class InlineParser {
         auto entity_result = TryParseEntity();
         if (entity_result) {
           result.emplace_back(std::in_place_type<Text>,
-                             StoreString(std::move(*entity_result)));
+                              StoreString(std::move(*entity_result)));
           continue;
         }
         start_span();
@@ -2451,7 +2475,8 @@ class InlineParser {
         flush_text();
         auto code_span = TryParseCodeSpan();
         if (code_span) {
-          result.emplace_back(std::in_place_type<Code>, std::move(code_span->content));
+          result.emplace_back(std::in_place_type<Code>,
+                              std::move(code_span->content));
           continue;
         }
         // Code span didn't match - include backticks in current text span
@@ -2516,12 +2541,12 @@ class InlineParser {
         flush_text();
 
         // Add delimiter to stack
-        delimiter_stack.emplace_back(result.size(), pos_, run_length, c, can_open,
-                                     can_close, true, &result);
+        delimiter_stack.emplace_back(result.size(), pos_, run_length, c,
+                                     can_open, can_close, true, &result);
 
         // Add the delimiter characters as text - view into input
         result.emplace_back(std::in_place_type<Text>,
-                           text_.substr(pos_, run_length));
+                            text_.substr(pos_, run_length));
         pos_ += run_length;
         continue;
       }
@@ -2540,11 +2565,11 @@ class InlineParser {
 
         if (is_image) {
           result.emplace_back(std::in_place_type<Text>,
-                             text_.substr(pos_, 2));  // "!["
+                              text_.substr(pos_, 2));  // "!["
           pos_ += 2;
         } else {
           result.emplace_back(std::in_place_type<Text>,
-                             text_.substr(pos_, 1));  // "["
+                              text_.substr(pos_, 1));  // "["
           pos_ += 1;
         }
         continue;
@@ -2647,7 +2672,7 @@ class InlineParser {
             pos_ = saved_pos;
             opener->active = false;
             result.emplace_back(std::in_place_type<Text>,
-                               text_.substr(pos_, 1));  // "]"
+                                text_.substr(pos_, 1));  // "]"
             ++pos_;
             continue;
           }
@@ -2725,7 +2750,7 @@ class InlineParser {
         }
 
         result.emplace_back(std::in_place_type<Text>,
-                           text_.substr(pos_, 1));  // "]"
+                            text_.substr(pos_, 1));  // "]"
         ++pos_;
         continue;
       }
@@ -2757,8 +2782,9 @@ class InlineParser {
         continue;
       }
 
-      // Fast path: scan ahead past runs of regular characters (cmark-style bulk scan)
-      // Handles >90% of characters in typical text without per-character branching
+      // Fast path: scan ahead past runs of regular characters (cmark-style bulk
+      // scan) Handles >90% of characters in typical text without per-character
+      // branching
       {
         size_t next_special = detail::FindNextSpecialChar(text_, pos_ + 1);
         start_span();
@@ -2847,7 +2873,7 @@ class InlineParser {
     size_t start = pos_;
     size_t backtick_count = 0;
     while (pos_ + backtick_count < text_.size() &&
-            text_[pos_ + backtick_count] == '`') {
+           text_[pos_ + backtick_count] == '`') {
       ++backtick_count;
     }
 
@@ -2977,7 +3003,7 @@ class InlineParser {
           0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1,  // !"#$%&'*+/-
           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0, 1,  // 0-9;=?~
           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // A-O
-           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1,  // P-^
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1,  // P-^
           0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  // a-o
           1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0,  // p-z|}~
       };
@@ -2990,10 +3016,12 @@ class InlineParser {
       }
 
       if (valid_local) {
-        // Validate domain: [a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[...])*
+        // Validate domain:
+        // [a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[...])*
         size_t d = at_pos + 1;
         bool valid_domain = true;
-        if (d < content.size() && std::isalnum(static_cast<unsigned char>(content[d]))) {
+        if (d < content.size() &&
+            std::isalnum(static_cast<unsigned char>(content[d]))) {
           while (d < content.size()) {
             // Label start
             size_t label_start = d;
@@ -3077,8 +3105,7 @@ class InlineParser {
 
       if (num_end > num_start && num_end < text_.size() &&
           text_[num_end] == ';') {
-        std::string_view num_sv(text_.data() + num_start,
-                                num_end - num_start);
+        std::string_view num_sv(text_.data() + num_start, num_end - num_start);
         uint32_t code_point;
         if (ParseUint(num_sv, code_point, is_hex ? 16 : 10) &&
             code_point <= 0x10FFFF) {
@@ -3273,8 +3300,7 @@ class InlineParser {
     return {};
   }
 
-  Result<std::pair<std::pmr::string, std::pmr::string>>
-  TryParseLinkTail() {
+  Result<std::pair<std::pmr::string, std::pmr::string>> TryParseLinkTail() {
     if (pos_ >= text_.size()) [[unlikely]]
       return {};
 
@@ -3392,8 +3418,9 @@ class InlineParser {
       return {};
 
     std::pmr::string normalized = detail::NormalizeLinkLabel(label);
-    auto it = std::lower_bound(link_references_->begin(), link_references_->end(),
-                               normalized, LinkRefComparator{});
+    auto it =
+        std::lower_bound(link_references_->begin(), link_references_->end(),
+                         normalized, LinkRefComparator{});
     if (it != link_references_->end() && !(normalized < it->first)) {
       return Result<std::pair<std::pmr::string, std::pmr::string>>::emplace(
           it->second);
@@ -3632,33 +3659,33 @@ class BlockParser {
   // Transfer blocks from a nested document to the parent's pool and return IDs
   // Also transfers inline nodes, string storage, and remaps their IDs
   std::pmr::vector<BlockNodeId> TransferFromNestedDoc(Document& nested_doc) {
-     // Transfer string_storage by COPYING to preserve string_view validity.
-     // SSO strings have data inside the object, so moving would invalidate
-     // views. We need to record how many strings we're copying to calculate new
-     // indices.
-     size_t string_storage_base = doc_->string_storage.size();
-     for (const auto& s : nested_doc.string_storage) {
-       doc_->string_storage.push_back(s);  // COPY, not move
-     }
+    // Transfer string_storage by COPYING to preserve string_view validity.
+    // SSO strings have data inside the object, so moving would invalidate
+    // views. We need to record how many strings we're copying to calculate new
+    // indices.
+    size_t string_storage_base = doc_->string_storage.size();
+    for (const auto& s : nested_doc.string_storage) {
+      doc_->string_storage.push_back(s);  // COPY, not move
+    }
 
-     // Helper to update a string_view to point to the new string location
-     auto update_string_view = [&](std::string_view& sv) {
-       const char* sv_data = sv.data();
-       // Find the original string this view points into
-       for (size_t i = 0; i < nested_doc.string_storage.size(); ++i) {
-         const auto& old_str = nested_doc.string_storage[i];
-         if (sv_data >= old_str.data() &&
-             sv_data < old_str.data() + old_str.size()) {
-           // Found it - compute offset and update to new location
-           size_t offset = sv_data - old_str.data();
-           const auto& new_str = doc_->string_storage[string_storage_base + i];
-           sv = std::string_view(new_str.data() + offset, sv.size());
-           return;
-         }
-       }
-     };
+    // Helper to update a string_view to point to the new string location
+    auto update_string_view = [&](std::string_view& sv) {
+      const char* sv_data = sv.data();
+      // Find the original string this view points into
+      for (size_t i = 0; i < nested_doc.string_storage.size(); ++i) {
+        const auto& old_str = nested_doc.string_storage[i];
+        if (sv_data >= old_str.data() &&
+            sv_data < old_str.data() + old_str.size()) {
+          // Found it - compute offset and update to new location
+          size_t offset = sv_data - old_str.data();
+          const auto& new_str = doc_->string_storage[string_storage_base + i];
+          sv = std::string_view(new_str.data() + offset, sv.size());
+          return;
+        }
+      }
+    };
 
-     // First, transfer all inline nodes from nested to parent and build ID map
+    // First, transfer all inline nodes from nested to parent and build ID map
     std::pmr::vector<InlineNodeId> inline_id_map;
     inline_id_map.reserve(nested_doc.inline_nodes.size());
     for (auto& inline_node : nested_doc.inline_nodes) {
@@ -3853,7 +3880,8 @@ class BlockParser {
         if (paren_depth == 0) break;
         --paren_depth;
         ++end;
-      } else if (detail::IsUnicodeWhitespace(c) || static_cast<unsigned char>(c) < 0x20) {
+      } else if (detail::IsUnicodeWhitespace(c) ||
+                 static_cast<unsigned char>(c) < 0x20) {
         break;
       } else {
         ++end;
@@ -4223,8 +4251,9 @@ class BlockParser {
                                      LinkRefComparator{});
       if (ref_it == doc.link_references.end() || ref_it->first != normalized) {
         // Insert in sorted position
-        doc.link_references.emplace(ref_it, std::move(normalized),
-                                    std::pair{detail::EncodeUrl(destination), title});
+        doc.link_references.emplace(
+            ref_it, std::move(normalized),
+            std::pair{detail::EncodeUrl(destination), title});
       }
       // After successful link ref extraction, next line starts fresh
       prev_line_had_content = false;
@@ -4465,7 +4494,7 @@ class BlockParser {
     return true;
   }
 
-  bool TryParseThematicBreak(std::pmr::vector<BlockNode> &blocks) {
+  bool TryParseThematicBreak(std::pmr::vector<BlockNode>& blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
@@ -4491,19 +4520,19 @@ class BlockParser {
     if (count >= 3) {
       Advance();
       blocks.emplace_back(std::in_place_type<ThematicBreak>);
-  return true;
-}
+      return true;
+    }
 
-// =============================================================================
-// Inline Parser Special Character Lookup Table (cmark-style optimization)
-// Marks characters that require special handling in inline parsing
-// This enables bulk scanning of "safe" text runs in the hot path
-// =============================================================================
+    // =============================================================================
+    // Inline Parser Special Character Lookup Table (cmark-style optimization)
+    // Marks characters that require special handling in inline parsing
+    // This enables bulk scanning of "safe" text runs in the hot path
+    // =============================================================================
 
     return false;
   }
 
-  bool TryParseAtxHeading(std::pmr::vector<BlockNode> &blocks) {
+  bool TryParseAtxHeading(std::pmr::vector<BlockNode>& blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
@@ -4565,12 +4594,11 @@ class BlockParser {
 
     Advance();
 
-    blocks.emplace_back(std::in_place_type<Heading>, level,
-                        std::move(content));
+    blocks.emplace_back(std::in_place_type<Heading>, level, std::move(content));
     return true;
   }
 
-  bool TryParseFencedCodeBlock(std::pmr::vector<BlockNode> &blocks) {
+  bool TryParseFencedCodeBlock(std::pmr::vector<BlockNode>& blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
@@ -4661,7 +4689,7 @@ class BlockParser {
     return true;
   }
 
-  bool TryParseHtmlBlock(std::pmr::vector<BlockNode> &blocks) {
+  bool TryParseHtmlBlock(std::pmr::vector<BlockNode>& blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
@@ -4673,7 +4701,7 @@ class BlockParser {
 
     int block_type = 0;
     std::pmr::string end_condition_storage;  // Only used for types 2-5
-    std::string_view end_condition_sv;       // Points to storage or static array
+    std::string_view end_condition_sv;  // Points to storage or static array
 
     // Type 1: <script>, <pre>, <style>, <textarea>
     // Each entry is {opening tag prefix, closing tag end condition}
@@ -4728,7 +4756,8 @@ class BlockParser {
     }
 
     // Type 4: <!DOCTYPE
-    if (block_type == 0 && detail::StartsWithInsensitive(trimmed, "<!doctype")) {
+    if (block_type == 0 &&
+        detail::StartsWithInsensitive(trimmed, "<!doctype")) {
       block_type = 4;
       end_condition_storage = ">";
       end_condition_sv = end_condition_storage;
@@ -4743,19 +4772,37 @@ class BlockParser {
 
     // Type 6: Block-level HTML tags
     static constexpr std::array type6_tags = {
-        std::string_view("address"),    std::string_view("article"),  std::string_view("aside"),   std::string_view("base"),     std::string_view("basefont"),
-        std::string_view("blockquote"), std::string_view("body"),     std::string_view("caption"), std::string_view("center"),   std::string_view("col"),
-        std::string_view("colgroup"),   std::string_view("dd"),       std::string_view("details"), std::string_view("dialog"),   std::string_view("dir"),
-        std::string_view("div"),        std::string_view("dl"),       std::string_view("dt"),      std::string_view("fieldset"), std::string_view("figcaption"),
-        std::string_view("figure"),     std::string_view("footer"),   std::string_view("form"),    std::string_view("frame"),    std::string_view("frameset"),
-        std::string_view("h1"),         std::string_view("h2"),       std::string_view("h3"),      std::string_view("h4"),       std::string_view("h5"),
-        std::string_view("h6"),         std::string_view("head"),     std::string_view("header"),  std::string_view("hr"),       std::string_view("html"),
-        std::string_view("iframe"),     std::string_view("legend"),   std::string_view("li"),      std::string_view("link"),     std::string_view("main"),
-        std::string_view("menu"),       std::string_view("menuitem"), std::string_view("nav"),     std::string_view("noframes"), std::string_view("ol"),
-        std::string_view("optgroup"),   std::string_view("option"),   std::string_view("p"),       std::string_view("param"),    std::string_view("search"),
-        std::string_view("section"),    std::string_view("summary"),  std::string_view("table"),   std::string_view("tbody"),    std::string_view("td"),
-        std::string_view("tfoot"),      std::string_view("th"),       std::string_view("thead"),   std::string_view("title"),    std::string_view("tr"),
-        std::string_view("track"),      std::string_view("ul")};
+        std::string_view("address"),  std::string_view("article"),
+        std::string_view("aside"),    std::string_view("base"),
+        std::string_view("basefont"), std::string_view("blockquote"),
+        std::string_view("body"),     std::string_view("caption"),
+        std::string_view("center"),   std::string_view("col"),
+        std::string_view("colgroup"), std::string_view("dd"),
+        std::string_view("details"),  std::string_view("dialog"),
+        std::string_view("dir"),      std::string_view("div"),
+        std::string_view("dl"),       std::string_view("dt"),
+        std::string_view("fieldset"), std::string_view("figcaption"),
+        std::string_view("figure"),   std::string_view("footer"),
+        std::string_view("form"),     std::string_view("frame"),
+        std::string_view("frameset"), std::string_view("h1"),
+        std::string_view("h2"),       std::string_view("h3"),
+        std::string_view("h4"),       std::string_view("h5"),
+        std::string_view("h6"),       std::string_view("head"),
+        std::string_view("header"),   std::string_view("hr"),
+        std::string_view("html"),     std::string_view("iframe"),
+        std::string_view("legend"),   std::string_view("li"),
+        std::string_view("link"),     std::string_view("main"),
+        std::string_view("menu"),     std::string_view("menuitem"),
+        std::string_view("nav"),      std::string_view("noframes"),
+        std::string_view("ol"),       std::string_view("optgroup"),
+        std::string_view("option"),   std::string_view("p"),
+        std::string_view("param"),    std::string_view("search"),
+        std::string_view("section"),  std::string_view("summary"),
+        std::string_view("table"),    std::string_view("tbody"),
+        std::string_view("td"),       std::string_view("tfoot"),
+        std::string_view("th"),       std::string_view("thead"),
+        std::string_view("title"),    std::string_view("tr"),
+        std::string_view("track"),    std::string_view("ul")};
 
     if (block_type == 0) {
       bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
@@ -4769,7 +4816,8 @@ class BlockParser {
       }
 
       if (tag_end > tag_start) {
-        std::string_view tag_name_sv = trimmed.substr(tag_start, tag_end - tag_start);
+        std::string_view tag_name_sv =
+            trimmed.substr(tag_start, tag_end - tag_start);
 
         for (auto t : type6_tags) {
           if (detail::StartsWithInsensitive(tag_name_sv, t) &&
@@ -4985,7 +5033,7 @@ class BlockParser {
     return true;
   }
 
-  bool TryParseBlockQuote(std::pmr::vector<BlockNode> &blocks) {
+  bool TryParseBlockQuote(std::pmr::vector<BlockNode>& blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
@@ -5168,7 +5216,7 @@ class BlockParser {
     return true;
   }
 
-  bool TryParseList(std::pmr::vector<BlockNode> &blocks) {
+  bool TryParseList(std::pmr::vector<BlockNode>& blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent >= 4) [[unlikely]]
@@ -5634,7 +5682,8 @@ class BlockParser {
           // Transfer nested doc to parent's pools and get IDs
           item.children = TransferFromNestedDoc(item_doc);
 
-          // Promote link references from nested document to parent (sorted merge)
+          // Promote link references from nested document to parent (sorted
+          // merge)
           if (parent_link_refs_) {
             for (const auto& [label, dest_title] : item_doc.link_references) {
               auto it = std::lower_bound(parent_link_refs_->begin(),
@@ -5666,7 +5715,7 @@ class BlockParser {
     return true;
   }
 
-  bool TryParseIndentedCodeBlock(std::pmr::vector<BlockNode> &blocks) {
+  bool TryParseIndentedCodeBlock(std::pmr::vector<BlockNode>& blocks) {
     std::string_view line = CurrentLine();
     int indent = detail::CountIndent(line);
     if (indent < 4) [[unlikely]]
@@ -5854,7 +5903,8 @@ class BlockParser {
         if (trimmed.starts_with("<")) {
           // Type 1: script, pre, style, textarea
           static constexpr std::array type1_tags = {
-              std::string_view("<script"), std::string_view("<pre"), std::string_view("<style"), std::string_view("<textarea")};
+              std::string_view("<script"), std::string_view("<pre"),
+              std::string_view("<style"), std::string_view("<textarea")};
           for (auto tag : type1_tags) {
             if (detail::StartsWithInsensitive(trimmed, tag) &&
                 (trimmed.size() == tag.size() || trimmed[tag.size()] == ' ' ||
@@ -5872,19 +5922,37 @@ class BlockParser {
           }
           // Type 6: block-level tags
           static constexpr std::array type6_tags = {
-              std::string_view("address"),    std::string_view("article"),  std::string_view("aside"),   std::string_view("base"),     std::string_view("basefont"),
-              std::string_view("blockquote"), std::string_view("body"),     std::string_view("caption"), std::string_view("center"),   std::string_view("col"),
-              std::string_view("colgroup"),   std::string_view("dd"),       std::string_view("details"), std::string_view("dialog"),   std::string_view("dir"),
-              std::string_view("div"),        std::string_view("dl"),       std::string_view("dt"),      std::string_view("fieldset"), std::string_view("figcaption"),
-              std::string_view("figure"),     std::string_view("footer"),   std::string_view("form"),    std::string_view("frame"),    std::string_view("frameset"),
-              std::string_view("h1"),         std::string_view("h2"),       std::string_view("h3"),      std::string_view("h4"),       std::string_view("h5"),
-              std::string_view("h6"),         std::string_view("head"),     std::string_view("header"),  std::string_view("hr"),       std::string_view("html"),
-              std::string_view("iframe"),     std::string_view("legend"),   std::string_view("li"),      std::string_view("link"),     std::string_view("main"),
-              std::string_view("menu"),       std::string_view("menuitem"), std::string_view("nav"),     std::string_view("noframes"), std::string_view("ol"),
-              std::string_view("optgroup"),   std::string_view("option"),   std::string_view("p"),       std::string_view("param"),    std::string_view("search"),
-              std::string_view("section"),    std::string_view("summary"),  std::string_view("table"),   std::string_view("tbody"),    std::string_view("td"),
-              std::string_view("tfoot"),      std::string_view("th"),       std::string_view("thead"),   std::string_view("title"),    std::string_view("tr"),
-              std::string_view("track"),      std::string_view("ul")};
+              std::string_view("address"),  std::string_view("article"),
+              std::string_view("aside"),    std::string_view("base"),
+              std::string_view("basefont"), std::string_view("blockquote"),
+              std::string_view("body"),     std::string_view("caption"),
+              std::string_view("center"),   std::string_view("col"),
+              std::string_view("colgroup"), std::string_view("dd"),
+              std::string_view("details"),  std::string_view("dialog"),
+              std::string_view("dir"),      std::string_view("div"),
+              std::string_view("dl"),       std::string_view("dt"),
+              std::string_view("fieldset"), std::string_view("figcaption"),
+              std::string_view("figure"),   std::string_view("footer"),
+              std::string_view("form"),     std::string_view("frame"),
+              std::string_view("frameset"), std::string_view("h1"),
+              std::string_view("h2"),       std::string_view("h3"),
+              std::string_view("h4"),       std::string_view("h5"),
+              std::string_view("h6"),       std::string_view("head"),
+              std::string_view("header"),   std::string_view("hr"),
+              std::string_view("html"),     std::string_view("iframe"),
+              std::string_view("legend"),   std::string_view("li"),
+              std::string_view("link"),     std::string_view("main"),
+              std::string_view("menu"),     std::string_view("menuitem"),
+              std::string_view("nav"),      std::string_view("noframes"),
+              std::string_view("ol"),       std::string_view("optgroup"),
+              std::string_view("option"),   std::string_view("p"),
+              std::string_view("param"),    std::string_view("search"),
+              std::string_view("section"),  std::string_view("summary"),
+              std::string_view("table"),    std::string_view("tbody"),
+              std::string_view("td"),       std::string_view("tfoot"),
+              std::string_view("th"),       std::string_view("thead"),
+              std::string_view("title"),    std::string_view("tr"),
+              std::string_view("track"),    std::string_view("ul")};
           bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
           size_t tag_start = is_closing ? 2 : 1;
           size_t tag_end = tag_start;
@@ -5894,7 +5962,8 @@ class BlockParser {
             ++tag_end;
           }
           if (tag_end > tag_start) {
-            std::string_view tag_name_sv = trimmed.substr(tag_start, tag_end - tag_start);
+            std::string_view tag_name_sv =
+                trimmed.substr(tag_start, tag_end - tag_start);
             for (auto t : type6_tags) {
               if (detail::StartsWithInsensitive(tag_name_sv, t) &&
                   tag_name_sv.size() == t.size()) {
@@ -6163,23 +6232,23 @@ class HtmlRenderer {
               out += "</strong>";
             } else if constexpr (std::is_same_v<T, Link>) {
               std::pmr::string escaped_dest = detail::EscapeHtml(n.destination);
-              std::string title_attr = n.title.empty()
-                                           ? ""
-                                           : std::format(" title=\"{}\"",
-                                                         detail::EscapeHtml(n.title));
+              std::string title_attr =
+                  n.title.empty() ? ""
+                                  : std::format(" title=\"{}\"",
+                                                detail::EscapeHtml(n.title));
               out += std::format("<a href=\"{}\"{}>", escaped_dest, title_attr);
               RenderInlines(n.children, out);
               out += "</a>";
             } else if constexpr (std::is_same_v<T, Image>) {
               std::pmr::string escaped_dest = detail::EscapeHtml(n.destination);
               std::pmr::string escaped_alt = detail::EscapeHtml(n.alt_text);
-              std::string title_attr = n.title.empty()
-                                           ? ""
-                                           : std::format(" title=\"{}\"",
-                                                         detail::EscapeHtml(n.title));
-               out += std::format("<img src=\"{}\" alt=\"{}\"{} />", escaped_dest,
-                                  escaped_alt, title_attr);
-             } else if constexpr (std::is_same_v<T, HtmlInline>) {
+              std::string title_attr =
+                  n.title.empty() ? ""
+                                  : std::format(" title=\"{}\"",
+                                                detail::EscapeHtml(n.title));
+              out += std::format("<img src=\"{}\" alt=\"{}\"{} />",
+                                 escaped_dest, escaped_alt, title_attr);
+            } else if constexpr (std::is_same_v<T, HtmlInline>) {
               out += n.content;
             }
           },
@@ -6279,8 +6348,9 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
               result += p + "ThematicBreak\n";
             } else if constexpr (std::is_same_v<T, CodeBlock>) {
               result += std::format("{}CodeBlock{}", p,
-                                    n.info_string.empty() ? ""
-                                                          : std::format(" ({})", n.info_string));
+                                    n.info_string.empty()
+                                        ? ""
+                                        : std::format(" ({})", n.info_string));
               result += "\n";
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
               result += std::format("{}HtmlBlock (type {})\n", p, n.block_type);
@@ -6320,8 +6390,9 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
               result += p + "ThematicBreak\n";
             } else if constexpr (std::is_same_v<T, CodeBlock>) {
               result += std::format("{}CodeBlock{}", p,
-                                    n.info_string.empty() ? ""
-                                                          : std::format(" ({})", n.info_string));
+                                    n.info_string.empty()
+                                        ? ""
+                                        : std::format(" ({})", n.info_string));
               result += "\n";
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
               result += std::format("{}HtmlBlock (type {})\n", p, n.block_type);

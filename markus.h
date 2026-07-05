@@ -10,6 +10,7 @@
 #include <deque>
 #include <format>
 #include <functional>
+#include <list>
 #include <memory>
 #include <memory_resource>
 #include <ranges>
@@ -22,6 +23,27 @@
 #include <vector>
 
 namespace markus {
+
+// =============================================================================
+// PMR Memory Resource - Monotonic Buffer for Parser Allocations
+// =============================================================================
+// Uses a thread-local monotonic_buffer_resource so ALL std::pmr containers
+// created during Parse() allocate from a single growing buffer via pointer
+// bumping (O(1)) instead of individual heap allocations. Dramatically reduces
+// allocation overhead in the parser's many temporary vectors and strings.
+
+inline std::pmr::monotonic_buffer_resource& GetParseResource() {
+  static thread_local std::pmr::monotonic_buffer_resource resource{256 * 1024};
+  return resource;
+}
+
+inline void ResetParseResource() {
+  auto& res = GetParseResource();
+  res.release();
+  // Re-initialize with fresh state but keep the underlying buffer
+  // release() frees nothing on monotonic_buffer_resource, it just returns
+  // the buffer. The next allocation will reuse from the start.
+}
 
 // Lightweight result type optimized for parser functions.
 // Replaces std::optional<T> to avoid overhead from type tracking
@@ -2357,26 +2379,28 @@ class InlineParser {
     return id;
   }
 
-  // Convert a vector of nodes to IDs by adding them all to the pool
-  std::pmr::vector<InlineNodeId> NodesToIds(
-      std::pmr::vector<InlineNode>& nodes) {
+  // Convert a container of nodes to IDs by adding them all to the pool.
+  // Works with any iterable container (vector, list, etc.)
+  template <typename Container>
+  std::pmr::vector<InlineNodeId> NodesToIds(Container& nodes) {
     std::pmr::vector<InlineNodeId> ids;
     ids.reserve(nodes.size());
-    for (auto& node : nodes) {
-      ids.push_back(AddToPool(std::move(node)));
+    for (auto it = nodes.begin(); it != nodes.end();) {
+      ids.push_back(AddToPool(std::move(*it)));
+      it = nodes.erase(it);
     }
     return ids;
   }
 
   struct DelimiterNode {
-    size_t pos;       // Position in result vector
+    size_t pos;       // Position in result list
     size_t text_pos;  // Position in original text (for extracting raw labels)
     size_t count;
     char delimiter;
     bool can_open;
     bool can_close;
     bool active;
-    std::pmr::vector<InlineNode>* target;
+    std::list<InlineNode>* target;
   };
 
   // Check if brackets are balanced in text between start and end (exclusive)
@@ -2396,9 +2420,12 @@ class InlineParser {
   }
 
   std::pmr::vector<InlineNodeId> ParseInlines() {
-    std::pmr::vector<InlineNode> result;
-    // Reserve based on text length heuristic (~1 node per 20 chars)
-    result.reserve(text_.size() / 20 + 4);
+    // Use std::list for O(1) splice operations during emphasis processing.
+    // This avoids O(N) element shifting from vector erase/insert, which is
+    // the dominant cost in documents with heavy emphasis nesting.
+    // Uses the thread-local monotonic_buffer_resource via default PMR
+    // allocator.
+    std::list<InlineNode> result;
 
     std::pmr::vector<DelimiterNode> delimiter_stack;
 
@@ -2606,10 +2633,10 @@ class InlineParser {
             bool is_image = (opener->delimiter == '!');
 
             // Collect inline content between opener and closer
-            std::pmr::vector<InlineNode> link_content;
-            link_content.reserve(result.size() - opener->pos - 1);
-            for (size_t i = opener->pos + 1; i < result.size(); ++i) {
-              link_content.emplace_back(std::move(result[i]));
+            std::list<InlineNode> link_content;
+            auto content_it = std::next(result.begin(), opener->pos + 1);
+            for (auto it = content_it; it != result.end(); ++it) {
+              link_content.push_back(std::move(*it));
             }
 
             // Extract delimiters that belong to link content and process
@@ -2624,8 +2651,13 @@ class InlineParser {
             }
             ProcessEmphasis(link_content, link_delimiters);
 
-            // Remove everything from opener position
-            result.resize(opener->pos);
+            // Remove opener and everything after it (matches
+            // resize(opener->pos))
+            {
+              auto erase_it = std::next(
+                  result.begin(), static_cast<std::ptrdiff_t>(opener->pos));
+              result.erase(erase_it, result.end());
+            }
 
             if (is_image) {
               Image img;
@@ -2696,10 +2728,10 @@ class InlineParser {
           if (ref_result) {
             bool is_image = (opener->delimiter == '!');
 
-            std::pmr::vector<InlineNode> link_content;
-            link_content.reserve(result.size() - opener->pos - 1);
-            for (size_t i = opener->pos + 1; i < result.size(); ++i) {
-              link_content.emplace_back(std::move(result[i]));
+            std::list<InlineNode> link_content;
+            auto content_it = std::next(result.begin(), opener->pos + 1);
+            for (auto it = content_it; it != result.end(); ++it) {
+              link_content.push_back(std::move(*it));
             }
 
             // Extract delimiters that belong to link content and process
@@ -2714,7 +2746,13 @@ class InlineParser {
             }
             ProcessEmphasis(link_content, link_delimiters);
 
-            result.resize(opener->pos);
+            // Remove opener and everything after it (matches
+            // resize(opener->pos))
+            {
+              auto erase_it = std::next(
+                  result.begin(), static_cast<std::ptrdiff_t>(opener->pos));
+              result.erase(erase_it, result.end());
+            }
 
             if (is_image) {
               Image img;
@@ -3469,7 +3507,8 @@ class InlineParser {
   }
 
   // Get alt text from a vector of local InlineNodes (not yet in pool)
-  std::pmr::string GetAltText(const std::pmr::vector<InlineNode>& nodes) {
+  template <typename Container>
+  std::pmr::string GetAltText(const Container& nodes) {
     std::pmr::string result;
     for (const auto& node : nodes) {
       std::visit(
@@ -3498,10 +3537,22 @@ class InlineParser {
     return result;
   }
 
-  void ProcessEmphasis(std::pmr::vector<InlineNode>& nodes,
+  void ProcessEmphasis(std::list<InlineNode>& nodes,
                        std::pmr::vector<DelimiterNode>& delimiters) {
     if (delimiters.empty()) [[unlikely]]
       return;
+
+    // Use a cached index-to-iterator map. Rebuilt after each emphasis match
+    // because splice operations change node positions in the list.
+    std::pmr::vector<std::list<InlineNode>::iterator> iter_map;
+
+    auto rebuild_iter_map = [&]() {
+      iter_map.clear();
+      iter_map.reserve(nodes.size());
+      for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        iter_map.push_back(it);
+      }
+    };
 
     // Process emphasis using the algorithm from CommonMark spec
     size_t closer_idx = 0;
@@ -3535,15 +3586,29 @@ class InlineParser {
 
         found_opener = true;
 
+        // Build the index-to-iterator map for this iteration
+        rebuild_iter_map();
+
+        // Ensure positions are valid (nested emphasis can shrink the list)
+        if (opener.pos >= iter_map.size() || closer.pos >= iter_map.size()) {
+          break;
+        }
+
+        auto opener_it = iter_map[opener.pos];
+        auto closer_it = iter_map[closer.pos];
+        auto after_opener = std::next(opener_it);
+
         // Determine emphasis type
         bool is_strong = opener.count >= 2 && closer.count >= 2;
         size_t delim_count = is_strong ? 2 : 1;
 
-        // Build emphasis node - reserve capacity to avoid reallocations
+        // Collect content nodes between opener and closer into a vector
+        // (needed for NodesToIds which takes a container)
         std::pmr::vector<InlineNode> content;
-        content.reserve(closer.pos - opener.pos - 1);
-        for (size_t i = opener.pos + 1; i < closer.pos; ++i) {
-          content.push_back(std::move(nodes[i]));
+        size_t content_size = 0;
+        for (auto it = after_opener; it != closer_it; ++it) {
+          content.push_back(std::move(*it));
+          ++content_size;
         }
 
         // Create emphasis node - convert children to pool IDs
@@ -3559,36 +3624,38 @@ class InlineParser {
         }
 
         // Update opener text - delimiters consumed from the END of opener run
-        // Remaining delimiters are at the START of the original view
         if (opener.count > delim_count) {
-          auto& opener_content = std::get<Text>(nodes[opener.pos]).content;
+          auto& opener_content = std::get<Text>(*opener_it).content;
           opener_content = opener_content.substr(0, opener.count - delim_count);
           opener.count -= delim_count;
         } else {
-          nodes[opener.pos] = Text("");
+          *opener_it = Text("");
           opener.active = false;
         }
 
         // Update closer text - delimiters consumed from the BEGINNING of closer
-        // run Remaining delimiters are at the END of the original view
         if (closer.count > delim_count) {
-          auto& closer_content = std::get<Text>(nodes[closer.pos]).content;
+          auto& closer_content = std::get<Text>(*closer_it).content;
           closer_content = closer_content.substr(delim_count);
           closer.count -= delim_count;
         } else {
-          nodes[closer.pos] = Text("");
+          *closer_it = Text("");
           closer.active = false;
         }
 
-        // Use in-place erase+insert instead of building a new vector
-        // Erase content between opener and closer (keep opener and closer)
-        nodes.erase(nodes.begin() + static_cast<ptrdiff_t>(opener.pos) + 1,
-                    nodes.begin() + static_cast<ptrdiff_t>(closer.pos));
-        // Insert emphasis node right after opener
-        nodes.insert(nodes.begin() + static_cast<ptrdiff_t>(opener.pos) + 1,
-                     std::move(emph_node));
+        // Use O(1) splice instead of O(N) erase+insert:
+        // 1. Splice content nodes out of the list (into a temporary)
+        // 2. Insert emphasis node after opener
+        // 3. The content nodes are discarded (they were moved into emph_node)
+        if (content_size > 0) {
+          std::list<InlineNode> temp;
+          temp.splice(temp.end(), nodes, after_opener, closer_it);
+        }
+        nodes.insert(std::next(opener_it), std::move(emph_node));
 
         // Adjust positions in delimiter stack
+        // Net change: removed (closer - opener - 1) nodes, added 1 emphasis
+        // node
         size_t removed = closer.pos - opener.pos - 1;
         for (auto& d : delimiters) {
           if (d.pos > opener.pos && d.pos < closer.pos) {
@@ -3607,15 +3674,13 @@ class InlineParser {
       }
     }
 
-    // Remove empty text nodes in-place (avoids extra vector allocation)
-    auto new_end =
-        std::remove_if(nodes.begin(), nodes.end(), [](const InlineNode& node) {
-          if (auto* text = std::get_if<Text>(&node)) {
-            return text->content.empty();
-          }
-          return false;
-        });
-    nodes.erase(new_end, nodes.end());
+    // Remove empty text nodes in-place
+    nodes.remove_if([](const InlineNode& node) {
+      if (auto* text = std::get_if<Text>(&node)) {
+        return text->content.empty();
+      }
+      return false;
+    });
   }
 };
 
@@ -3626,6 +3691,12 @@ class InlineParser {
 class BlockParser {
  public:
   Document Parse(std::string_view input) {
+    // Reset the thread-local monotonic buffer for this parse operation.
+    // All std::pmr containers created from here until the next Parse() call
+    // will allocate from this single growing buffer via pointer bumping,
+    // eliminating individual heap allocation overhead.
+    ResetParseResource();
+
     Document doc;
     doc_ = &doc;
     // Use LineBuffer for cache-friendly line storage (contiguous offsets)

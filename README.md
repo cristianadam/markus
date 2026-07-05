@@ -4,11 +4,11 @@ Vibe coded single-header C++20 Markdown parser that converts Markdown
 to HTML. Implements the [CommonMark specification](https://spec.commonmark.org/) 
 with zero external dependencies.
 
-_Vibe coded with Claude Opus 4.5_
+_Vibe coded with Claude Opus 4.5 and Opencode (qwen 3.6 35b)_
 
 > [!CAUTION]
 > DO NOT USE IN PRODUCTION. This is completely vibe coded and has not undergone
-any reviews for memory safety. Its performance is also 2-3x slower than cmark.
+any reviews for memory safety.
 
 ## Features
 
@@ -192,6 +192,20 @@ Markus is optimized for speed through several techniques:
 - **String Views**: Avoids unnecessary string copies using `std::string_view`
 - **Lookup Tables**: O(1) character classification for punctuation, whitespace, and HTML escaping
 - **Compact Node Storage**: AST nodes use 32-bit IDs instead of pointers
+
+### Benchmarks
+
+Benchmarks compare Markus against [cmark](https://github.com/commonmark/cmark) (the CommonMark reference implementation) and [md4c](https://github.com/mity/md4c) on GitHub Actions runners. Results are averaged over multiple runs across Ubuntu, macOS, and Windows.
+
+| Platform | CPU | Markus vs Cmark | Markus vs Md4c |
+|----------|-----|-----------------|----------------|
+| Ubuntu (Linux) | 4x 3.5 GHz | 1.76x slower | 2.67x slower |
+| macOS | 3x Apple Silicon | 1.26x slower | 2.83x slower |
+| Windows | 4x 2.4 GHz | 1.53x slower | 3.46x slower |
+
+**Average: ~1.5x slower than cmark, ~2.7x slower than md4c.**
+
+Markus performs competitively on simple inputs and in some cases approaches cmark's speed. The gap is most noticeable on nested structures (block quotes, lists), where Markus's pure C++ recursive descent parsing has more overhead than cmark's optimized C implementation.
 
 ## Unicode Support
 

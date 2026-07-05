@@ -4,6 +4,12 @@
 #include <sstream>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/wait.h>
+#endif
+
 #include "gtest/gtest.h"
 #include "markus.h"
 
@@ -53,19 +59,26 @@ std::string RunPythonTest(int test_number, const std::string& main_path,
     output += line;
   }
 
+  int exit_code;
+#ifdef _WIN32
+  exit_code = _pclose(pipe);
+#else
   int status = pclose(pipe);
   if (WIFEXITED(status)) {
-    int exit_code = WEXITSTATUS(status);
-    if (exit_code == 0) {
-      return "PASS";
-    } else if (exit_code == 124) {
-      return "TIMEOUT";
-    }
-    std::ostringstream err;
-    err << "EXIT_CODE=" << exit_code << "\n" << output;
-    return err.str();
+    exit_code = WEXITSTATUS(status);
+  } else {
+    return "ERROR: pclose failed";
   }
-  return "ERROR: pclose failed";
+#endif
+
+  if (exit_code == 0) {
+    return "PASS";
+  } else if (exit_code == 124) {
+    return "TIMEOUT";
+  }
+  std::ostringstream err;
+  err << "EXIT_CODE=" << exit_code << "\n" << output;
+  return err.str();
 }
 
 // Generate a TEST() for each spec example (1-655)

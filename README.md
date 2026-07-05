@@ -102,14 +102,23 @@ int main() {
 
 ## Building
 
-### With Bazel
+### With CMake
 
 ```bash
-# Build the library and CLI tool
-bazel build main
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build
+```
 
-# Run the CLI tool
-echo "# Hello" | bazel-bin/main
+Run tests:
+
+```bash
+ctest --test-dir build
+```
+
+Run the CLI tool:
+
+```bash
+echo "# Hello" | ./build/main
 ```
 
 ### With Other Build Systems
@@ -131,11 +140,11 @@ The included `main.cc` provides a simple CLI for converting Markdown:
 
 ```bash
 # Convert Markdown from stdin to HTML
-echo "**bold** text" | bazel-bin/main
+echo "**bold** text" | ./build/main
 # Output: <p><strong>bold</strong> text</p>
 
 # Print the AST instead of HTML
-echo "# Title" | bazel-bin/main --ast
+echo "# Title" | ./build/main --ast
 # Output:
 # Document
 #   Heading (level 1)

@@ -208,13 +208,13 @@ Benchmarks compare Markus against [cmark](https://github.com/commonmark/cmark) (
 
 | Platform | CPU | Markus vs Cmark | Markus vs Md4c |
 |----------|-----|-----------------|----------------|
-| Ubuntu (Linux) | 4x 3.5 GHz | 1.76x slower | 2.67x slower |
-| macOS | 3x Apple Silicon | 1.26x slower | 2.83x slower |
-| Windows | 4x 2.4 GHz | 1.53x slower | 3.46x slower |
+| Ubuntu (Linux) | 4x 3.5 GHz | 1.44x slower | 2.33x slower |
+| macOS | 4x Apple M1 | faster | 2.11x slower |
+| Windows | 4x 2.4 GHz | 1.03x slower | 2.51x slower |
 
-**Average: ~1.5x slower than cmark, ~2.7x slower than md4c.**
+**Average: ~1.1x vs cmark, ~2.3x slower than md4c.**
 
-Markus performs competitively on simple inputs and in some cases approaches cmark's speed. The gap is most noticeable on nested structures (block quotes, lists), where Markus's pure C++ recursive descent parsing has more overhead than cmark's optimized C implementation.
+Markus is within ~1.5x of cmark across platforms and faster than cmark on macOS, though still roughly 2-3x behind md4c. The gap vs cmark is most noticeable on nested structures (block quotes, lists), where recursive descent parsing has more overhead than cmark's optimized C implementation.
 
 ## Unicode Support
 

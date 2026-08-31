@@ -7,6 +7,7 @@
 #include <cctype>
 #include <charconv>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <format>
 #include <functional>
@@ -442,74 +443,63 @@ inline constexpr auto kEscapeLens = MakeEscapeLens();
 // =============================================================================
 
 // Writes escaped HTML directly to output buffer - eliminates temp string
-// allocation C++20: 8-wide unrolled scan for significantly better throughput
+// allocation. Uses uint64_t loads for 8-wide scanning.
 inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
-  size_t i = 0;
   const size_t len = text.size();
+  if (len == 0) return;
+  const char* data = text.data();
+  size_t i = 0;
 
   while (i < len) {
     size_t start = i;
-    // 8-wide unrolled scan for escape characters
-    while (i + 7 < len) {
-      uint8_t e0 = kEscapeTableV2[static_cast<unsigned char>(text[i])];
-      uint8_t e1 = kEscapeTableV2[static_cast<unsigned char>(text[i + 1])];
-      uint8_t e2 = kEscapeTableV2[static_cast<unsigned char>(text[i + 2])];
-      uint8_t e3 = kEscapeTableV2[static_cast<unsigned char>(text[i + 3])];
-      if (e0 || e1 || e2 || e3) {
-        if (e0) break;
-        if (e1) {
-          ++i;
-          break;
-        }
-        i += 2;
-        break;
+    // Find next special char using 8-wide uint64_t scan
+    while (i + 8 <= len) {
+      uint64_t chunk;
+      std::memcpy(&chunk, data + i, 8);
+      // Build a bitmask of which bytes are special
+      uint64_t mask = 0;
+      if (kEscapeTableV2[chunk & 0xFF]) mask |= 1;
+      if (kEscapeTableV2[(chunk >> 8) & 0xFF]) mask |= 2;
+      if (kEscapeTableV2[(chunk >> 16) & 0xFF]) mask |= 4;
+      if (kEscapeTableV2[(chunk >> 24) & 0xFF]) mask |= 8;
+      if (kEscapeTableV2[(chunk >> 32) & 0xFF]) mask |= 16;
+      if (kEscapeTableV2[(chunk >> 40) & 0xFF]) mask |= 32;
+      if (kEscapeTableV2[(chunk >> 48) & 0xFF]) mask |= 64;
+      if (kEscapeTableV2[(chunk >> 56) & 0xFF]) mask |= 128;
+      if (mask == 0) {
+        i += 8;
+        continue;
       }
-      uint8_t e4 = kEscapeTableV2[static_cast<unsigned char>(text[i + 4])];
-      uint8_t e5 = kEscapeTableV2[static_cast<unsigned char>(text[i + 5])];
-      uint8_t e6 = kEscapeTableV2[static_cast<unsigned char>(text[i + 6])];
-      uint8_t e7 = kEscapeTableV2[static_cast<unsigned char>(text[i + 7])];
-      if (e4 || e5 || e6 || e7) {
-        if (e4) {
-          i += 4;
-          break;
-        }
-        if (e5) {
-          i += 5;
-          break;
-        }
-        i += 6;
-        break;
-      }
-      i += 8;
+      // Find which byte in this group is special
+      if (mask & 1) break;
+      if (mask & 2) { i += 1; break; }
+      if (mask & 4) { i += 2; break; }
+      if (mask & 8) { i += 3; break; }
+      if (mask & 16) { i += 4; break; }
+      if (mask & 32) { i += 5; break; }
+      if (mask & 64) { i += 6; break; }
+      i += 7;
+      break;
     }
-    // Scalar fallback for remaining characters
+    // Scalar fallback for remaining < 8 bytes
     while (i < len) {
-      uint8_t e = kEscapeTableV2[static_cast<unsigned char>(text[i])];
-      if (e != 0) break;
+      if (kEscapeTableV2[static_cast<unsigned char>(data[i])]) break;
       ++i;
     }
 
     // Batch copy safe span
     if (i > start) {
-      out.append(text.data() + start, i - start);
+      out.append(data + start, i - start);
     }
 
     // Handle escaped character
     if (i < len) {
-      uint8_t e = kEscapeTableV2[static_cast<unsigned char>(text[i])];
+      uint8_t e = kEscapeTableV2[static_cast<unsigned char>(data[i])];
       switch (e) {
-        case 1:
-          out.append("&amp;");
-          break;
-        case 2:
-          out.append("&lt;");
-          break;
-        case 3:
-          out.append("&gt;");
-          break;
-        case 4:
-          out.append("&quot;");
-          break;
+        case 1: out.append("&amp;"); break;
+        case 2: out.append("&lt;"); break;
+        case 3: out.append("&gt;"); break;
+        case 4: out.append("&quot;"); break;
       }
       ++i;
     }
@@ -1449,27 +1439,15 @@ inline int CountIndent(std::string_view line, int* consumed_chars = nullptr) {
 
 // Remove N spaces of indentation (handling tabs)
 // Optimized with fast path for common case of n spaces at start
-inline std::pmr::string RemoveIndent(std::string_view line, int n) {
-  if (n <= 0) {
-    return std::pmr::string(line);
-  }
-
-  // Fast path: check if we have n spaces at the start (no tabs)
-  size_t space_count = 0;
-  while (space_count < line.size() && line[space_count] == ' ') {
-    ++space_count;
-  }
-  if (space_count >= static_cast<size_t>(n)) {
-    // Common case: just skip n spaces, return rest
-    return std::pmr::string(line.substr(n));
-  }
-
-  // Slow path: handle tabs
-  std::pmr::string result;
-  int removed = 0;
+// Appends `line` with up to `n` columns of leading whitespace removed into
+// `out`. Appending directly lets callers avoid materializing an intermediate
+// string when the result is immediately consumed.
+inline void AppendRemoveIndent(std::string_view line, int n,
+                               std::pmr::string& out) {
   size_t i = 0;
+  int removed = 0;
 
-  while (i < line.size() && removed < n) {
+  while (n > 0 && i < line.size() && removed < n) {
     if (line[i] == ' ') {
       ++removed;
       ++i;
@@ -1479,26 +1457,31 @@ inline std::pmr::string RemoveIndent(std::string_view line, int n) {
         removed += tab_width;
         ++i;
       } else {
-        // Partial tab - add remaining spaces
+        // Partial tab - add spaces for the portion of the tab we didn't use
         int remaining = n - removed;
         removed = n;
         ++i;
-        // Add spaces for the portion of the tab we didn't use
         int leftover = tab_width - remaining;
-        result.append(leftover, ' ');
+        out.append(leftover, ' ');
       }
     } else {
       break;
     }
   }
 
-  result += line.substr(i);
+  out.append(line.data() + i, line.size() - i);
+}
+
+inline std::pmr::string RemoveIndent(std::string_view line, int n) {
+  std::pmr::string result;
+  AppendRemoveIndent(line, n, result);
   return result;
 }
 
-// Remove blockquote prefix (> and optional following space) with proper tab
-// handling Returns the remaining content with proper indentation preserved
-inline std::pmr::string RemoveBlockQuotePrefix(std::string_view line) {
+// Append blockquote content (after > and optional space) directly into out,
+// with proper tab expansion. Returns true if the line had a > prefix, false
+// otherwise (and out is untouched). Fast path: bulk append when no tabs.
+inline bool AppendBlockQuoteContent(std::string_view line, std::pmr::string& out) {
   size_t i = 0;
   int column = 0;
 
@@ -1522,7 +1505,7 @@ inline std::pmr::string RemoveBlockQuotePrefix(std::string_view line) {
 
   // Check for >
   if (i >= line.size() || line[i] != '>') {
-    return std::pmr::string(line);
+    return false;
   }
   ++i;
   ++column;
@@ -1535,16 +1518,13 @@ inline std::pmr::string RemoveBlockQuotePrefix(std::string_view line) {
       content_start_column = column + 1;
     } else if (line[i] == '\t') {
       // Tab after > - consume part of the tab as the "optional space"
-      // The remaining virtual spaces stay as indentation
       int tab_end = (column / 4 + 1) * 4;
       int spaces_from_tab = tab_end - column;
-      // Consume one space's worth, rest becomes leading indent
       ++i;
       content_start_column = tab_end;
-      // The remaining (spaces_from_tab - 1) spaces become content indent
-      std::pmr::string result;
+      // Append remaining (spaces_from_tab - 1) leading spaces
       for (int j = 0; j < spaces_from_tab - 1; ++j) {
-        result += ' ';
+        out += ' ';
       }
       // Expand remaining tabs in the content
       int col = content_start_column;
@@ -1552,37 +1532,43 @@ inline std::pmr::string RemoveBlockQuotePrefix(std::string_view line) {
         if (line[i] == '\t') {
           int next_col = (col / 4 + 1) * 4;
           for (int k = 0; k < next_col - col; ++k) {
-            result += ' ';
+            out += ' ';
           }
           col = next_col;
         } else {
-          result += line[i];
+          out += line[i];
           ++col;
         }
         ++i;
       }
-      return result;
+      return true;
     }
   }
 
-  // Expand any remaining tabs in content
-  std::pmr::string result;
+  // Fast path: no tabs — bulk append the rest
+  if (line.find('\t', i) == std::string_view::npos) {
+    out.append(line.data() + i, line.size() - i);
+    return true;
+  }
+
+  // Slow path: expand tabs in content
   int col = content_start_column;
   while (i < line.size()) {
     if (line[i] == '\t') {
       int next_col = (col / 4 + 1) * 4;
       for (int k = 0; k < next_col - col; ++k) {
-        result += ' ';
+        out += ' ';
       }
       col = next_col;
     } else {
-      result += line[i];
+      out += line[i];
       ++col;
     }
     ++i;
   }
-  return result;
+  return true;
 }
+
 
 // Expand tabs to spaces (tab stops every 4 columns)
 // Optimized with fast path and batch copying
@@ -1967,10 +1953,37 @@ inline size_t FindNextSpecialChar(std::string_view text, size_t start) {
 // stores line offsets into a contiguous buffer. Only copies data when
 // null characters need replacement.
 
-class LineBuffer {
- public:
-  explicit LineBuffer(std::string_view input) {
-    if (input.empty()) [[unlikely]] {
+ class LineBuffer {
+  public:
+   LineBuffer() = default;
+
+    explicit LineBuffer(std::string_view input, bool no_nulls = false) {
+       if (input.empty()) [[unlikely]] {
+         return;
+       }
+
+    if (no_nulls) [[unlikely]] {
+      // Fast path for content we built ourselves (guaranteed null-free, e.g.
+      // nested blockquote/list buffers). Build the offsets in a single pass,
+      // skipping the separate null-detection / line-count pass.
+      data_ptr_ = input.data();
+      line_offsets_.reserve(16);
+      size_t line_start = 0;
+      for (size_t i = 0; i < input.size(); ++i) {
+        char c = input[i];
+        if (c == '\n') {
+          line_offsets_.emplace_back(line_start, i - line_start);
+          line_start = i + 1;
+        } else if (c == '\r') {
+          line_offsets_.emplace_back(line_start, i - line_start);
+          if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
+          line_start = i + 1;
+        }
+      }
+      if (input.size() > line_start ||
+          (input.back() == '\n' || input.back() == '\r')) {
+        line_offsets_.emplace_back(line_start, input.size() - line_start);
+      }
       return;
     }
 
@@ -2048,7 +2061,7 @@ class LineBuffer {
   }
 
  private:
-  struct LineOffset {
+   struct LineOffset {
     size_t offset;
     size_t length;
   };
@@ -2379,29 +2392,26 @@ class InlineParser {
     return id;
   }
 
-  // Convert a container of nodes to IDs by adding them all to the pool.
-  // Works with any iterable container (vector, list, etc.)
-  template <typename Container>
-  std::pmr::vector<InlineNodeId> NodesToIds(Container& nodes) {
+  // Convert a vector of nodes to IDs by adding them all to the pool.
+  std::pmr::vector<InlineNodeId> NodesToIds(std::pmr::vector<InlineNode>& nodes) {
     std::pmr::vector<InlineNodeId> ids;
     ids.reserve(nodes.size());
-    for (auto it = nodes.begin(); it != nodes.end();) {
-      ids.push_back(AddToPool(std::move(*it)));
-      it = nodes.erase(it);
+    for (auto& node : nodes) {
+      ids.push_back(AddToPool(std::move(node)));
     }
+    nodes.clear();
     return ids;
   }
 
-  struct DelimiterNode {
-    size_t pos;       // Position in result list
-    size_t text_pos;  // Position in original text (for extracting raw labels)
-    size_t count;
-    char delimiter;
-    bool can_open;
-    bool can_close;
-    bool active;
-    std::list<InlineNode>* target;
-  };
+   struct DelimiterNode {
+      size_t pos;          // Index in result vector
+      size_t text_pos;     // Position in original text (for extracting raw labels)
+      size_t count;
+      char delimiter;
+      bool can_open;
+      bool can_close;
+      bool active;
+    };
 
   // Check if brackets are balanced in text between start and end (exclusive)
   bool AreBracketsBalanced(size_t start, size_t end) {
@@ -2420,12 +2430,10 @@ class InlineParser {
   }
 
   std::pmr::vector<InlineNodeId> ParseInlines() {
-    // Use std::list for O(1) splice operations during emphasis processing.
-    // This avoids O(N) element shifting from vector erase/insert, which is
-    // the dominant cost in documents with heavy emphasis nesting.
-    // Uses the thread-local monotonic_buffer_resource via default PMR
-    // allocator.
-    std::list<InlineNode> result;
+    // Use vector for cache locality - for typical document sizes the O(n)
+    // shift cost is negligible compared to list's pointer-chasing overhead.
+    std::pmr::vector<InlineNode> result;
+    result.reserve(32);
 
     std::pmr::vector<DelimiterNode> delimiter_stack;
 
@@ -2567,13 +2575,14 @@ class InlineParser {
 
         flush_text();
 
-        // Add delimiter to stack
-        delimiter_stack.emplace_back(result.size(), pos_, run_length, c,
-                                     can_open, can_close, true, &result);
-
         // Add the delimiter characters as text - view into input
         result.emplace_back(std::in_place_type<Text>,
                             text_.substr(pos_, run_length));
+
+        // Add delimiter to stack
+        delimiter_stack.emplace_back(result.size() - 1, pos_, run_length, c,
+                                      can_open, can_close, true);
+
         pos_ += run_length;
         continue;
       }
@@ -2584,19 +2593,19 @@ class InlineParser {
         bool is_image = (c == '!');
         flush_text();
 
-        size_t bracket_pos = result.size();
         size_t bracket_text_pos = pos_;  // Position in original text
-        delimiter_stack.emplace_back(bracket_pos, bracket_text_pos, 1,
-                                     is_image ? '!' : '[', true, false, true,
-                                     &result);
 
         if (is_image) {
           result.emplace_back(std::in_place_type<Text>,
                               text_.substr(pos_, 2));  // "!["
+          delimiter_stack.emplace_back(result.size() - 1, bracket_text_pos, 1,
+                                        '!', true, false, true);
           pos_ += 2;
         } else {
           result.emplace_back(std::in_place_type<Text>,
                               text_.substr(pos_, 1));  // "["
+          delimiter_stack.emplace_back(result.size() - 1, bracket_text_pos, 1,
+                                        '[', true, false, true);
           pos_ += 1;
         }
         continue;
@@ -2632,32 +2641,42 @@ class InlineParser {
             // Build the link/image
             bool is_image = (opener->delimiter == '!');
 
-            // Collect inline content between opener and closer
-            std::list<InlineNode> link_content;
-            auto content_it = std::next(result.begin(), opener->pos + 1);
-            for (auto it = content_it; it != result.end(); ++it) {
-              link_content.push_back(std::move(*it));
-            }
+            // Save original result size before extraction (for delimiter filtering)
+            size_t original_result_size = result.size();
 
-            // Extract delimiters that belong to link content and process
-            // emphasis
+            // Extract inline content between opener and end
+            size_t opener_idx = opener->pos;
+            std::pmr::vector<InlineNode> link_content;
+            link_content.reserve(original_result_size - opener_idx - 1);
+            for (size_t i = opener_idx + 1; i < original_result_size; ++i) {
+              link_content.push_back(std::move(result[i]));
+            }
+            result.resize(opener_idx + 1);
+
+            // Extract delimiters that belong to link content and process emphasis
+            size_t content_offset = opener->pos + 1;
             std::pmr::vector<DelimiterNode> link_delimiters;
             for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
-              if (it->pos > opener->pos && it->pos < result.size()) {
+              if (it->pos > opener->pos && it->pos < original_result_size) {
                 DelimiterNode d = *it;
-                d.pos -= (opener->pos + 1);  // Adjust to link_content indices
+                d.pos -= content_offset;  // Adjust to link_content indices
                 link_delimiters.emplace_back(d);
               }
             }
             ProcessEmphasis(link_content, link_delimiters);
 
-            // Remove opener and everything after it (matches
-            // resize(opener->pos))
-            {
-              auto erase_it = std::next(
-                  result.begin(), static_cast<std::ptrdiff_t>(opener->pos));
-              result.erase(erase_it, result.end());
+            // Sync active flags back to main delimiter_stack
+            for (auto& ld : link_delimiters) {
+              for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
+                if (it->pos == ld.pos + content_offset && it->active != ld.active) {
+                  it->active = ld.active;
+                  break;
+                }
+              }
             }
+
+            // Remove opener
+            result.resize(opener_idx);
 
             if (is_image) {
               Image img;
@@ -2728,31 +2747,42 @@ class InlineParser {
           if (ref_result) {
             bool is_image = (opener->delimiter == '!');
 
-            std::list<InlineNode> link_content;
-            auto content_it = std::next(result.begin(), opener->pos + 1);
-            for (auto it = content_it; it != result.end(); ++it) {
-              link_content.push_back(std::move(*it));
-            }
+            // Save original result size before extraction
+            size_t original_result_size = result.size();
 
-            // Extract delimiters that belong to link content and process
-            // emphasis
+            // Extract inline content between opener and end
+            size_t opener_idx = opener->pos;
+            std::pmr::vector<InlineNode> link_content;
+            link_content.reserve(original_result_size - opener_idx - 1);
+            for (size_t i = opener_idx + 1; i < original_result_size; ++i) {
+              link_content.push_back(std::move(result[i]));
+            }
+            result.resize(opener_idx + 1);
+
+            // Extract delimiters that belong to link content and process emphasis
+            size_t content_offset = opener->pos + 1;
             std::pmr::vector<DelimiterNode> link_delimiters;
             for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
-              if (it->pos > opener->pos && it->pos < result.size()) {
+              if (it->pos > opener->pos && it->pos < original_result_size) {
                 DelimiterNode d = *it;
-                d.pos -= (opener->pos + 1);  // Adjust to link_content indices
+                d.pos -= content_offset;  // Adjust to link_content indices
                 link_delimiters.emplace_back(d);
               }
             }
             ProcessEmphasis(link_content, link_delimiters);
 
-            // Remove opener and everything after it (matches
-            // resize(opener->pos))
-            {
-              auto erase_it = std::next(
-                  result.begin(), static_cast<std::ptrdiff_t>(opener->pos));
-              result.erase(erase_it, result.end());
+            // Sync active flags back to main delimiter_stack
+            for (auto& ld : link_delimiters) {
+              for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
+                if (it->pos == ld.pos + content_offset && it->active != ld.active) {
+                  it->active = ld.active;
+                  break;
+                }
+              }
             }
+
+            // Remove opener
+            result.resize(opener_idx);
 
             if (is_image) {
               Image img;
@@ -2778,7 +2808,6 @@ class InlineParser {
               }
             }
             delimiter_stack.erase(opener, delimiter_stack.end());
-            // Note: pos_ was already advanced past ']' at line 1167
             continue;
           }
 
@@ -3537,24 +3566,11 @@ class InlineParser {
     return result;
   }
 
-  void ProcessEmphasis(std::list<InlineNode>& nodes,
-                       std::pmr::vector<DelimiterNode>& delimiters) {
+  void ProcessEmphasis(std::pmr::vector<InlineNode>& nodes,
+                        std::pmr::vector<DelimiterNode>& delimiters) {
     if (delimiters.empty()) [[unlikely]]
       return;
 
-    // Use a cached index-to-iterator map. Rebuilt after each emphasis match
-    // because splice operations change node positions in the list.
-    std::pmr::vector<std::list<InlineNode>::iterator> iter_map;
-
-    auto rebuild_iter_map = [&]() {
-      iter_map.clear();
-      iter_map.reserve(nodes.size());
-      for (auto it = nodes.begin(); it != nodes.end(); ++it) {
-        iter_map.push_back(it);
-      }
-    };
-
-    // Process emphasis using the algorithm from CommonMark spec
     size_t closer_idx = 0;
     while (closer_idx < delimiters.size()) {
       auto& closer = delimiters[closer_idx];
@@ -3585,30 +3601,19 @@ class InlineParser {
         }
 
         found_opener = true;
-
-        // Build the index-to-iterator map for this iteration
-        rebuild_iter_map();
-
-        // Ensure positions are valid (nested emphasis can shrink the list)
-        if (opener.pos >= iter_map.size() || closer.pos >= iter_map.size()) {
-          break;
-        }
-
-        auto opener_it = iter_map[opener.pos];
-        auto closer_it = iter_map[closer.pos];
-        auto after_opener = std::next(opener_it);
+        size_t opener_pos = opener.pos;
+        size_t closer_pos = closer.pos;
 
         // Determine emphasis type
         bool is_strong = opener.count >= 2 && closer.count >= 2;
         size_t delim_count = is_strong ? 2 : 1;
 
-        // Collect content nodes between opener and closer into a vector
-        // (needed for NodesToIds which takes a container)
+        // Collect content nodes between opener and closer
         std::pmr::vector<InlineNode> content;
-        size_t content_size = 0;
-        for (auto it = after_opener; it != closer_it; ++it) {
-          content.push_back(std::move(*it));
-          ++content_size;
+        size_t content_size = closer_pos - opener_pos - 1;
+        content.reserve(content_size);
+        for (size_t i = opener_pos + 1; i < closer_pos; ++i) {
+          content.push_back(std::move(nodes[i]));
         }
 
         // Create emphasis node - convert children to pool IDs
@@ -3625,44 +3630,42 @@ class InlineParser {
 
         // Update opener text - delimiters consumed from the END of opener run
         if (opener.count > delim_count) {
-          auto& opener_content = std::get<Text>(*opener_it).content;
+          auto& opener_content = std::get<Text>(nodes[opener_pos]).content;
           opener_content = opener_content.substr(0, opener.count - delim_count);
           opener.count -= delim_count;
         } else {
-          *opener_it = Text("");
+          nodes[opener_pos] = Text("");
           opener.active = false;
         }
 
         // Update closer text - delimiters consumed from the BEGINNING of closer
         if (closer.count > delim_count) {
-          auto& closer_content = std::get<Text>(*closer_it).content;
+          auto& closer_content = std::get<Text>(nodes[closer_pos]).content;
           closer_content = closer_content.substr(delim_count);
           closer.count -= delim_count;
         } else {
-          *closer_it = Text("");
+          nodes[closer_pos] = Text("");
           closer.active = false;
         }
 
-        // Use O(1) splice instead of O(N) erase+insert:
-        // 1. Splice content nodes out of the list (into a temporary)
-        // 2. Insert emphasis node after opener
-        // 3. The content nodes are discarded (they were moved into emph_node)
-        if (content_size > 0) {
-          std::list<InlineNode> temp;
-          temp.splice(temp.end(), nodes, after_opener, closer_it);
-        }
-        nodes.insert(std::next(opener_it), std::move(emph_node));
+        // Remove the content nodes (opener/closer text nodes stay in place)
+        // and insert the emphasis node after the opener.
+        size_t content_count = closer_pos - opener_pos - 1;
+        nodes.erase(nodes.begin() + opener_pos + 1,
+                    nodes.begin() + closer_pos);
+        nodes.insert(nodes.begin() + opener_pos + 1, std::move(emph_node));
 
-        // Adjust positions in delimiter stack
-        // Net change: removed (closer - opener - 1) nodes, added 1 emphasis
-        // node
-        size_t removed = closer.pos - opener.pos - 1;
+        // Adjust positions in delimiter stack:
+        // - delimiters inside (opener_pos, closer_pos) are now wrapped
+        // - delimiters at/after closer_pos shift by 1 - content_count
+        //   (one emphasis node added, content_count nodes removed)
+        int64_t net_shift = 1 - static_cast<int64_t>(content_count);
         for (auto& d : delimiters) {
-          if (d.pos > opener.pos && d.pos < closer.pos) {
+          if (d.pos > opener_pos && d.pos < closer_pos) {
             d.active = false;
-          } else if (d.pos >= closer.pos) {
-            d.pos -= removed;
-            d.pos += 1;  // Account for inserted emphasis node
+          } else if (d.pos >= closer_pos) {
+            d.pos = static_cast<size_t>(
+                static_cast<int64_t>(d.pos) + net_shift);
           }
         }
 
@@ -3674,13 +3677,19 @@ class InlineParser {
       }
     }
 
-    // Remove empty text nodes in-place
-    nodes.remove_if([](const InlineNode& node) {
-      if (auto* text = std::get_if<Text>(&node)) {
-        return text->content.empty();
+    // Remove empty text nodes in-place (compact)
+    size_t write = 0;
+    for (size_t read = 0; read < nodes.size(); ++read) {
+      if (std::holds_alternative<Text>(nodes[read]) &&
+          std::get<Text>(nodes[read]).content.empty()) {
+        continue;
       }
-      return false;
-    });
+      if (write != read) {
+        nodes[write] = std::move(nodes[read]);
+      }
+      ++write;
+    }
+    nodes.resize(write);
   }
 };
 
@@ -3698,18 +3707,9 @@ class BlockParser {
     ResetParseResource();
 
     Document doc;
-    doc_ = &doc;
-    // Use LineBuffer for cache-friendly line storage (contiguous offsets)
-    lines_ = std::make_unique<detail::LineBuffer>(input);
-    line_idx_ = 0;
-    parent_link_refs_ = &doc.link_references;
-
-    // First pass: extract link reference definitions
-    ExtractLinkReferences(doc);
-
-    // Second pass: parse blocks
-    line_idx_ = 0;
-    ParseBlocks(doc.children);
+    std::pmr::vector<BlockNode> top_blocks;
+    ParseBlocksInto(input, doc, top_blocks);
+    doc.children = std::move(top_blocks);
 
     // Third pass: parse inlines
     InlineParser inline_parser(&doc.link_references, &doc.string_storage,
@@ -3719,6 +3719,24 @@ class BlockParser {
     return doc;
   }
 
+  void ParseBlocksInto(std::string_view input, Document& doc,
+                        std::pmr::vector<BlockNode>& blocks,
+                        bool input_no_nulls = false) {
+    doc_ = &doc;
+    lines_ = std::make_unique<detail::LineBuffer>(input, input_no_nulls);
+    line_idx_ = 0;
+    parent_link_refs_ = &doc.link_references;
+
+    // First pass: extract link reference definitions (skip if no '[' present)
+    if (input.find('[') != std::string_view::npos) {
+      ExtractLinkReferences(doc);
+    }
+
+    // Second pass: parse blocks
+    line_idx_ = 0;
+    ParseBlocks(blocks);
+  }
+
  private:
   // LineBuffer provides cache-friendly storage: contiguous offset array
   // pointing into single buffer, vs vector<string> with many allocations
@@ -3726,158 +3744,6 @@ class BlockParser {
   size_t line_idx_ = 0;
   LinkRefMap* parent_link_refs_ = nullptr;
   Document* doc_ = nullptr;
-
-  // Transfer blocks from a nested document to the parent's pool and return IDs
-  // Also transfers inline nodes, string storage, and remaps their IDs
-  std::pmr::vector<BlockNodeId> TransferFromNestedDoc(Document& nested_doc) {
-    // Transfer string_storage by COPYING to preserve string_view validity.
-    // SSO strings have data inside the object, so moving would invalidate
-    // views. We need to record how many strings we're copying to calculate new
-    // indices.
-    size_t string_storage_base = doc_->string_storage.size();
-    for (const auto& s : nested_doc.string_storage) {
-      doc_->string_storage.push_back(s);  // COPY, not move
-    }
-
-    // Helper to update a string_view to point to the new string location
-    auto update_string_view = [&](std::string_view& sv) {
-      const char* sv_data = sv.data();
-      // Find the original string this view points into
-      for (size_t i = 0; i < nested_doc.string_storage.size(); ++i) {
-        const auto& old_str = nested_doc.string_storage[i];
-        if (sv_data >= old_str.data() &&
-            sv_data < old_str.data() + old_str.size()) {
-          // Found it - compute offset and update to new location
-          size_t offset = sv_data - old_str.data();
-          const auto& new_str = doc_->string_storage[string_storage_base + i];
-          sv = std::string_view(new_str.data() + offset, sv.size());
-          return;
-        }
-      }
-    };
-
-    // First, transfer all inline nodes from nested to parent and build ID map
-    std::pmr::vector<InlineNodeId> inline_id_map;
-    inline_id_map.reserve(nested_doc.inline_nodes.size());
-    for (auto& inline_node : nested_doc.inline_nodes) {
-      // Update string_views in Text/HtmlInline nodes before moving
-      // (Code has pmr::string, not string_view, so it doesn't need updating)
-      std::visit(
-          [&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, Text>) {
-              update_string_view(node.content);
-            } else if constexpr (std::is_same_v<T, HtmlInline>) {
-              update_string_view(node.content);
-            }
-          },
-          inline_node);
-      InlineNodeId new_id =
-          static_cast<InlineNodeId>(doc_->inline_nodes.size());
-      doc_->inline_nodes.push_back(std::move(inline_node));
-      inline_id_map.push_back(new_id);
-    }
-
-    // Helper to remap inline IDs in a vector
-    auto remap_inline_ids = [&](std::pmr::vector<InlineNodeId>& ids) {
-      for (auto& id : ids) {
-        id = inline_id_map[id];
-      }
-    };
-
-    // Remap inline IDs in nested inline nodes (for Emphasis/Strong/Link
-    // children) These were just moved to doc_->inline_nodes
-    size_t start_idx = doc_->inline_nodes.size() - inline_id_map.size();
-    for (size_t i = start_idx; i < doc_->inline_nodes.size(); ++i) {
-      std::visit(
-          [&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, Emphasis> ||
-                          std::is_same_v<T, Strong> ||
-                          std::is_same_v<T, Link>) {
-              remap_inline_ids(node.children);
-            }
-          },
-          doc_->inline_nodes[i]);
-    }
-
-    // First, transfer nested block_nodes (for nested BlockQuotes/ListItems)
-    // Build block_id_map so we can remap IDs in Lists/BlockQuotes
-    std::pmr::vector<BlockNodeId> block_id_map;
-    block_id_map.reserve(nested_doc.block_nodes.size());
-    for (auto& nested_block : nested_doc.block_nodes) {
-      // Remap inline IDs in nested blocks
-      std::visit(
-          [&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, Paragraph> ||
-                          std::is_same_v<T, Heading>) {
-              remap_inline_ids(node.children);
-            }
-          },
-          nested_block);
-      BlockNodeId new_id = doc_->AddBlock(std::move(nested_block));
-      block_id_map.push_back(new_id);
-    }
-
-    // Helper to remap block IDs using block_id_map
-    auto remap_block_ids = [&](auto& block) {
-      std::visit(
-          [&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, BlockQuote>) {
-              for (auto& id : node.children) {
-                if (id < block_id_map.size()) {
-                  id = block_id_map[id];
-                }
-              }
-            } else if constexpr (std::is_same_v<T, List>) {
-              for (auto& item : node.items) {
-                for (auto& id : item.children) {
-                  if (id < block_id_map.size()) {
-                    id = block_id_map[id];
-                  }
-                }
-              }
-            } else if constexpr (std::is_same_v<T, ListItem>) {
-              for (auto& id : node.children) {
-                if (id < block_id_map.size()) {
-                  id = block_id_map[id];
-                }
-              }
-            }
-          },
-          block);
-    };
-
-    // Remap block IDs in the transferred block_nodes
-    size_t block_start_idx = doc_->block_nodes.size() - block_id_map.size();
-    for (size_t i = block_start_idx; i < doc_->block_nodes.size(); ++i) {
-      remap_block_ids(doc_->block_nodes[i]);
-    }
-
-    // Now transfer blocks from nested_doc.children and remap their IDs
-    std::pmr::vector<BlockNodeId> block_ids;
-    block_ids.reserve(nested_doc.children.size());
-
-    for (auto& block : nested_doc.children) {
-      // Remap inline IDs in the block
-      std::visit(
-          [&](auto&& node) {
-            using T = std::decay_t<decltype(node)>;
-            if constexpr (std::is_same_v<T, Paragraph> ||
-                          std::is_same_v<T, Heading>) {
-              remap_inline_ids(node.children);
-            }
-          },
-          block);
-      // Remap block IDs in Lists/BlockQuotes
-      remap_block_ids(block);
-      block_ids.push_back(doc_->AddBlock(std::move(block)));
-    }
-
-    return block_ids;
-  }
 
   bool AtEnd() const { return !lines_ || line_idx_ >= lines_->size(); }
 
@@ -4739,12 +4605,9 @@ class BlockParser {
         }
       }
 
-      // Remove indentation from code line
-      if (indent > 0) {
-        content += detail::RemoveIndent(code_line, indent);
-      } else {
-        content += code_line;
-      }
+      // Remove indentation from code line (appends directly, no intermediate
+      // string)
+      detail::AppendRemoveIndent(code_line, indent, content);
       content += '\n';
       Advance();
     }
@@ -5114,8 +4977,10 @@ class BlockParser {
     if (trimmed.empty() || trimmed[0] != '>') [[unlikely]]
       return false;
 
-    // Collect block quote lines
-    std::pmr::vector<std::pmr::string> quote_lines;
+    // Build a single contiguous buffer for nested content
+    std::pmr::string nested_buf;
+    // Reserve a reasonable amount to reduce reallocations
+    nested_buf.reserve(256);
 
     // Track state for lazy continuation rules
     bool last_line_was_blank = false;
@@ -5130,14 +4995,19 @@ class BlockParser {
       auto bq_trimmed = detail::TrimLeft(bq_line);
 
       if (bq_trimmed.starts_with(">")) {
-        // Remove > and optional space with proper tab handling
-        std::pmr::string bq_content = detail::RemoveBlockQuotePrefix(bq_line);
-        quote_lines.push_back(bq_content);
+        // Append the post-'>' content directly into nested_buf (no
+        // intermediate copy) and derive a non-owning view for the checks.
+        // The trailing newline is appended after the checks so that the view
+        // stays valid for them.
+        size_t content_start = nested_buf.size();
+        detail::AppendBlockQuoteContent(bq_line, nested_buf);
+        std::string_view inner(nested_buf.data() + content_start,
+                               nested_buf.size() - content_start);
 
         // Track if this line is blank inside the blockquote
-        auto inner_trimmed = detail::TrimLeft(bq_content);
+        auto inner_trimmed = detail::TrimLeft(inner);
         last_line_was_blank = inner_trimmed.empty();
-        int inner_indent = detail::CountIndent(bq_content);
+        int inner_indent = detail::CountIndent(inner);
 
         // Track block types for lazy continuation rules
         if (!in_fenced_code) {
@@ -5196,8 +5066,9 @@ class BlockParser {
           }
         }
 
+        nested_buf += '\n';
         Advance();
-      } else if (!bq_trimmed.empty() && !quote_lines.empty()) {
+      } else if (!bq_trimmed.empty() && !nested_buf.empty()) {
         // Lazy continuation - only for paragraphs, not after blank lines,
         // not inside fenced code blocks
         bool is_continuation = true;
@@ -5237,11 +5108,12 @@ class BlockParser {
           // Mark lazy continuation with special prefix to prevent setext
           // heading (but don't add if already marked)
           if (!bq_trimmed.empty() && bq_trimmed[0] == '\x01') {
-            quote_lines.push_back(std::pmr::string(bq_trimmed));
+            nested_buf.append(bq_trimmed.data(), bq_trimmed.size());
           } else {
-            quote_lines.push_back(std::pmr::string(1, '\x01') +
-                                  std::pmr::string(bq_trimmed));
+            nested_buf += '\x01';
+            nested_buf.append(bq_trimmed.data(), bq_trimmed.size());
           }
+          nested_buf += '\n';
           last_line_was_blank = false;
           // Lazy continuation continues the paragraph
           in_paragraph = true;
@@ -5255,37 +5127,22 @@ class BlockParser {
       }
     }
 
-    if (quote_lines.empty()) [[unlikely]]
+    if (nested_buf.empty()) [[unlikely]]
       return false;
 
-    // Parse the content of the block quote
-    std::pmr::string quote_content;
-    for (const auto& ql : quote_lines) {
-      quote_content += ql;
-      quote_content += '\n';
-    }
-
     BlockParser nested_parser;
-    Document nested_doc = nested_parser.Parse(quote_content);
+    std::pmr::vector<BlockNode> nested_blocks;
+    nested_parser.ParseBlocksInto(std::string_view(nested_buf), *doc_,
+                                  nested_blocks, /*input_no_nulls=*/true);
 
-    // Promote link references from nested document to parent (sorted merge)
-    if (parent_link_refs_) {
-      for (const auto& [label, dest_title] : nested_doc.link_references) {
-        auto it = std::lower_bound(parent_link_refs_->begin(),
-                                   parent_link_refs_->end(), label,
-                                   LinkRefComparator{});
-        if (it == parent_link_refs_->end() || it->first != label) {
-          parent_link_refs_->emplace(it, label, dest_title);
-        }
-      }
-    }
-
-    // Transfer nested doc to parent's pools and get IDs
     BlockQuote bq;
-    bq.children = TransferFromNestedDoc(nested_doc);
+    for (auto& node : nested_blocks) {
+      bq.children.push_back(doc_->AddBlock(std::move(node)));
+    }
     blocks.emplace_back(std::in_place_type<BlockQuote>, std::move(bq.children));
     return true;
   }
+
 
   bool TryParseList(std::pmr::vector<BlockNode>& blocks) {
     std::string_view line = CurrentLine();
@@ -5436,11 +5293,20 @@ class BlockParser {
         }
 
         ListItem item;
-        std::pmr::vector<std::pmr::string> item_lines;
+        // Build a single contiguous buffer for item content
+        std::pmr::string item_buf;
 
-        // Get first line content with proper tab handling
-        // Expand tabs in the original line, then extract content after marker
-        std::pmr::string expanded_line = detail::ExpandTabs(item_line);
+        // Get first line content with proper tab handling. Only materialize an
+        // expanded copy when the line actually contains a tab; otherwise reuse
+        // the original (valid) view to avoid a per-line allocation.
+        std::pmr::string expanded_storage;
+        std::string_view expanded_line;
+        if (item_line.find('\t') != std::string_view::npos) {
+          expanded_storage = detail::ExpandTabs(item_line);
+          expanded_line = expanded_storage;
+        } else {
+          expanded_line = item_line;
+        }
         std::string_view expanded_trimmed = detail::TrimLeft(expanded_line);
 
         // Calculate required indent based on content start position
@@ -5493,7 +5359,8 @@ class BlockParser {
 
         std::pmr::string first_content =
             std::pmr::string(expanded_trimmed.substr(skip));
-        item_lines.push_back(first_content);
+        item_buf += first_content;
+        item_buf += '\n';
         Advance();
         had_blank_line = false;
 
@@ -5538,7 +5405,7 @@ class BlockParser {
               had_blank_line = true;
               break;  // End item - don't collect more lines
             }
-            item_lines.push_back("");
+            item_buf += '\n';
             // Only count blank lines outside fenced code blocks
             if (!in_item_fenced_code) {
               had_blank_line = true;
@@ -5547,8 +5414,16 @@ class BlockParser {
             continue;
           }
 
-          // Expand tabs for proper indent calculation
-          std::pmr::string expanded_cont = detail::ExpandTabs(cont_line);
+          // Expand tabs for proper indent calculation. Reuse the original view
+          // when there is no tab to avoid a per-line allocation.
+          std::pmr::string cont_storage;
+          std::string_view expanded_cont;
+          if (cont_line.find('\t') != std::string_view::npos) {
+            cont_storage = detail::ExpandTabs(cont_line);
+            expanded_cont = cont_storage;
+          } else {
+            expanded_cont = cont_line;
+          }
           int cont_indent = detail::CountIndent(expanded_cont);
           auto cont_trimmed = detail::TrimLeft(expanded_cont);
 
@@ -5645,19 +5520,26 @@ class BlockParser {
               // Lazy continuation - mark with \x01 to prevent block parsing
               // (but don't add if already marked)
               if (!cont_trimmed.empty() && cont_trimmed[0] == '\x01') {
-                item_lines.push_back(std::pmr::string(cont_trimmed));
+                item_buf.append(cont_trimmed.data(), cont_trimmed.size());
               } else {
-                item_lines.push_back(std::pmr::string(1, '\x01') +
-                                     std::pmr::string(cont_trimmed));
+                item_buf += '\x01';
+                item_buf.append(cont_trimmed.data(), cont_trimmed.size());
               }
+              item_buf += '\n';
               Advance();
             } else {
               break;
             }
           } else {
-            // Properly indented continuation - remove required_indent spaces
-            std::pmr::string dedented =
-                detail::RemoveIndent(expanded_cont, required_indent);
+            // Properly indented continuation - remove required_indent columns
+            // directly into item_buf (no intermediate allocation) and derive a
+            // non-owning view for the checks. The view stays valid because
+            // item_buf is not mutated until the trailing newline is appended
+            // after the checks below.
+            size_t dedented_start = item_buf.size();
+            detail::AppendRemoveIndent(expanded_cont, required_indent, item_buf);
+            std::string_view dedented(item_buf.data() + dedented_start,
+                                      item_buf.size() - dedented_start);
 
             // Track fenced code blocks
             auto dedented_trimmed = detail::TrimLeft(dedented);
@@ -5729,41 +5611,29 @@ class BlockParser {
                 list.is_tight = false;
               }
             }
-            item_lines.push_back(dedented);
+            item_buf += '\n';
             Advance();
             had_blank_line = false;
           }
         }
 
-        // Remove trailing blank lines
-        while (!item_lines.empty() && item_lines.back().empty()) {
-          item_lines.pop_back();
+        // Remove trailing blank lines (pop_back removed empty strings = trailing \n)
+        while (item_buf.size() >= 2 && item_buf.back() == '\n') {
+          // Check if the preceding line is empty (i.e., this is a trailing blank line)
+          // A trailing blank line in our buffer is just a bare \n after another \n
+          // or at the end. Strip it.
+          item_buf.pop_back();
         }
 
         // Parse item content
-        std::pmr::string item_content;
-        for (const auto& il : item_lines) {
-          item_content += il;
-          item_content += '\n';
-        }
-
-        if (!item_content.empty()) {
+        if (!item_buf.empty()) {
           BlockParser item_parser;
-          Document item_doc = item_parser.Parse(item_content);
-          // Transfer nested doc to parent's pools and get IDs
-          item.children = TransferFromNestedDoc(item_doc);
+          std::pmr::vector<BlockNode> item_blocks;
+          item_parser.ParseBlocksInto(std::string_view(item_buf), *doc_,
+                                      item_blocks, /*input_no_nulls=*/true);
 
-          // Promote link references from nested document to parent (sorted
-          // merge)
-          if (parent_link_refs_) {
-            for (const auto& [label, dest_title] : item_doc.link_references) {
-              auto it = std::lower_bound(parent_link_refs_->begin(),
-                                         parent_link_refs_->end(), label,
-                                         LinkRefComparator{});
-              if (it == parent_link_refs_->end() || it->first != label) {
-                parent_link_refs_->emplace(it, label, dest_title);
-              }
-            }
+          for (auto& node : item_blocks) {
+            item.children.push_back(doc_->AddBlock(std::move(node)));
           }
         }
 
@@ -5801,7 +5671,7 @@ class BlockParser {
       if (detail::IsBlankLine(code_line)) {
         // Blank lines within code blocks preserve whitespace beyond 4 spaces
         if (code_indent >= 4) {
-          content += detail::RemoveIndent(code_line, 4);
+          detail::AppendRemoveIndent(code_line, 4, content);
         }
         content += '\n';
         Advance();
@@ -5810,7 +5680,7 @@ class BlockParser {
 
       if (code_indent < 4) break;
 
-      content += detail::RemoveIndent(code_line, 4);
+      detail::AppendRemoveIndent(code_line, 4, content);
       content += '\n';
       Advance();
     }
@@ -5836,7 +5706,10 @@ class BlockParser {
   }
 
   BlockNode ParseParagraph() {
-    std::pmr::vector<std::pmr::string> para_lines;
+    // Store non-owning views into the LineBuffer (which stays valid for the
+    // duration of this call) instead of copying each line into its own
+    // string. The single join into raw_content at the end is the only copy.
+    std::pmr::vector<std::string_view> para_lines;
 
     while (!AtEnd()) {
       std::string_view line = CurrentLine();
@@ -6055,9 +5928,9 @@ class BlockParser {
 
       // Strip \x01 marker used for lazy continuation lines
       if (!trimmed.empty() && trimmed[0] == '\x01') {
-        para_lines.push_back(std::pmr::string(trimmed.substr(1)));
+        para_lines.push_back(trimmed.substr(1));
       } else {
-        para_lines.push_back(std::pmr::string(trimmed));
+        para_lines.push_back(trimmed);
       }
       Advance();
     }
@@ -6090,9 +5963,40 @@ class BlockParser {
               doc_->string_storage.push_back(std::move(node.raw_content));
               std::string_view stable_content = doc_->string_storage.back();
               node.children = parser.Parse(stable_content);
+            } else if constexpr (std::is_same_v<T, BlockQuote>) {
+              ParseInlines(node.children, parser);
+            } else if constexpr (std::is_same_v<T, List>) {
+              for (auto& item : node.items) {
+                ParseInlines(item.children, parser);
+              }
             }
-            // BlockQuote and List children are already parsed by their nested
-            // BlockParser - do NOT recursively parse them again
+          },
+          block);
+    }
+  }
+
+  void ParseInlines(const std::pmr::vector<BlockNodeId>& block_ids,
+                     InlineParser& parser) {
+    for (BlockNodeId id : block_ids) {
+      auto& block = doc_->block_nodes[id];
+      std::visit(
+          [&parser, this](auto&& node) {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, Paragraph>) {
+              doc_->string_storage.push_back(std::move(node.raw_content));
+              std::string_view stable_content = doc_->string_storage.back();
+              node.children = parser.Parse(stable_content);
+            } else if constexpr (std::is_same_v<T, Heading>) {
+              doc_->string_storage.push_back(std::move(node.raw_content));
+              std::string_view stable_content = doc_->string_storage.back();
+              node.children = parser.Parse(stable_content);
+            } else if constexpr (std::is_same_v<T, BlockQuote>) {
+              ParseInlines(node.children, parser);
+            } else if constexpr (std::is_same_v<T, List>) {
+              for (auto& item : node.items) {
+                ParseInlines(item.children, parser);
+              }
+            }
           },
           block);
     }
@@ -6302,23 +6206,29 @@ class HtmlRenderer {
               RenderInlines(n.children, out);
               out += "</strong>";
             } else if constexpr (std::is_same_v<T, Link>) {
-              std::pmr::string escaped_dest = detail::EscapeHtml(n.destination);
-              std::string title_attr =
-                  n.title.empty() ? ""
-                                  : std::format(" title=\"{}\"",
-                                                detail::EscapeHtml(n.title));
-              out += std::format("<a href=\"{}\"{}>", escaped_dest, title_attr);
+              out += "<a href=\"";
+              detail::EscapeHtmlTo(n.destination, out);
+              out += '\"';
+              if (!n.title.empty()) {
+                out += " title=\"";
+                detail::EscapeHtmlTo(n.title, out);
+                out += '\"';
+              }
+              out += ">";
               RenderInlines(n.children, out);
               out += "</a>";
             } else if constexpr (std::is_same_v<T, Image>) {
-              std::pmr::string escaped_dest = detail::EscapeHtml(n.destination);
-              std::pmr::string escaped_alt = detail::EscapeHtml(n.alt_text);
-              std::string title_attr =
-                  n.title.empty() ? ""
-                                  : std::format(" title=\"{}\"",
-                                                detail::EscapeHtml(n.title));
-              out += std::format("<img src=\"{}\" alt=\"{}\"{} />",
-                                 escaped_dest, escaped_alt, title_attr);
+              out += "<img src=\"";
+              detail::EscapeHtmlTo(n.destination, out);
+              out += "\" alt=\"";
+              detail::EscapeHtmlTo(n.alt_text, out);
+              out += '"';
+              if (!n.title.empty()) {
+                out += " title=\"";
+                detail::EscapeHtmlTo(n.title, out);
+                out += '\"';
+              }
+              out += " />";
             } else if constexpr (std::is_same_v<T, HtmlInline>) {
               out += n.content;
             }

@@ -6,15 +6,22 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Opt-in GFM feature tests (cmark-gfm GFM spec vs markus). Off by default so the
+# standard CommonMark run stays green; enable to track GFM feature progress.
+option(MARKUS_BUILD_GFM_TESTS "Build the opt-in cmark-gfm GFM feature tests" OFF)
+
 # Profile build type support (for gprof)
 set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_PROFILE} -pg")
 
-# Add cmark as subdirectory for benchmark (EXCLUDE_FROM_ALL so it only builds when needed)
-# Disable cmark's own tests since we use our own gtest-based test suite
-set(BUILD_TESTING_SAVE ${BUILD_TESTING})
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-add_subdirectory(commonmark-spec cmark-build EXCLUDE_FROM_ALL)
-set(BUILD_TESTING ${BUILD_TESTING_SAVE} CACHE BOOL "Build tests" FORCE)
+# Add cmark-gfm as subdirectory for benchmark (EXCLUDE_FROM_ALL so it only builds when needed)
+# Only build the static core library; disable cmark-gfm's own tests since we use our own gtest suite
+set(CMARK_TESTS OFF CACHE BOOL "" FORCE)
+set(CMARK_SHARED OFF CACHE BOOL "" FORCE)
+set(CMARK_STATIC ON CACHE BOOL "" FORCE)
+# cmark-gfm declares cmake_minimum_required(VERSION 3.5), which recent CMake
+# rejects; allow it to configure.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+add_subdirectory(cmark-gfm cmark-gfm-build EXCLUDE_FROM_ALL)
 
 # Add md4c as subdirectory for benchmark (EXCLUDE_FROM_ALL so it only builds when needed)
 # Disable md4c's own executables since we only need the libraries
@@ -61,6 +68,21 @@ if(BUILD_TESTING)
     DISCOVERY_TIMEOUT 30
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
+
+  # Opt-in GFM feature tests: run cmark-gfm's GFM spec extension sections against
+  # markus. Excluded from the default CommonMark run (see MARKUS_BUILD_GFM_TESTS).
+  if(MARKUS_BUILD_GFM_TESTS)
+    add_executable(test_gfm tests/test_gfm.cc)
+    target_link_libraries(test_gfm PRIVATE markus GTest::gtest_main)
+    set_target_properties(test_gfm PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
+    gtest_discover_tests(test_gfm
+      TEST_PREFIX "markus.gfm."
+      DISCOVERY_TIMEOUT 30
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+  endif()
 endif()
 
 # Google Benchmark
@@ -76,8 +98,8 @@ FetchContent_MakeAvailable(googlebenchmark)
 
 # Benchmark executable
 add_executable(bench bench.cc)
-target_link_libraries(bench PRIVATE markus cmark md4c md4c-html benchmark::benchmark)
-target_include_directories(bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/commonmark-spec/src ${CMAKE_BINARY_DIR}/cmark-build/src)
+target_link_libraries(bench PRIVATE markus libcmark-gfm_static md4c md4c-html benchmark::benchmark)
+target_include_directories(bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cmark-gfm/src ${CMAKE_BINARY_DIR}/cmark-gfm-build/src)
 set_target_properties(bench PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )

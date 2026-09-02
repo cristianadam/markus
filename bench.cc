@@ -22,8 +22,8 @@
 #include "benchmark/benchmark.h"
 #include "markus.h"
 
-// cmark headers
-#include "commonmark-spec/src/cmark.h"
+// cmark-gfm headers
+#include "cmark-gfm.h"
 
 // md4c headers
 #include "md4c.h"
@@ -86,7 +86,7 @@ std::vector<std::pair<std::string, std::string>> CollectInputs(
 // Timing data collected by benchmark lambdas via SetIterationTime
 std::mutex g_timing_mutex;
 std::map<std::string, std::vector<double>> g_markus_times;
-std::map<std::string, std::vector<double>> g_cmark_times;
+std::map<std::string, std::vector<double>> g_cmark_gfm_times;
 std::map<std::string, std::vector<double>> g_md4c_times;
 
 void RecordTiming(const std::string& name, double time_ms,
@@ -107,17 +107,17 @@ void PrintSummary() {
 
   std::map<std::string, bool> all_files;
   for (const auto& [file, _] : g_markus_times) all_files[file] = true;
-  for (const auto& [file, _] : g_cmark_times) all_files[file] = true;
+  for (const auto& [file, _] : g_cmark_gfm_times) all_files[file] = true;
   for (const auto& [file, _] : g_md4c_times) all_files[file] = true;
 
   printf("\n");
   printf("%-30s %12s %12s %12s %8s %8s\n", "Sample", "Markus(ms)",
-         "Cmark(ms)", "Md4c(ms)", "M/C", "M/D");
+          "CmarkGfm(ms)", "Md4c(ms)", "M/GFM", "M/D");
   printf(
       "%-30s %12s %12s %12s %8s %8s\n", "------------------------------",
       "------------", "------------", "------------", "--------", "--------");
 
-  double total_markus = 0, total_cmark = 0, total_md4c = 0;
+  double total_markus = 0, total_cmark_gfm = 0, total_md4c = 0;
 
   for (const auto& [file, _] : all_files) {
     auto get_mean = [](const std::map<std::string, std::vector<double>>& m,
@@ -128,7 +128,7 @@ void PrintSummary() {
     };
 
     double m = get_mean(g_markus_times, file);
-    double c = get_mean(g_cmark_times, file);
+    double c = get_mean(g_cmark_gfm_times, file);
     double d = get_mean(g_md4c_times, file);
 
     double ratio_mc = c > 0 ? m / c : 0;
@@ -138,7 +138,7 @@ void PrintSummary() {
            d, ratio_mc, ratio_md);
 
     total_markus += m;
-    total_cmark += c;
+    total_cmark_gfm += c;
     total_md4c += d;
   }
 
@@ -146,10 +146,10 @@ void PrintSummary() {
       "%-30s %12s %12s %12s %8s %8s\n", "------------------------------",
       "------------", "------------", "------------", "--------", "--------");
 
-  double ratio_mc = total_cmark > 0 ? total_markus / total_cmark : 0;
+  double ratio_mc = total_cmark_gfm > 0 ? total_markus / total_cmark_gfm : 0;
   double ratio_md = total_md4c > 0 ? total_markus / total_md4c : 0;
   printf("%-30s %12.3f %12.3f %12.3f %7.2fx %7.2fx\n", "TOTAL", total_markus,
-         total_cmark, total_md4c, ratio_mc, ratio_md);
+         total_cmark_gfm, total_md4c, ratio_mc, ratio_md);
   printf("\n");
 }
 
@@ -204,15 +204,17 @@ void RegisterBenchmarks(
           }
         });
 
-    std::string cmark_content = content;
+    std::string cmark_gfm_content = content;
     benchmark::RegisterBenchmark(
-        (name + "_cmark").c_str(),
-        [name, cmark_content](benchmark::State& st) {
+        (name + "_cmark_gfm").c_str(),
+        [name, cmark_gfm_content](benchmark::State& st) {
           for (auto _ : st) {
             auto start = std::chrono::high_resolution_clock::now();
             cmark_node* doc = cmark_parse_document(
-                cmark_content.c_str(), cmark_content.size(), CMARK_OPT_DEFAULT);
-            char* html = cmark_render_html(doc, CMARK_OPT_DEFAULT);
+                cmark_gfm_content.c_str(), cmark_gfm_content.size(),
+                CMARK_OPT_DEFAULT);
+            char* html =
+                cmark_render_html(doc, CMARK_OPT_DEFAULT, nullptr);
             benchmark::DoNotOptimize(html);
             free(html);
             cmark_node_free(doc);
@@ -220,11 +222,11 @@ void RegisterBenchmarks(
             double seconds =
                 std::chrono::duration<double>(end - start).count();
             st.SetIterationTime(seconds);
-            RecordTiming(name, seconds * 1000.0, g_cmark_times);
+            RecordTiming(name, seconds * 1000.0, g_cmark_gfm_times);
           }
           if (st.iterations() > 0) {
-            st.SetBytesProcessed(
-                static_cast<int64_t>(st.iterations()) * cmark_content.size());
+            st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                                 cmark_gfm_content.size());
           }
         });
 
@@ -263,7 +265,7 @@ void RegisterBenchmarks(
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string samples_dir = "commonmark-spec/bench/samples";
+  std::string samples_dir = "cmark-gfm/bench/samples";
   std::string input_file;
   int num_rounds = 2;
 
@@ -279,11 +281,11 @@ int main(int argc, char** argv) {
     std::string arg = argv[i];
     if (arg == "--help" || arg == "-h") {
       std::cerr << "Usage: bench [--input FILE] [--rounds N] [SAMPLES_DIR]\n";
-      std::cerr << "\nBenchmarks markus vs cmark vs md4c on markdown samples.\n";
+      std::cerr << "\nBenchmarks markus vs cmark-gfm vs md4c on markdown samples.\n";
       std::cerr << "\nOptions:\n";
       std::cerr << "  --rounds N       Number of benchmark repetitions (default: 2)\n";
       std::cerr << "  --input FILE     Benchmark a single file instead of samples dir\n";
-      std::cerr << "  SAMPLES_DIR      Directory with .md files (default: commonmark-spec/bench/samples)\n";
+      std::cerr << "  SAMPLES_DIR      Directory with .md files (default: cmark-gfm/bench/samples)\n";
       std::cerr << "\nGoogle Benchmark options:\n";
       std::cerr << "  --benchmark_min_time=N   Minimum time per benchmark run (default: 1s)\n";
       std::cerr << "  --benchmark_filter=REGEX Run only benchmarks matching REGEX\n";

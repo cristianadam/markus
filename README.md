@@ -204,17 +204,19 @@ Markus is optimized for speed through several techniques:
 
 ### Benchmarks
 
-Benchmarks compare Markus against [cmark](https://github.com/commonmark/cmark) (the CommonMark reference implementation) and [md4c](https://github.com/mity/md4c) on GitHub Actions runners. Results are averaged over multiple runs across Ubuntu, macOS, and Windows.
+Benchmarks compare Markus against [cmark-gfm](https://github.com/github/cmark-gfm) (the GitHub CommonMark reference implementation, run in plain CommonMark mode) and [md4c](https://github.com/mity/md4c) on GitHub Actions runners. Results are averaged over multiple runs across Ubuntu, macOS, and Windows.
 
-| Platform | CPU | Markus vs Cmark | Markus vs Md4c |
+> The comparison target was switched from cmark to cmark-gfm. The figures below are from the prior cmark baseline and will be re-measured by CI.
+
+| Platform | CPU | Markus vs cmark (baseline) | Markus vs Md4c |
 |----------|-----|-----------------|----------------|
 | Ubuntu (Linux) | 4x 3.5 GHz | 1.44x slower | 2.33x slower |
 | macOS | 4x Apple M1 | faster | 2.11x slower |
 | Windows | 4x 2.4 GHz | 1.03x slower | 2.51x slower |
 
-**Average: ~1.1x vs cmark, ~2.3x slower than md4c.**
+**Average (cmark baseline): ~1.1x vs cmark, ~2.3x slower than md4c.**
 
-Markus is within ~1.5x of cmark across platforms and faster than cmark on macOS, though still roughly 2-3x behind md4c. The gap vs cmark is most noticeable on nested structures (block quotes, lists), where recursive descent parsing has more overhead than cmark's optimized C implementation.
+Historically, Markus was within ~1.5x of cmark across platforms and faster than cmark on macOS, though still roughly 2-3x behind md4c. The gap was most noticeable on nested structures (block quotes, lists), where recursive descent parsing has more overhead than cmark's optimized C implementation.
 
 ## Unicode Support
 
@@ -235,4 +237,5 @@ MIT License - see [LICENSE.md](LICENSE.md)
 ## Acknowledgments
 
 - [CommonMark](https://commonmark.org/) for the Markdown specification
-- [cmark](https://github.com/commonmark/cmark) for the reference implementation and test suite
+- [cmark](https://github.com/commonmark/cmark) for the CommonMark reference implementation and spec test suite
+- [cmark-gfm](https://github.com/github/cmark-gfm) for the GitHub-flavored reference implementation, benchmark, and GFM feature spec

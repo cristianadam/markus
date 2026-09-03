@@ -96,6 +96,12 @@ std::map<std::string, std::vector<double>> g_markus_autolink_times;
 std::map<std::string, std::vector<double>> g_cmark_gfm_autolink_times;
 std::map<std::string, std::vector<double>> g_md4c_autolink_times;
 
+// Timing data for the GFM `strikethrough` extension benchmarks (each parser
+// with the strikethrough extension enabled, on strikethrough-heavy input).
+std::map<std::string, std::vector<double>> g_markus_strikethrough_times;
+std::map<std::string, std::vector<double>> g_cmark_gfm_strikethrough_times;
+std::map<std::string, std::vector<double>> g_md4c_strikethrough_times;
+
 void RecordTiming(const std::string& name, double time_ms,
                   std::map<std::string, std::vector<double>>& map) {
   std::lock_guard<std::mutex> lock(g_timing_mutex);
@@ -171,6 +177,9 @@ void PrintSummary() {
                     g_md4c_times);
   PrintSummaryTable("GFM Autolink Extension", g_markus_autolink_times,
                     g_cmark_gfm_autolink_times, g_md4c_autolink_times);
+  PrintSummaryTable("GFM Strikethrough Extension", g_markus_strikethrough_times,
+                    g_cmark_gfm_strikethrough_times,
+                    g_md4c_strikethrough_times);
 }
 
 class SummaryReporter : public benchmark::BenchmarkReporter {
@@ -307,6 +316,27 @@ std::string CmarkGfmRenderWithAutolink(const std::string& content) {
   return result;
 }
 
+// Parse + render with cmark-gfm with the GFM `strikethrough` extension
+// attached.
+std::string CmarkGfmRenderWithStrikethrough(const std::string& content) {
+  cmark_parser* parser = cmark_parser_new(CMARK_OPT_DEFAULT);
+  cmark_syntax_extension* ext = cmark_find_syntax_extension("strikethrough");
+  if (ext != nullptr) {
+    cmark_parser_attach_syntax_extension(parser, ext);
+  }
+  cmark_parser_feed(parser, content.c_str(), content.size());
+  cmark_node* doc = cmark_parser_finish(parser);
+  // The renderer copies the extensions it needs; keep the parser alive until
+  // after rendering since it owns this list.
+  cmark_llist* extensions = cmark_parser_get_syntax_extensions(parser);
+  char* html = cmark_render_html(doc, CMARK_OPT_DEFAULT, extensions);
+  std::string result = html != nullptr ? std::string(html) : std::string();
+  cmark_parser_free(parser);
+  free(html);
+  cmark_node_free(doc);
+  return result;
+}
+
 // Build a synthetic document that is heavy in GFM extended autolinks (www,
 // http(s)/ftp URLs, and email addresses) so the autolink extension code paths
 // are actually exercised by the benchmark.
@@ -340,6 +370,47 @@ std::string GenerateAutolinkSample(int lines = 4000) {
       case 5:
         out += "Mixed www.site.org/a.b and mail a.b-c_d@host.io here " +
                std::to_string(i) + ".\n";
+        break;
+    }
+  }
+  return out;
+}
+
+// Build a synthetic document that is heavy in GFM strikethrough (~~...~~ runs,
+// including some nested in emphasis) so the strikethrough extension code paths
+// are actually exercised by the benchmark. Each entry is its own paragraph
+// (blank-line separated) so the document is representative of real Markdown and
+// every parser runs in linear time.
+std::string GenerateStrikethroughSample(int lines = 4000) {
+  std::string out;
+  out.reserve(static_cast<size_t>(lines) * 80);
+  out += "# GFM Strikethrough Extension Benchmark\n\n";
+  for (int i = 0; i < lines; ++i) {
+    switch (i % 6) {
+      case 0:
+        out += "This ~~deleted~~ text " + std::to_string(i) +
+               " is struck through.\n\n";
+        break;
+      case 1:
+        out += "Keep ~~old value~~ but ~~new value~~ " + std::to_string(i) +
+               " is kept.\n\n";
+        break;
+      case 2:
+        out += "Mix of ~~bold ~~strong~~ and plain~~ text " +
+               std::to_string(i) + ".\n\n";
+        break;
+      case 3:
+        out += "~~a long struck-through sentence about item " +
+               std::to_string(i) +
+               " that should be fully wrapped in del~~ here.\n\n";
+        break;
+      case 4:
+        out += "Plain prose line " + std::to_string(i) +
+               " with no strikethrough at all, just text.\n\n";
+        break;
+      case 5:
+        out += "Single ~tilde~ and double ~~tilde~~ plus ~~triple~~ " +
+               std::to_string(i) + ".\n\n";
         break;
     }
   }
@@ -413,6 +484,74 @@ void RegisterAutolinkBenchmarks(const std::string& content) {
       });
 }
 
+void RegisterStrikethroughBenchmarks(const std::string& content) {
+  const std::string name = "strikethrough-ext";
+
+  benchmark::RegisterBenchmark(
+      (name + "_markus_strikethrough").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          markus::Options options;
+          options.enable_strikethrough = true;
+          auto result = markus::MarkdownToHtml(content, options);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_markus_strikethrough_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_cmark_gfm_strikethrough").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          auto result = CmarkGfmRenderWithStrikethrough(content);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_cmark_gfm_strikethrough_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_md4c_strikethrough").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          std::vector<char> output;
+          output.reserve(4096);
+          md_html(
+              content.c_str(), static_cast<MD_SIZE>(content.size()),
+              [](const char* text, MD_SIZE sz, void* userdata) {
+                auto& vec = *static_cast<std::vector<char>*>(userdata);
+                vec.insert(vec.end(), text, text + sz);
+              },
+              &output, MD_DIALECT_COMMONMARK | MD_FLAG_STRIKETHROUGH, 0);
+          benchmark::DoNotOptimize(output.data());
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_md4c_strikethrough_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -441,11 +580,14 @@ int main(int argc, char** argv) {
                    "samples dir\n";
       std::cerr << "  SAMPLES_DIR      Directory with .md files (default: "
                    "cmark-gfm/bench/samples)\n";
-      std::cerr << "\nIn addition to the CommonMark comparison, an autolink\n"
-                   "benchmark (autolink-ext_*) runs each parser with the GFM "
-                   "autolink\n"
-                   "extension enabled on a synthetic autolink-heavy document.\n"
-                   "Use --benchmark_filter=autolink to run only those.\n";
+      std::cerr << "\nIn addition to the CommonMark comparison, autolink and\n"
+                   "strikethrough benchmarks (autolink-ext_*, "
+                   "strikethrough-ext_*)\n"
+                   "run each parser with the matching GFM extension enabled on "
+                   "a synthetic\n"
+                   "extension-heavy document. Use --benchmark_filter=autolink "
+                   "or\n"
+                   "--benchmark_filter=strikethrough to run only those.\n";
       std::cerr << "\nGoogle Benchmark options:\n";
       std::cerr << "  --benchmark_min_time=N   Minimum time per benchmark run "
                    "(default: 1s)\n";
@@ -478,10 +620,11 @@ int main(int argc, char** argv) {
 
   RegisterBenchmarks(inputs);
 
-  // GFM autolink extension benchmark: each parser with the autolink extension
-  // enabled, on a synthetic autolink-heavy document.
+  // GFM autolink and strikethrough extension benchmarks: each parser with the
+  // extension enabled, on a synthetic extension-heavy document.
   EnsureCmarkGfmExtensions();
   RegisterAutolinkBenchmarks(GenerateAutolinkSample());
+  RegisterStrikethroughBenchmarks(GenerateStrikethroughSample());
 
   // Add --benchmark_repetitions for our --rounds option
   std::string reps_arg =

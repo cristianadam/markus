@@ -131,6 +131,7 @@ struct HardBreak;
 struct Code;
 struct Emphasis;
 struct Strong;
+struct Strikethrough;
 struct Link;
 struct Image;
 struct HtmlInline;
@@ -157,6 +158,7 @@ enum class NodeType {
   kCode,
   kEmphasis,
   kStrong,
+  kStrikethrough,
   kLink,
   kImage,
   kHtmlInline,
@@ -197,6 +199,8 @@ inline std::string_view NodeTypeToString(NodeType type) {
       return "Emphasis";
     case NodeType::kStrong:
       return "Strong";
+    case NodeType::kStrikethrough:
+      return "Strikethrough";
     case NodeType::kLink:
       return "Link";
     case NodeType::kImage:
@@ -246,6 +250,10 @@ struct Strong {
   std::pmr::vector<InlineNodeId> children;
 };
 
+struct Strikethrough {
+  std::pmr::vector<InlineNodeId> children;
+};
+
 struct Link {
   std::pmr::string destination;
   std::pmr::string title;
@@ -267,7 +275,7 @@ struct HtmlInline {
 
 // Variant type for inline content
 using InlineNode = std::variant<Text, SoftBreak, HardBreak, Code, Emphasis,
-                                Strong, Link, Image, HtmlInline>;
+                                Strong, Strikethrough, Link, Image, HtmlInline>;
 
 // =============================================================================
 // Block Node Definitions
@@ -2220,6 +2228,7 @@ inline constexpr auto MakeInlineSpecialTable() {
   table['<'] = 1;   // Autolink / HTML inline
   table['*'] = 1;   // Emphasis / strong
   table['_'] = 1;   // Emphasis / strong
+  table['~'] = 1;   // GFM strikethrough (only when the extension is enabled)
   table['['] = 1;   // Link open
   table[']'] = 1;   // Link close
   table['!'] = 1;   // Image prefix
@@ -2691,6 +2700,11 @@ class InlineParser {
   // always recognised). Off by default for plain CommonMark behaviour.
   bool enable_autolink = false;
 
+  // GFM `strikethrough` extension. When true, `~`/`~~` delimiter runs are
+  // recognised and wrapped in a <del> node. Off by default so `~` is treated as
+  // plain text under plain CommonMark behaviour.
+  bool enable_strikethrough = false;
+
  private:
   std::string_view text_;
   size_t pos_ = 0;
@@ -2912,6 +2926,41 @@ class InlineParser {
         // Add delimiter to stack
         delimiter_stack.emplace_back(result.size() - 1, pos_, run_length, c,
                                      can_open, can_close, true);
+
+        pos_ += run_length;
+        continue;
+      }
+
+      // Check for GFM `strikethrough` markers (only when the extension is on).
+      // Mirrors cmark-gfm's strikethrough match(): a run of 1 or 2 tildes that
+      // is left- or right-flanking becomes a delimiter; longer runs and
+      // non-flanking runs are plain text. The whole maximal run is emitted as a
+      // single text node (and a delimiter is pushed only when valid) so that a
+      // sub-run of a longer run is never re-examined. can_open/can_close come
+      // straight from the flanking flags (no underscore-style extra rules).
+      if (c == '~' && enable_strikethrough) {
+        size_t run_start = pos_;
+        size_t run_length = 0;
+        while (pos_ + run_length < text_.size() &&
+               text_[pos_ + run_length] == '~') {
+          ++run_length;
+        }
+
+        flush_text();
+
+        // Add the tilde run as text - view into input
+        result.emplace_back(std::in_place_type<Text>,
+                            text_.substr(pos_, run_length));
+
+        if (run_length <= 2) {
+          bool left_flanking = IsLeftFlanking(run_start, run_length);
+          bool right_flanking = IsRightFlanking(run_start, run_length);
+          if (left_flanking || right_flanking) {
+            delimiter_stack.emplace_back(result.size() - 1, pos_, run_length,
+                                         '~', left_flanking, right_flanking,
+                                         true);
+          }
+        }
 
         pos_ += run_length;
         continue;
@@ -3865,6 +3914,8 @@ class InlineParser {
               result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Strong>) {
               result += GetAltTextFromIds(arg.children);
+            } else if constexpr (std::is_same_v<T, Strikethrough>) {
+              result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Link>) {
               result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Image>) {
@@ -3896,6 +3947,8 @@ class InlineParser {
               result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Strong>) {
               result += GetAltTextFromIds(arg.children);
+            } else if constexpr (std::is_same_v<T, Strikethrough>) {
+              result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Link>) {
               result += GetAltTextFromIds(arg.children);
             } else if constexpr (std::is_same_v<T, Image>) {
@@ -3917,7 +3970,8 @@ class InlineParser {
       auto& closer = delimiters[closer_idx];
 
       if (!closer.can_close || !closer.active ||
-          (closer.delimiter != '*' && closer.delimiter != '_')) {
+          (closer.delimiter != '*' && closer.delimiter != '_' &&
+           closer.delimiter != '~')) {
         ++closer_idx;
         continue;
       }
@@ -3944,6 +3998,60 @@ class InlineParser {
         found_opener = true;
         size_t opener_pos = opener.pos;
         size_t closer_pos = closer.pos;
+
+        // GFM `strikethrough`: the opener and closer must have the SAME number
+        // of tildes, and both whole runs are consumed. When the counts differ,
+        // cmark-gfm still drops the two delimiters (and any between them) from
+        // the stack without producing a node; the tildes remain in the text and
+        // later closers can no longer match against them.
+        if (closer.delimiter == '~') {
+          if (opener.count == closer.count) {
+            // Collect content nodes between opener and closer
+            std::pmr::vector<InlineNode> content;
+            size_t content_size = closer_pos - opener_pos - 1;
+            content.reserve(content_size);
+            for (size_t i = opener_pos + 1; i < closer_pos; ++i) {
+              content.push_back(std::move(nodes[i]));
+            }
+
+            Strikethrough strike;
+            strike.children = NodesToIds(content);
+
+            // Consume both whole runs (the tildes are replaced by the node).
+            nodes[opener_pos] = Text("");
+            opener.active = false;
+            nodes[closer_pos] = Text("");
+            closer.active = false;
+
+            // Remove the content nodes and insert the strikethrough node after
+            // the (now empty) opener text node.
+            size_t content_count = closer_pos - opener_pos - 1;
+            nodes.erase(nodes.begin() + opener_pos + 1,
+                        nodes.begin() + closer_pos);
+            nodes.insert(nodes.begin() + opener_pos + 1, std::move(strike));
+
+            // Adjust positions in the delimiter stack (same as emphasis).
+            int64_t net_shift = 1 - static_cast<int64_t>(content_count);
+            for (auto& d : delimiters) {
+              if (d.pos > opener_pos && d.pos < closer_pos) {
+                d.active = false;
+              } else if (d.pos >= closer_pos) {
+                d.pos = static_cast<size_t>(static_cast<int64_t>(d.pos) +
+                                            net_shift);
+              }
+            }
+          } else {
+            // Mismatch: drop the delimiters without creating a node.
+            opener.active = false;
+            closer.active = false;
+            for (auto& d : delimiters) {
+              if (d.pos > opener_pos && d.pos < closer_pos) {
+                d.active = false;
+              }
+            }
+          }
+          break;
+        }
 
         // Determine emphasis type
         bool is_strong = opener.count >= 2 && closer.count >= 2;
@@ -4413,6 +4521,10 @@ class BlockParser {
   // recognised regardless of this flag.
   bool enable_autolink = false;
 
+  // GFM `strikethrough` extension. When true, `~`/`~~` delimiter runs are
+  // wrapped in a <del> node. Off by default for plain CommonMark behaviour.
+  bool enable_strikethrough = false;
+
   Document Parse(std::string_view input) {
     // Reset the thread-local monotonic buffer for this parse operation.
     // All std::pmr containers created from here until the next Parse() call
@@ -4429,6 +4541,7 @@ class BlockParser {
     InlineParser inline_parser(&doc.link_references, &doc.string_storage,
                                &doc.inline_nodes);
     inline_parser.enable_autolink = enable_autolink;
+    inline_parser.enable_strikethrough = enable_strikethrough;
     ParseInlines(doc.children, inline_parser);
 
     return doc;
@@ -7092,6 +7205,10 @@ class HtmlRenderer {
               out += "<strong>";
               RenderInlines(n.children, out);
               out += "</strong>";
+            } else if constexpr (std::is_same_v<T, Strikethrough>) {
+              out += "<del>";
+              RenderInlines(n.children, out);
+              out += "</del>";
             } else if constexpr (std::is_same_v<T, Link>) {
               out += "<a href=\"";
               detail::EscapeHtmlTo(n.destination, out);
@@ -7130,12 +7247,15 @@ class HtmlRenderer {
 // =============================================================================
 
 // Parser options. Plain CommonMark by default; individual GFM extensions can
-// be turned on: `enable_tables` (the `table` extension) and `enable_autolink`
+// be turned on: `enable_tables` (the `table` extension), `enable_autolink`
 // (the `autolink` extension, which recognises www/url/email autolinks in plain
-// text in addition to the CommonMark `<...>` autolinks).
+// text in addition to the CommonMark `<...>` autolinks), and
+// `enable_strikethrough` (the `strikethrough` extension, which wraps `~`/`~~`
+// delimited text in a <del> node).
 struct Options {
   bool enable_tables = false;
   bool enable_autolink = false;
+  bool enable_strikethrough = false;
 };
 
 // Parse Markdown input and return an AST
@@ -7149,6 +7269,7 @@ inline Document Parse(std::string_view input, const Options& options) {
   BlockParser parser;
   parser.enable_tables = options.enable_tables;
   parser.enable_autolink = options.enable_autolink;
+  parser.enable_strikethrough = options.enable_strikethrough;
   return parser.Parse(input);
 }
 
@@ -7204,6 +7325,9 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
               print_inlines(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, Strong>) {
               result += p + "Strong\n";
+              print_inlines(n.children, ind + 1);
+            } else if constexpr (std::is_same_v<T, Strikethrough>) {
+              result += p + "Strikethrough\n";
               print_inlines(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, Link>) {
               result += p + "Link: " + n.destination + "\n";

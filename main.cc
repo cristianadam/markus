@@ -12,13 +12,15 @@
 namespace {
 
 void PrintUsage(const char* program_name) {
-  std::cerr << "Usage: " << program_name << " [--ast]\n";
+  std::cerr << "Usage: " << program_name << " [--ast] [--unsafe] [-e <ext> ...]\n";
   std::cerr << "\n";
   std::cerr << "Reads markdown from stdin and outputs HTML to stdout.\n";
   std::cerr << "\n";
   std::cerr << "Options:\n";
-  std::cerr << "  --ast    Print the AST instead of HTML output\n";
-  std::cerr << "  --help   Show this help message\n";
+  std::cerr << "  --ast     Print the AST instead of HTML output\n";
+  std::cerr << "  --unsafe  Accept (and render) raw HTML (accepted for cmark compatibility)\n";
+  std::cerr << "  -e <ext>  Enable a GFM extension (currently: table)\n";
+  std::cerr << "  --help    Show this help message\n";
 }
 
 std::string ReadStdin() {
@@ -36,6 +38,7 @@ int main(int argc, char* argv[]) {
 #endif
 
   bool ast_mode = false;
+  markus::Options options;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -45,16 +48,24 @@ int main(int argc, char* argv[]) {
     }
     if (arg == "--ast") {
       ast_mode = true;
+    } else if (arg == "--unsafe") {
+      // Raw HTML is always passed through; the flag is accepted for
+      // cmark/cmark-gfm compatibility.
+    } else if (arg == "-e") {
+      if (i + 1 < argc && std::string(argv[i + 1]) == "table") {
+        options.enable_tables = true;
+      }
+      ++i;  // Consume the extension name.
     }
   }
 
   std::string markdown = ReadStdin();
 
   if (ast_mode) {
-    markus::Document doc = markus::Parse(markdown);
+    markus::Document doc = markus::Parse(markdown, options);
     std::cout << markus::DebugAst(doc);
   } else {
-    std::cout << markus::MarkdownToHtml(markdown);
+    std::cout << markus::MarkdownToHtml(markdown, options);
   }
 
   return 0;

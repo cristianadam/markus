@@ -124,6 +124,7 @@ struct HtmlBlock;
 struct BlockQuote;
 struct List;
 struct ListItem;
+struct Table;
 struct Text;
 struct SoftBreak;
 struct HardBreak;
@@ -149,6 +150,7 @@ enum class NodeType {
   kBlockQuote,
   kList,
   kListItem,
+  kTable,
   kText,
   kSoftBreak,
   kHardBreak,
@@ -181,6 +183,8 @@ inline std::string_view NodeTypeToString(NodeType type) {
       return "List";
     case NodeType::kListItem:
       return "ListItem";
+    case NodeType::kTable:
+      return "Table";
     case NodeType::kText:
       return "Text";
     case NodeType::kSoftBreak:
@@ -339,9 +343,36 @@ struct BlockQuote {
       : children(std::move(children)) {}
 };
 
+// Column alignment for GFM tables (GFM `table` extension).
+enum class TableAlign : uint8_t {
+  kNone = 0,
+  kLeft = 1,
+  kCenter = 2,
+  kRight = 3,
+};
+
+struct TableCell {
+  std::pmr::string raw_content;  // Cell text; inlines parsed in the 3rd pass
+  std::pmr::vector<InlineNodeId> children;
+
+  TableCell() = default;
+  explicit TableCell(std::pmr::string content)
+      : raw_content(std::move(content)) {}
+};
+
+struct TableRow {
+  bool is_header = false;
+  std::pmr::vector<TableCell> cells;  // Always padded to the table's column count
+};
+
+struct Table {
+  std::pmr::vector<TableAlign> alignments;  // Size == number of columns
+  std::pmr::vector<TableRow> rows;  // rows[0] is the header row
+};
+
 // Variant type for block content
 using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
-                               HtmlBlock, BlockQuote, List, ListItem>;
+                               HtmlBlock, BlockQuote, List, ListItem, Table>;
 
 // Type alias for link references - sorted vector with binary search
 // Much faster than unordered_map for typical document sizes (< 50 refs)
@@ -1872,6 +1903,267 @@ inline bool IsBlankLine(std::string_view line) {
   for (char c : line) {
     if (!kBlankTable[static_cast<unsigned char>(c)]) {
       return false;
+    }
+  }
+  return true;
+}
+
+// =============================================================================
+// GFM table (extension) helpers
+// =============================================================================
+
+// Remove a backslash that immediately precedes a pipe, matching cmark-gfm's
+// unescape_pipes so that `\|` inside a cell becomes a literal `|`.
+inline void UnescapePipes(std::pmr::string& s) {
+  size_t r = 0, w = 0;
+  while (r < s.size()) {
+    if (s[r] == '\\' && r + 1 < s.size() && s[r + 1] == '|') {
+      ++r;  // drop the backslash
+    }
+    s[w++] = s[r];
+    ++r;
+  }
+  s.resize(w);
+}
+
+// True if `line` is a setext heading underline: a run of `=` or `-`, then
+// optional whitespace, indented at most 3 spaces. Used so that `foo` + `---`
+// stays a heading rather than a single-column table.
+inline bool IsSetextUnderline(std::string_view line) {
+  if (CountIndent(line) >= 4) return false;
+  std::string_view t = TrimLeft(line);
+  if (t.empty()) return false;
+  char c = t[0];
+  if (c != '=' && c != '-') return false;
+  size_t i = 0;
+  while (i < t.size() && t[i] == c) ++i;
+  for (; i < t.size(); ++i) {
+    if (t[i] != ' ' && t[i] != '\t') return false;
+  }
+  return true;
+}
+
+// True if a (trimmed) delimiter cell matches GFM's `:?-+:?`; fills alignment.
+inline bool ClassifyDelimiterCell(std::string_view cell, TableAlign& align) {
+  if (cell.empty()) return false;
+  size_t i = 0;
+  bool left = false, right = false;
+  if (cell[i] == ':') {
+    left = true;
+    ++i;
+  }
+  size_t first_hyphen = i;
+  while (i < cell.size() && cell[i] == '-') ++i;
+  if (i == first_hyphen) return false;  // needs at least one hyphen
+  if (i < cell.size() && cell[i] == ':') {
+    right = true;
+    ++i;
+  }
+  if (i != cell.size()) return false;  // trailing junk
+  align = (left && right) ? TableAlign::kCenter
+         : (left)          ? TableAlign::kLeft
+         : (right)         ? TableAlign::kRight
+                           : TableAlign::kNone;
+  return true;
+}
+
+// Split a single GFM table row line into its cell contents (pipes removed,
+// `\|` escapes resolved, cells trimmed). Mirrors cmark-gfm's row_from_string
+// for a line that is exactly one row. Returns an empty vector if the line does
+// not cleanly form a row of one or more cells.
+inline std::pmr::vector<std::pmr::string> SplitTableRow(std::string_view line) {
+  std::pmr::vector<std::pmr::string> cells;
+  const size_t len = line.size();
+  size_t offset = 0;
+
+  auto is_space = [](char c) {
+    return c == ' ' || c == '\t' || c == '\v' || c == '\f';
+  };
+  auto is_escaped = [](std::string_view s, size_t i) {
+    if (s[i] != '\\' || i + 1 >= s.size()) return false;
+    unsigned char c = s[i + 1];
+    return c >= 0x21 && c <= 0x7e;  // backslash + ASCII punctuation
+  };
+
+  // Scan past the optional leading pipe (and following spaces).
+  if (offset < len && line[offset] == '|') {
+    ++offset;
+    while (offset < len && is_space(line[offset])) ++offset;
+  }
+
+  bool expect_more = true;
+  while (offset < len && expect_more) {
+    // table_cell: (escaped_char | [^|\r\n])+
+    const size_t cell_start = offset;
+    size_t cell_matched = 0;
+    while (offset < len) {
+      if (is_escaped(line, offset)) {
+        offset += 2;
+        cell_matched += 2;
+      } else if (line[offset] != '|' && line[offset] != '\r' &&
+                 line[offset] != '\n') {
+        ++offset;
+        ++cell_matched;
+      } else {
+        break;
+      }
+    }
+    // table_cell_end: [|] spacechar*
+    size_t pipe_matched = 0;
+    if (offset < len && line[offset] == '|') {
+      ++offset;
+      ++pipe_matched;
+      while (offset < len && is_space(line[offset])) {
+        ++offset;
+        ++pipe_matched;
+      }
+    }
+
+    if (cell_matched > 0 || pipe_matched > 0) {
+      std::pmr::string cell(line.substr(cell_start, cell_matched));
+      UnescapePipes(cell);
+      // Trim ASCII whitespace (spaces, tabs) like cmark_strbuf_trim.
+      size_t a = 0, b = cell.size();
+      while (a < b && (cell[a] == ' ' || cell[a] == '\t')) ++a;
+      while (b > a && (cell[b - 1] == ' ' || cell[b - 1] == '\t')) --b;
+      cell = std::pmr::string(cell.substr(a, b - a));
+      cells.push_back(std::move(cell));
+    }
+
+    if (pipe_matched > 0) {
+      expect_more = true;
+    } else {
+      // table_row_end: trailing spaces only (a single line has no newline).
+      while (offset < len && is_space(line[offset])) ++offset;
+      if (offset != len) return {};
+      expect_more = false;
+    }
+  }
+
+  if (offset != len || cells.empty()) return {};
+  return cells;
+}
+
+// True if `line` continues a GFM table as a body row: non-blank and not the
+// start of a new block-level construct. Setext underlines do not apply here
+// (a table is not a paragraph), so `===` is a row but `---` is a thematic
+// break.
+inline bool IsTableRowLine(std::string_view line) {
+  if (IsBlankLine(line)) return false;
+  if (CountIndent(line) >= 4) return false;  // indented code block
+  std::string_view t = TrimLeft(line);
+  if (t.empty()) return false;
+
+  // ATX heading
+  if (t[0] == '#') {
+    size_t h = 0;
+    while (h < t.size() && t[h] == '#') ++h;
+    if (h <= 6 && (h >= t.size() || t[h] == ' ' || t[h] == '\t')) return false;
+  }
+  // Block quote
+  if (t[0] == '>') return false;
+  // Fenced code block
+  if (t.size() >= 3 && (t[0] == '`' || t[0] == '~')) {
+    char f = t[0];
+    size_t fl = 0;
+    while (fl < t.size() && t[fl] == f) ++fl;
+    if (fl >= 3) {
+      if (f == '~') return false;
+      std::string_view info = Trim(t.substr(fl));
+      if (info.find('`') == std::string_view::npos) return false;
+    }
+  }
+  // Thematic break
+  if (t.size() >= 3 && (t[0] == '-' || t[0] == '*' || t[0] == '_')) {
+    char c = t[0];
+    int count = 0;
+    bool ok = true;
+    for (char ch : t) {
+      if (ch == c) ++count;
+      else if (ch != ' ' && ch != '\t') { ok = false; break; }
+    }
+    if (ok && count >= 3) return false;
+  }
+  // List item
+  if (t.starts_with("- ") || t.starts_with("+ ") || t.starts_with("* "))
+    return false;
+  if (std::isdigit(static_cast<unsigned char>(t[0]))) {
+    size_t num_end = 0;
+    while (num_end < t.size() &&
+           std::isdigit(static_cast<unsigned char>(t[num_end]))) ++num_end;
+    if (num_end + 1 < t.size() && (t[num_end] == '.' || t[num_end] == ')') &&
+        (t[num_end + 1] == ' ' || t[num_end + 1] == '\t')) {
+      return false;
+    }
+  }
+  // HTML block (types 1-6 can terminate a table)
+  if (t.starts_with("<")) {
+    static constexpr std::array type1_tags = {
+        std::string_view("<script"), std::string_view("<pre"),
+        std::string_view("<style"), std::string_view("<textarea")};
+    for (auto tag : type1_tags) {
+      if (StartsWithInsensitive(t, tag) &&
+          (t.size() == tag.size() || t[tag.size()] == ' ' ||
+           t[tag.size()] == '>' || t[tag.size()] == '\t')) {
+        return false;
+      }
+    }
+    if (t.starts_with("<!--") || t.starts_with("<?") ||
+        t.starts_with("<![CDATA[")) {
+      return false;
+    }
+    if (StartsWithInsensitive(t, "<!doctype")) return false;
+    static constexpr std::array type6_tags = {
+        std::string_view("address"),  std::string_view("article"),
+        std::string_view("aside"),    std::string_view("base"),
+        std::string_view("basefont"), std::string_view("blockquote"),
+        std::string_view("body"),     std::string_view("caption"),
+        std::string_view("center"),   std::string_view("col"),
+        std::string_view("colgroup"), std::string_view("dd"),
+        std::string_view("details"),  std::string_view("dialog"),
+        std::string_view("dir"),      std::string_view("div"),
+        std::string_view("dl"),       std::string_view("dt"),
+        std::string_view("fieldset"), std::string_view("figcaption"),
+        std::string_view("figure"),   std::string_view("footer"),
+        std::string_view("form"),     std::string_view("frame"),
+        std::string_view("frameset"), std::string_view("h1"),
+        std::string_view("h2"),       std::string_view("h3"),
+        std::string_view("h4"),       std::string_view("h5"),
+        std::string_view("h6"),       std::string_view("head"),
+        std::string_view("header"),   std::string_view("hr"),
+        std::string_view("html"),     std::string_view("iframe"),
+        std::string_view("legend"),   std::string_view("li"),
+        std::string_view("link"),     std::string_view("main"),
+        std::string_view("menu"),     std::string_view("menuitem"),
+        std::string_view("nav"),      std::string_view("noframes"),
+        std::string_view("ol"),       std::string_view("optgroup"),
+        std::string_view("option"),   std::string_view("p"),
+        std::string_view("param"),    std::string_view("search"),
+        std::string_view("section"),  std::string_view("summary"),
+        std::string_view("table"),    std::string_view("tbody"),
+        std::string_view("td"),       std::string_view("tfoot"),
+        std::string_view("th"),       std::string_view("thead"),
+        std::string_view("title"),    std::string_view("tr"),
+        std::string_view("track"),    std::string_view("ul")};
+    bool is_closing = (t.size() >= 2 && t[1] == '/');
+    size_t tag_start = is_closing ? 2 : 1;
+    size_t tag_end = tag_start;
+    while (tag_end < t.size() &&
+           (std::isalnum(static_cast<unsigned char>(t[tag_end])) ||
+            t[tag_end] == '-')) {
+      ++tag_end;
+    }
+    if (tag_end > tag_start) {
+      std::string_view tag_name = t.substr(tag_start, tag_end - tag_start);
+      for (auto name : type6_tags) {
+        if (StartsWithInsensitive(tag_name, name) &&
+            tag_name.size() == name.size()) {
+          if (tag_end >= t.size() || t[tag_end] == ' ' || t[tag_end] == '>' ||
+              t[tag_end] == '\t' || t[tag_end] == '/') {
+            return false;
+          }
+        }
+      }
     }
   }
   return true;
@@ -3698,8 +3990,12 @@ class InlineParser {
 // =============================================================================
 
 class BlockParser {
- public:
-  Document Parse(std::string_view input) {
+  public:
+   // GFM `table` extension. When false (default, CommonMark mode) tables are
+   // not recognized and the corresponding syntax is left as plain paragraphs.
+   bool enable_tables = false;
+
+   Document Parse(std::string_view input) {
     // Reset the thread-local monotonic buffer for this parse operation.
     // All std::pmr containers created from here until the next Parse() call
     // will allocate from this single growing buffer via pointer bumping,
@@ -4243,9 +4539,8 @@ class BlockParser {
         continue;
       }
 
-      // Default: paragraph (may include setext heading)
-      auto para = ParseParagraph();
-      blocks.push_back(std::move(para));
+      // Default: paragraph (may include setext heading, or a GFM table)
+      ParseParagraph(blocks);
     }
   }
 
@@ -5131,6 +5426,7 @@ class BlockParser {
       return false;
 
     BlockParser nested_parser;
+    nested_parser.enable_tables = enable_tables;
     std::pmr::vector<BlockNode> nested_blocks;
     nested_parser.ParseBlocksInto(std::string_view(nested_buf), *doc_,
                                   nested_blocks, /*input_no_nulls=*/true);
@@ -5628,6 +5924,7 @@ class BlockParser {
         // Parse item content
         if (!item_buf.empty()) {
           BlockParser item_parser;
+          item_parser.enable_tables = enable_tables;
           std::pmr::vector<BlockNode> item_blocks;
           item_parser.ParseBlocksInto(std::string_view(item_buf), *doc_,
                                       item_blocks, /*input_no_nulls=*/true);
@@ -5705,7 +6002,79 @@ class BlockParser {
     return true;
   }
 
-  BlockNode ParseParagraph() {
+  // If `header_line` (the current line) is a table header and the following
+  // line is a matching delimiter row, consume the whole table (header,
+  // delimiter and body rows) and fill `out`. Returns false without consuming
+  // anything when it is not a table.
+  bool TryBuildTable(std::string_view header_line, Table* out) {
+    if (line_idx_ + 1 >= lines_->size()) return false;
+    std::string_view next_raw = (*lines_)[line_idx_ + 1];
+    std::string_view next_line = detail::TrimLeft(next_raw);
+
+    // A setext underline following a one-line paragraph is a heading, not a
+    // single-column table.
+    if (detail::IsSetextUnderline(next_raw)) return false;
+
+    // A delimiter row that looks like a list bullet (e.g. `- | -`) is parsed
+    // as a list, not a table (lists take precedence).
+    if (next_line.size() >= 2 && next_line[0] == '-' &&
+        (next_line[1] == ' ' || next_line[1] == '\t')) {
+      return false;
+    }
+
+    auto header_cells = detail::SplitTableRow(header_line);
+    if (header_cells.empty()) return false;
+
+    auto delim_cells = detail::SplitTableRow(next_line);
+    if (delim_cells.empty() || delim_cells.size() != header_cells.size())
+      return false;
+
+    std::pmr::vector<TableAlign> aligns;
+    aligns.reserve(delim_cells.size());
+    for (auto& c : delim_cells) {
+      TableAlign a;
+      if (!detail::ClassifyDelimiterCell(c, a)) return false;
+      aligns.push_back(a);
+    }
+
+    const int ncols = static_cast<int>(header_cells.size());
+    out->alignments = std::move(aligns);
+
+    TableRow header_row;
+    header_row.is_header = true;
+    header_row.cells.reserve(ncols);
+    for (int i = 0; i < ncols; ++i) {
+      header_row.cells.emplace_back(std::pmr::string(header_cells[i]));
+    }
+    out->rows.push_back(std::move(header_row));
+
+    // Consume the header and delimiter lines.
+    Advance();
+    Advance();
+
+    // Body rows: consume while the line continues the table.
+    while (!AtEnd()) {
+      std::string_view body_line = CurrentLine();
+      if (!detail::IsTableRowLine(body_line)) break;
+      auto body_cells = detail::SplitTableRow(detail::TrimLeft(body_line));
+      TableRow body_row;
+      body_row.is_header = false;
+      body_row.cells.reserve(ncols);
+      for (int i = 0; i < ncols; ++i) {
+        if (i < static_cast<int>(body_cells.size())) {
+          body_row.cells.emplace_back(std::pmr::string(body_cells[i]));
+        } else {
+          body_row.cells.emplace_back(std::pmr::string());
+        }
+      }
+      out->rows.push_back(std::move(body_row));
+      Advance();
+    }
+
+    return true;
+  }
+
+  void ParseParagraph(std::pmr::vector<BlockNode>& blocks) {
     // Store non-owning views into the LineBuffer (which stays valid for the
     // duration of this call) instead of copying each line into its own
     // string. The single join into raw_content at the end is the only copy.
@@ -5752,7 +6121,8 @@ class BlockParser {
                 heading_content += para_lines[j];
               }
               heading.raw_content = std::move(heading_content);
-              return heading;
+              blocks.push_back(heading);
+              return;
             }
           }
         }
@@ -5926,6 +6296,28 @@ class BlockParser {
         }
       }
 
+      // GFM tables: the current (non-blank, non-interrupting) line is a table
+      // header if the following line is a matching delimiter row. Any lines
+      // collected so far become a separate preceding paragraph.
+      if (enable_tables && indent < 4 &&
+          (!trimmed.empty() && trimmed[0] != '\x01')) {
+        Table table;
+        if (TryBuildTable(trimmed, &table)) {
+          if (!para_lines.empty()) {
+            Paragraph leading;
+            std::pmr::string leading_content;
+            for (size_t j = 0; j < para_lines.size(); ++j) {
+              if (j > 0) leading_content += '\n';
+              leading_content += para_lines[j];
+            }
+            leading.raw_content = std::move(leading_content);
+            blocks.push_back(std::move(leading));
+          }
+          blocks.push_back(std::move(table));
+          return;
+        }
+      }
+
       // Strip \x01 marker used for lazy continuation lines
       if (!trimmed.empty() && trimmed[0] == '\x01') {
         para_lines.push_back(trimmed.substr(1));
@@ -5942,7 +6334,7 @@ class BlockParser {
       para_content += para_lines[j];
     }
     para.raw_content = std::move(para_content);
-    return para;
+    blocks.push_back(std::move(para));
   }
 
   void ParseInlines(std::pmr::vector<BlockNode>& blocks, InlineParser& parser) {
@@ -5969,6 +6361,15 @@ class BlockParser {
               for (auto& item : node.items) {
                 ParseInlines(item.children, parser);
               }
+            } else if constexpr (std::is_same_v<T, Table>) {
+              for (auto& row : node.rows) {
+                for (auto& cell : row.cells) {
+                  doc_->string_storage.push_back(std::move(cell.raw_content));
+                  std::string_view stable_content =
+                      doc_->string_storage.back();
+                  cell.children = parser.Parse(stable_content);
+                }
+              }
             }
           },
           block);
@@ -5976,7 +6377,7 @@ class BlockParser {
   }
 
   void ParseInlines(const std::pmr::vector<BlockNodeId>& block_ids,
-                     InlineParser& parser) {
+                    InlineParser& parser) {
     for (BlockNodeId id : block_ids) {
       auto& block = doc_->block_nodes[id];
       std::visit(
@@ -5995,6 +6396,15 @@ class BlockParser {
             } else if constexpr (std::is_same_v<T, List>) {
               for (auto& item : node.items) {
                 ParseInlines(item.children, parser);
+              }
+            } else if constexpr (std::is_same_v<T, Table>) {
+              for (auto& row : node.rows) {
+                for (auto& cell : row.cells) {
+                  doc_->string_storage.push_back(std::move(cell.raw_content));
+                  std::string_view stable_content =
+                      doc_->string_storage.back();
+                  cell.children = parser.Parse(stable_content);
+                }
               }
             }
           },
@@ -6042,6 +6452,8 @@ class HtmlRenderer {
               RenderList(node, out);
             } else if constexpr (std::is_same_v<T, ListItem>) {
               // Handled by RenderList
+            } else if constexpr (std::is_same_v<T, Table>) {
+              RenderTable(node, out);
             }
           },
           blocks[i]);
@@ -6125,6 +6537,8 @@ class HtmlRenderer {
               RenderList(node, out);
             } else if constexpr (std::is_same_v<T, ListItem>) {
               // Handled by RenderList
+            } else if constexpr (std::is_same_v<T, Table>) {
+              RenderTable(node, out);
             }
           },
           block);
@@ -6178,6 +6592,61 @@ class HtmlRenderer {
     } else {
       out += "</ul>\n";
     }
+  }
+
+  void RenderTable(const Table& table, std::pmr::string& out) {
+    out += "<table>\n";
+
+    // Header row wrapped in <thead>.
+    out += "<thead>\n";
+    const TableRow& header = table.rows.front();
+    out += "<tr>\n";
+    for (size_t i = 0; i < header.cells.size(); ++i) {
+      RenderTableCell(header.cells[i], i, table.alignments, /*is_header=*/true,
+                      out);
+    }
+    out += "</tr>\n</thead>\n";
+
+    // Body rows wrapped in <tbody> (only emitted when there are body rows).
+    if (table.rows.size() > 1) {
+      out += "<tbody>\n";
+      for (size_t r = 1; r < table.rows.size(); ++r) {
+        const TableRow& row = table.rows[r];
+        out += "<tr>\n";
+        for (size_t i = 0; i < row.cells.size(); ++i) {
+          RenderTableCell(row.cells[i], i, table.alignments,
+                          /*is_header=*/false, out);
+        }
+        out += "</tr>\n";
+      }
+      out += "</tbody>\n";
+    }
+
+    out += "</table>\n";
+  }
+
+  void RenderTableCell(const TableCell& cell, size_t col,
+                       const std::pmr::vector<TableAlign>& alignments,
+                       bool is_header, std::pmr::string& out) {
+    out += is_header ? "<th" : "<td";
+    if (col < alignments.size()) {
+      switch (alignments[col]) {
+        case TableAlign::kLeft:
+          out += " align=\"left\"";
+          break;
+        case TableAlign::kCenter:
+          out += " align=\"center\"";
+          break;
+        case TableAlign::kRight:
+          out += " align=\"right\"";
+          break;
+        default:
+          break;
+      }
+    }
+    out += '>';
+    RenderInlines(cell.children, out);
+    out += is_header ? "</th>\n" : "</td>\n";
   }
 
   void RenderInlines(const std::pmr::vector<InlineNodeId>& node_ids,
@@ -6242,9 +6711,22 @@ class HtmlRenderer {
 // Public API
 // =============================================================================
 
+// Parser options. Plain CommonMark by default; set `enable_tables` to turn on
+// the GFM `table` extension.
+struct Options {
+  bool enable_tables = false;
+};
+
 // Parse Markdown input and return an AST
 inline Document Parse(std::string_view input) {
   BlockParser parser;
+  return parser.Parse(input);
+}
+
+// Parse Markdown input with options and return an AST
+inline Document Parse(std::string_view input, const Options& options) {
+  BlockParser parser;
+  parser.enable_tables = options.enable_tables;
   return parser.Parse(input);
 }
 
@@ -6257,6 +6739,12 @@ inline std::pmr::string RenderHtml(const Document& doc) {
 // Convenience function: parse Markdown and render to HTML
 inline std::pmr::string MarkdownToHtml(std::string_view input) {
   return RenderHtml(Parse(input));
+}
+
+// Convenience function: parse Markdown with options and render to HTML
+inline std::pmr::string MarkdownToHtml(std::string_view input,
+                                       const Options& options) {
+  return RenderHtml(Parse(input, options));
 }
 
 // Debug: print AST structure
@@ -6349,6 +6837,16 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
             } else if constexpr (std::is_same_v<T, ListItem>) {
               result += p + "ListItem\n";
               print_block_ids(n.children, ind + 1);
+            } else if constexpr (std::is_same_v<T, Table>) {
+              result += std::format("{}Table ({} cols)\n", p,
+                                    n.alignments.size());
+              for (const auto& row : n.rows) {
+                result += p + (row.is_header ? "  Row (header)\n" : "  Row\n");
+                for (const auto& cell : row.cells) {
+                  result += p + "    Cell\n";
+                  print_inlines(cell.children, ind + 3);
+                }
+              }
             }
           },
           block);
@@ -6391,6 +6889,16 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
             } else if constexpr (std::is_same_v<T, ListItem>) {
               result += p + "ListItem\n";
               print_block_ids(n.children, ind + 1);
+            } else if constexpr (std::is_same_v<T, Table>) {
+              result += std::format("{}Table ({} cols)\n", p,
+                                    n.alignments.size());
+              for (const auto& row : n.rows) {
+                result += p + (row.is_header ? "  Row (header)\n" : "  Row\n");
+                for (const auto& cell : row.cells) {
+                  result += p + "    Cell\n";
+                  print_inlines(cell.children, ind + 3);
+                }
+              }
             }
           },
           block);

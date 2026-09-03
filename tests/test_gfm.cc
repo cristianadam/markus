@@ -37,13 +37,13 @@ std::string GetGfmSpecPath() {
 // program in external mode, appending `--unsafe` and a `-e <ext>` flag per
 // required extension; markus currently ignores these and renders plain
 // CommonMark, so these tests fail until each GFM feature is implemented.
-std::string RunGfmSection(const std::string& pattern, const std::string& main_path,
+std::string RunGfmSection(const std::string& pattern,
+                          const std::string& main_path,
                           const std::string& spec_path) {
   std::ostringstream cmd;
   cmd << "python3 cmark-gfm/test/spec_tests.py"
-      << " --program " << main_path
-      << " -s " << spec_path
-      << " -P \"" << pattern << "\""
+      << " --program " << main_path << " -s " << spec_path << " -P \""
+      << pattern << "\""
       << " 2>&1";
 
   FILE* pipe = popen(cmd.str().c_str(), "r");
@@ -83,8 +83,8 @@ std::string RunGfmSection(const std::string& pattern, const std::string& main_pa
 
 }  // namespace
 
-// GFM extension features tracked against cmark-gfm's GFM spec, so that as markus
-// implements each one, the corresponding test goes green. Opt-in via
+// GFM extension features tracked against cmark-gfm's GFM spec, so that as
+// markus implements each one, the corresponding test goes green. Opt-in via
 // -DMARKUS_BUILD_GFM_TESTS=ON (excluded from the default CommonMark run).
 //
 // Task list items are intentionally omitted: their GFM spec examples are marked

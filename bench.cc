@@ -26,8 +26,8 @@
 #include "cmark-gfm.h"
 
 // md4c headers
-#include "md4c.h"
 #include "md4c-html.h"
+#include "md4c.h"
 
 namespace {
 
@@ -112,10 +112,10 @@ void PrintSummary() {
 
   printf("\n");
   printf("%-30s %12s %12s %12s %8s %8s\n", "Sample", "Markus(ms)",
-          "CmarkGfm(ms)", "Md4c(ms)", "M/GFM", "M/D");
-  printf(
-      "%-30s %12s %12s %12s %8s %8s\n", "------------------------------",
-      "------------", "------------", "------------", "--------", "--------");
+         "CmarkGfm(ms)", "Md4c(ms)", "M/GFM", "M/D");
+  printf("%-30s %12s %12s %12s %8s %8s\n", "------------------------------",
+         "------------", "------------", "------------", "--------",
+         "--------");
 
   double total_markus = 0, total_cmark_gfm = 0, total_md4c = 0;
 
@@ -134,17 +134,17 @@ void PrintSummary() {
     double ratio_mc = c > 0 ? m / c : 0;
     double ratio_md = d > 0 ? m / d : 0;
 
-    printf("%-30s %12.3f %12.3f %12.3f %7.2fx %7.2fx\n", file.c_str(), m, c,
-           d, ratio_mc, ratio_md);
+    printf("%-30s %12.3f %12.3f %12.3f %7.2fx %7.2fx\n", file.c_str(), m, c, d,
+           ratio_mc, ratio_md);
 
     total_markus += m;
     total_cmark_gfm += c;
     total_md4c += d;
   }
 
-  printf(
-      "%-30s %12s %12s %12s %8s %8s\n", "------------------------------",
-      "------------", "------------", "------------", "--------", "--------");
+  printf("%-30s %12s %12s %12s %8s %8s\n", "------------------------------",
+         "------------", "------------", "------------", "--------",
+         "--------");
 
   double ratio_mc = total_cmark_gfm > 0 ? total_markus / total_cmark_gfm : 0;
   double ratio_md = total_md4c > 0 ? total_markus / total_md4c : 0;
@@ -154,7 +154,7 @@ void PrintSummary() {
 }
 
 class SummaryReporter : public benchmark::BenchmarkReporter {
-public:
+ public:
   SummaryReporter()
       : console_reporter_(std::make_unique<benchmark::ConsoleReporter>()) {}
 
@@ -171,7 +171,7 @@ public:
     PrintSummary();
   }
 
-private:
+ private:
   std::unique_ptr<BenchmarkReporter> console_reporter_;
 };
 
@@ -193,14 +193,13 @@ void RegisterBenchmarks(
             auto result = markus::MarkdownToHtml(markus_content);
             benchmark::DoNotOptimize(result);
             auto end = std::chrono::high_resolution_clock::now();
-            double seconds =
-                std::chrono::duration<double>(end - start).count();
+            double seconds = std::chrono::duration<double>(end - start).count();
             st.SetIterationTime(seconds);
             RecordTiming(name, seconds * 1000.0, g_markus_times);
           }
           if (st.iterations() > 0) {
-            st.SetBytesProcessed(
-                static_cast<int64_t>(st.iterations()) * markus_content.size());
+            st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                                 markus_content.size());
           }
         });
 
@@ -210,17 +209,15 @@ void RegisterBenchmarks(
         [name, cmark_gfm_content](benchmark::State& st) {
           for (auto _ : st) {
             auto start = std::chrono::high_resolution_clock::now();
-            cmark_node* doc = cmark_parse_document(
-                cmark_gfm_content.c_str(), cmark_gfm_content.size(),
-                CMARK_OPT_DEFAULT);
-            char* html =
-                cmark_render_html(doc, CMARK_OPT_DEFAULT, nullptr);
+            cmark_node* doc = cmark_parse_document(cmark_gfm_content.c_str(),
+                                                   cmark_gfm_content.size(),
+                                                   CMARK_OPT_DEFAULT);
+            char* html = cmark_render_html(doc, CMARK_OPT_DEFAULT, nullptr);
             benchmark::DoNotOptimize(html);
             free(html);
             cmark_node_free(doc);
             auto end = std::chrono::high_resolution_clock::now();
-            double seconds =
-                std::chrono::duration<double>(end - start).count();
+            double seconds = std::chrono::duration<double>(end - start).count();
             st.SetIterationTime(seconds);
             RecordTiming(name, seconds * 1000.0, g_cmark_gfm_times);
           }
@@ -232,31 +229,29 @@ void RegisterBenchmarks(
 
     std::string md4c_content = content;
     benchmark::RegisterBenchmark(
-        (name + "_md4c").c_str(),
-        [name, md4c_content](benchmark::State& st) {
+        (name + "_md4c").c_str(), [name, md4c_content](benchmark::State& st) {
           for (auto _ : st) {
             auto start = std::chrono::high_resolution_clock::now();
             std::vector<char> output;
             output.reserve(4096);
 
-            md_html(md4c_content.c_str(),
-                    static_cast<MD_SIZE>(md4c_content.size()),
-                    [](const char* text, MD_SIZE sz, void* userdata) {
-                      auto& vec = *static_cast<std::vector<char>*>(userdata);
-                      vec.insert(vec.end(), text, text + sz);
-                    },
-                    &output, MD_DIALECT_COMMONMARK, 0);
+            md_html(
+                md4c_content.c_str(), static_cast<MD_SIZE>(md4c_content.size()),
+                [](const char* text, MD_SIZE sz, void* userdata) {
+                  auto& vec = *static_cast<std::vector<char>*>(userdata);
+                  vec.insert(vec.end(), text, text + sz);
+                },
+                &output, MD_DIALECT_COMMONMARK, 0);
 
             benchmark::DoNotOptimize(output.data());
             auto end = std::chrono::high_resolution_clock::now();
-            double seconds =
-                std::chrono::duration<double>(end - start).count();
+            double seconds = std::chrono::duration<double>(end - start).count();
             st.SetIterationTime(seconds);
             RecordTiming(name, seconds * 1000.0, g_md4c_times);
           }
           if (st.iterations() > 0) {
-            st.SetBytesProcessed(
-                static_cast<int64_t>(st.iterations()) * md4c_content.size());
+            st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                                 md4c_content.size());
           }
         });
   }
@@ -281,16 +276,23 @@ int main(int argc, char** argv) {
     std::string arg = argv[i];
     if (arg == "--help" || arg == "-h") {
       std::cerr << "Usage: bench [--input FILE] [--rounds N] [SAMPLES_DIR]\n";
-      std::cerr << "\nBenchmarks markus vs cmark-gfm vs md4c on markdown samples.\n";
+      std::cerr
+          << "\nBenchmarks markus vs cmark-gfm vs md4c on markdown samples.\n";
       std::cerr << "\nOptions:\n";
-      std::cerr << "  --rounds N       Number of benchmark repetitions (default: 2)\n";
-      std::cerr << "  --input FILE     Benchmark a single file instead of samples dir\n";
-      std::cerr << "  SAMPLES_DIR      Directory with .md files (default: cmark-gfm/bench/samples)\n";
+      std::cerr << "  --rounds N       Number of benchmark repetitions "
+                   "(default: 2)\n";
+      std::cerr << "  --input FILE     Benchmark a single file instead of "
+                   "samples dir\n";
+      std::cerr << "  SAMPLES_DIR      Directory with .md files (default: "
+                   "cmark-gfm/bench/samples)\n";
       std::cerr << "\nGoogle Benchmark options:\n";
-      std::cerr << "  --benchmark_min_time=N   Minimum time per benchmark run (default: 1s)\n";
-      std::cerr << "  --benchmark_filter=REGEX Run only benchmarks matching REGEX\n";
+      std::cerr << "  --benchmark_min_time=N   Minimum time per benchmark run "
+                   "(default: 1s)\n";
+      std::cerr
+          << "  --benchmark_filter=REGEX Run only benchmarks matching REGEX\n";
       std::cerr << "  --benchmark_list_tests   List benchmark names and exit\n";
-      std::cerr << "  --benchmark_format=FORMAT Output format: console, json, csv (default: console)\n";
+      std::cerr << "  --benchmark_format=FORMAT Output format: console, json, "
+                   "csv (default: console)\n";
       return 0;
     } else if (arg == "--input" || arg == "-f") {
       ++i;
@@ -316,7 +318,8 @@ int main(int argc, char** argv) {
   RegisterBenchmarks(inputs);
 
   // Add --benchmark_repetitions for our --rounds option
-  std::string reps_arg = "--benchmark_repetitions=" + std::to_string(num_rounds);
+  std::string reps_arg =
+      "--benchmark_repetitions=" + std::to_string(num_rounds);
   bench_argv_strs.push_back(reps_arg);
   bench_argv.push_back(const_cast<char*>(bench_argv_strs.back().c_str()));
 

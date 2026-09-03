@@ -12,13 +12,15 @@
 namespace {
 
 void PrintUsage(const char* program_name) {
-  std::cerr << "Usage: " << program_name << " [--ast] [--unsafe] [-e <ext> ...]\n";
+  std::cerr << "Usage: " << program_name
+            << " [--ast] [--unsafe] [-e <ext> ...]\n";
   std::cerr << "\n";
   std::cerr << "Reads markdown from stdin and outputs HTML to stdout.\n";
   std::cerr << "\n";
   std::cerr << "Options:\n";
   std::cerr << "  --ast     Print the AST instead of HTML output\n";
-  std::cerr << "  --unsafe  Accept (and render) raw HTML (accepted for cmark compatibility)\n";
+  std::cerr << "  --unsafe  Accept (and render) raw HTML (accepted for cmark "
+               "compatibility)\n";
   std::cerr << "  -e <ext>  Enable a GFM extension (currently: table)\n";
   std::cerr << "  --help    Show this help message\n";
 }

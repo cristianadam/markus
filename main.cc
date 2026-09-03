@@ -21,7 +21,7 @@ void PrintUsage(const char* program_name) {
   std::cerr << "  --ast     Print the AST instead of HTML output\n";
   std::cerr << "  --unsafe  Accept (and render) raw HTML (accepted for cmark "
                "compatibility)\n";
-  std::cerr << "  -e <ext>  Enable a GFM extension (currently: table)\n";
+  std::cerr << "  -e <ext>  Enable a GFM extension (table, autolink)\n";
   std::cerr << "  --help    Show this help message\n";
 }
 
@@ -54,8 +54,13 @@ int main(int argc, char* argv[]) {
       // Raw HTML is always passed through; the flag is accepted for
       // cmark/cmark-gfm compatibility.
     } else if (arg == "-e") {
-      if (i + 1 < argc && std::string(argv[i + 1]) == "table") {
-        options.enable_tables = true;
+      if (i + 1 < argc) {
+        std::string ext = argv[i + 1];
+        if (ext == "table") {
+          options.enable_tables = true;
+        } else if (ext == "autolink") {
+          options.enable_autolink = true;
+        }
       }
       ++i;  // Consume the extension name.
     }

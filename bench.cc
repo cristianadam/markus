@@ -23,6 +23,7 @@
 #include "markus.h"
 
 // cmark-gfm headers
+#include "cmark-gfm-core-extensions.h"
 #include "cmark-gfm.h"
 
 // md4c headers
@@ -89,6 +90,12 @@ std::map<std::string, std::vector<double>> g_markus_times;
 std::map<std::string, std::vector<double>> g_cmark_gfm_times;
 std::map<std::string, std::vector<double>> g_md4c_times;
 
+// Timing data for the GFM `autolink` extension benchmarks (each parser with the
+// autolink extension enabled, on autolink-heavy input).
+std::map<std::string, std::vector<double>> g_markus_autolink_times;
+std::map<std::string, std::vector<double>> g_cmark_gfm_autolink_times;
+std::map<std::string, std::vector<double>> g_md4c_autolink_times;
+
 void RecordTiming(const std::string& name, double time_ms,
                   std::map<std::string, std::vector<double>>& map) {
   std::lock_guard<std::mutex> lock(g_timing_mutex);
@@ -102,15 +109,21 @@ double CalcMean(const std::vector<double>& data) {
   return sum / data.size();
 }
 
-void PrintSummary() {
-  if (g_markus_times.empty()) return;
+void PrintSummaryTable(
+    const char* title,
+    const std::map<std::string, std::vector<double>>& markus_times,
+    const std::map<std::string, std::vector<double>>& cmark_gfm_times,
+    const std::map<std::string, std::vector<double>>& md4c_times) {
+  if (markus_times.empty() && cmark_gfm_times.empty() && md4c_times.empty()) {
+    return;
+  }
 
   std::map<std::string, bool> all_files;
-  for (const auto& [file, _] : g_markus_times) all_files[file] = true;
-  for (const auto& [file, _] : g_cmark_gfm_times) all_files[file] = true;
-  for (const auto& [file, _] : g_md4c_times) all_files[file] = true;
+  for (const auto& [file, _] : markus_times) all_files[file] = true;
+  for (const auto& [file, _] : cmark_gfm_times) all_files[file] = true;
+  for (const auto& [file, _] : md4c_times) all_files[file] = true;
 
-  printf("\n");
+  printf("\n%s\n", title);
   printf("%-30s %12s %12s %12s %8s %8s\n", "Sample", "Markus(ms)",
          "CmarkGfm(ms)", "Md4c(ms)", "M/GFM", "M/D");
   printf("%-30s %12s %12s %12s %8s %8s\n", "------------------------------",
@@ -127,9 +140,9 @@ void PrintSummary() {
       return CalcMean(it->second);
     };
 
-    double m = get_mean(g_markus_times, file);
-    double c = get_mean(g_cmark_gfm_times, file);
-    double d = get_mean(g_md4c_times, file);
+    double m = get_mean(markus_times, file);
+    double c = get_mean(cmark_gfm_times, file);
+    double d = get_mean(md4c_times, file);
 
     double ratio_mc = c > 0 ? m / c : 0;
     double ratio_md = d > 0 ? m / d : 0;
@@ -151,6 +164,13 @@ void PrintSummary() {
   printf("%-30s %12.3f %12.3f %12.3f %7.2fx %7.2fx\n", "TOTAL", total_markus,
          total_cmark_gfm, total_md4c, ratio_mc, ratio_md);
   printf("\n");
+}
+
+void PrintSummary() {
+  PrintSummaryTable("CommonMark", g_markus_times, g_cmark_gfm_times,
+                    g_md4c_times);
+  PrintSummaryTable("GFM Autolink Extension", g_markus_autolink_times,
+                    g_cmark_gfm_autolink_times, g_md4c_autolink_times);
 }
 
 class SummaryReporter : public benchmark::BenchmarkReporter {
@@ -257,6 +277,142 @@ void RegisterBenchmarks(
   }
 }
 
+// Register cmark-gfm's core GFM extensions (table, strikethrough, autolink,
+// tagfilter, tasklist) once so cmark_find_syntax_extension can locate them.
+void EnsureCmarkGfmExtensions() {
+  static bool done = false;
+  if (!done) {
+    cmark_gfm_core_extensions_ensure_registered();
+    done = true;
+  }
+}
+
+// Parse + render with cmark-gfm with the GFM `autolink` extension attached.
+std::string CmarkGfmRenderWithAutolink(const std::string& content) {
+  cmark_parser* parser = cmark_parser_new(CMARK_OPT_DEFAULT);
+  cmark_syntax_extension* ext = cmark_find_syntax_extension("autolink");
+  if (ext != nullptr) {
+    cmark_parser_attach_syntax_extension(parser, ext);
+  }
+  cmark_parser_feed(parser, content.c_str(), content.size());
+  cmark_node* doc = cmark_parser_finish(parser);
+  // The renderer copies the extensions it needs; keep the parser alive until
+  // after rendering since it owns this list.
+  cmark_llist* extensions = cmark_parser_get_syntax_extensions(parser);
+  char* html = cmark_render_html(doc, CMARK_OPT_DEFAULT, extensions);
+  std::string result = html != nullptr ? std::string(html) : std::string();
+  cmark_parser_free(parser);
+  free(html);
+  cmark_node_free(doc);
+  return result;
+}
+
+// Build a synthetic document that is heavy in GFM extended autolinks (www,
+// http(s)/ftp URLs, and email addresses) so the autolink extension code paths
+// are actually exercised by the benchmark.
+std::string GenerateAutolinkSample(int lines = 4000) {
+  std::string out;
+  out.reserve(static_cast<size_t>(lines) * 80);
+  out += "# GFM Autolink Extension Benchmark\n\n";
+  for (int i = 0; i < lines; ++i) {
+    switch (i % 6) {
+      case 0:
+        out += "Visit www.example-" + std::to_string(i) +
+               ".com/path/to/page?q=" + std::to_string(i) +
+               "&id=" + std::to_string(i) + " for details.\n";
+        break;
+      case 1:
+        out += "See https://foo.bar.baz/segment" + std::to_string(i) +
+               "/resource?x=1&y=2#anchor" + std::to_string(i) + " online.\n";
+        break;
+      case 2:
+        out += "Contact user" + std::to_string(i) +
+               ".name+tag@domain.co.uk with any questions.\n";
+        break;
+      case 3:
+        out += "Reference ftp://files.host.org/pub/data/file" +
+               std::to_string(i) + ".tar.gz for downloads.\n";
+        break;
+      case 4:
+        out += "Plain prose line " + std::to_string(i) +
+               " with no links at all, just some ordinary text.\n";
+        break;
+      case 5:
+        out += "Mixed www.site.org/a.b and mail a.b-c_d@host.io here " +
+               std::to_string(i) + ".\n";
+        break;
+    }
+  }
+  return out;
+}
+
+void RegisterAutolinkBenchmarks(const std::string& content) {
+  const std::string name = "autolink-ext";
+
+  benchmark::RegisterBenchmark(
+      (name + "_markus_autolink").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          markus::Options options;
+          options.enable_autolink = true;
+          auto result = markus::MarkdownToHtml(content, options);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_markus_autolink_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_cmark_gfm_autolink").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          auto result = CmarkGfmRenderWithAutolink(content);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_cmark_gfm_autolink_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_md4c_autolink").c_str(), [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          std::vector<char> output;
+          output.reserve(4096);
+          md_html(
+              content.c_str(), static_cast<MD_SIZE>(content.size()),
+              [](const char* text, MD_SIZE sz, void* userdata) {
+                auto& vec = *static_cast<std::vector<char>*>(userdata);
+                vec.insert(vec.end(), text, text + sz);
+              },
+              &output, MD_DIALECT_COMMONMARK | MD_FLAG_PERMISSIVEAUTOLINKS, 0);
+          benchmark::DoNotOptimize(output.data());
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_md4c_autolink_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -285,6 +441,11 @@ int main(int argc, char** argv) {
                    "samples dir\n";
       std::cerr << "  SAMPLES_DIR      Directory with .md files (default: "
                    "cmark-gfm/bench/samples)\n";
+      std::cerr << "\nIn addition to the CommonMark comparison, an autolink\n"
+                   "benchmark (autolink-ext_*) runs each parser with the GFM "
+                   "autolink\n"
+                   "extension enabled on a synthetic autolink-heavy document.\n"
+                   "Use --benchmark_filter=autolink to run only those.\n";
       std::cerr << "\nGoogle Benchmark options:\n";
       std::cerr << "  --benchmark_min_time=N   Minimum time per benchmark run "
                    "(default: 1s)\n";
@@ -316,6 +477,11 @@ int main(int argc, char** argv) {
   }
 
   RegisterBenchmarks(inputs);
+
+  // GFM autolink extension benchmark: each parser with the autolink extension
+  // enabled, on a synthetic autolink-heavy document.
+  EnsureCmarkGfmExtensions();
+  RegisterAutolinkBenchmarks(GenerateAutolinkSample());
 
   // Add --benchmark_repetitions for our --rounds option
   std::string reps_arg =

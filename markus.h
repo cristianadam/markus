@@ -2686,6 +2686,11 @@ class InlineParser {
     return ParseInlines();
   }
 
+  // GFM `autolink` extension. When true, www/url/email autolinks are recognised
+  // in plain text (in addition to the CommonMark `<...>` autolinks, which are
+  // always recognised). Off by default for plain CommonMark behaviour.
+  bool enable_autolink = false;
+
  private:
   std::string_view text_;
   size_t pos_ = 0;
@@ -3193,6 +3198,12 @@ class InlineParser {
 
     // Process emphasis
     ProcessEmphasis(result, delimiter_stack);
+
+    // GFM `autolink` extension: split text nodes that contain www/url/email
+    // autolinks into Text/Link sequences.
+    if (enable_autolink) {
+      PostprocessAutolinks(result);
+    }
 
     // Convert local nodes to pool IDs
     return NodesToIds(result);
@@ -4020,6 +4031,371 @@ class InlineParser {
     }
     nodes.resize(write);
   }
+
+  // ===========================================================================
+  // GFM `autolink` extension
+  //
+  // Mirrors cmark-gfm's autolink.c. Recognises three kinds of autolink in plain
+  // text (no angle brackets):
+  //   * extended www autolink:  `www.` + valid domain (+ optional path)
+  //   * extended url autolink:  `http://` / `https://` / `ftp://` + domain
+  //   * extended email autolink: local-part@domain
+  // This runs as a postprocess over the top-level inline nodes after emphasis,
+  // splitting Text nodes into Text/Link sequences. It is intentionally limited
+  // to top-level text (text inside links/images/emphasis is already in the pool
+  // and, per the GFM spec tests, autolinks do not nest inside other inlines).
+  // ===========================================================================
+
+  enum class AutolinkKind { None, Www, Url, Email };
+
+  // A character that terminates an autolink path (whitespace or '<').
+  static bool IsAutolinkStopChar(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+           c == '\v' || c == '<';
+  }
+
+  // A character valid in a domain/host segment: not whitespace and not
+  // (ASCII) punctuation. Punctuation such as '/', '?', '=' ends the domain
+  // portion and is picked up by the path scan instead.
+  static bool IsValidHostChar(char c) {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+        c == '\v') {
+      return false;
+    }
+    return !detail::IsAsciiPunctuation(c);
+  }
+
+  // A character allowed in the local part of an email address.
+  static bool IsEmailLocalPartChar(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '.' ||
+           c == '-' || c == '_' || c == '+';
+  }
+
+  // Case-insensitive match of one of the safe URL schemes at `pos`; returns the
+  // number of scheme characters (including `://`) or 0 if no scheme matches.
+  static size_t MatchScheme(std::string_view text, size_t pos) {
+    auto matches = [&](const char* scheme) {
+      size_t n = std::char_traits<char>::length(scheme);
+      if (pos + n > text.size()) return false;
+      for (size_t i = 0; i < n; ++i) {
+        if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
+            scheme[i]) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (matches("https://")) return 8;
+    if (matches("http://")) return 7;
+    if (matches("ftp://")) return 6;
+    return 0;
+  }
+
+  // Validates the domain starting at `start`; returns its length (0 if none).
+  // Port of cmark's check_domain: rejects domains with an underscore in either
+  // of the last two segments (host names, unlike domain names, disallow them),
+  // and (unless allow_short) requires at least one period.
+  static size_t CheckDomain(std::string_view data, size_t start,
+                            bool allow_short) {
+    size_t size = data.size() - start;
+    if (size < 1) return 0;
+    int np = 0;
+    int uscore1 = 0;
+    int uscore2 = 0;
+    size_t i = 1;  // data[start] is assumed valid (www.'s first char / host)
+    for (; i < size - 1; ++i) {
+      char c = data[start + i];
+      if (c == '\\' && i + 1 < size - 1) {
+        ++i;  // skip escaped character
+        continue;
+      }
+      if (c == '_') {
+        ++uscore2;
+      } else if (c == '.') {
+        uscore1 = uscore2;
+        uscore2 = 0;
+        ++np;
+      } else if (!IsValidHostChar(c) && c != '-') {
+        break;
+      }
+    }
+    if ((uscore1 > 0 || uscore2 > 0) && np <= 10) {
+      return 0;
+    }
+    if (allow_short) {
+      return i;
+    }
+    return np ? i : 0;
+  }
+
+  // Trims trailing punctuation from an autolink that currently spans
+  // text[base, link_end). Port of cmark's autolink_delim: handles trailing
+  // punctuation, unbalanced closing parens, and entity-like `;` sequences.
+  static size_t AutolinkDelim(std::string_view text, size_t base,
+                              size_t link_end) {
+    size_t closing = 0;
+    size_t opening = 0;
+    for (size_t i = base; i < link_end; ++i) {
+      char c = text[i];
+      if (c == '<') {
+        link_end = i;
+        break;
+      } else if (c == '(') {
+        ++opening;
+      } else if (c == ')') {
+        ++closing;
+      }
+    }
+    while (link_end > base) {
+      char c = text[link_end - 1];
+      switch (c) {
+        case ')':
+          if (closing <= opening) {
+            return link_end;
+          }
+          --closing;
+          --link_end;
+          break;
+        case '?':
+        case '!':
+        case '.':
+        case ',':
+        case ':':
+        case '*':
+        case '_':
+        case '~':
+        case '\'':
+        case '"':
+          --link_end;
+          break;
+        case ';': {
+          size_t rel_end = link_end - base;
+          size_t new_end = (rel_end >= 2) ? rel_end - 2 : 0;
+          while (new_end > 0 && std::isalpha(static_cast<unsigned char>(
+                                    text[base + new_end]))) {
+            --new_end;
+          }
+          if (new_end < rel_end - 2 && new_end < rel_end &&
+              text[base + new_end] == '&') {
+            link_end = base + new_end;
+          } else {
+            --link_end;
+          }
+          break;
+        }
+        default:
+          return link_end;
+      }
+    }
+    return link_end;
+  }
+
+  // Tries to match an extended www autolink starting at `pos`.
+  size_t TryMatchWww(std::string_view text, size_t pos) const {
+    // An extended autolink can only come at the beginning of a line, after
+    // whitespace, or after one of the delimiting characters * _ ~ ( .
+    if (pos > 0) {
+      char prev = text[pos - 1];
+      if (!(prev == ' ' || prev == '\t' || prev == '\n' || prev == '\r' ||
+            prev == '*' || prev == '_' || prev == '~' || prev == '(')) {
+        return 0;
+      }
+    }
+    if (pos + 4 > text.size() || text.compare(pos, 4, "www.") != 0) {
+      return 0;
+    }
+    size_t domain_len = CheckDomain(text, pos, /*allow_short=*/false);
+    if (domain_len == 0) return 0;
+    size_t link_end = pos + domain_len;
+    while (link_end < text.size() && !IsAutolinkStopChar(text[link_end])) {
+      ++link_end;
+    }
+    link_end = AutolinkDelim(text, pos, link_end);
+    if (link_end <= pos) return 0;
+    return link_end - pos;
+  }
+
+  // Tries to match an extended url autolink starting at `pos`.
+  size_t TryMatchUrl(std::string_view text, size_t pos) const {
+    // The scheme must not be preceded by an alphanumeric, otherwise it is part
+    // of a longer word (e.g. `xhttp://`).
+    if (pos > 0 && std::isalnum(static_cast<unsigned char>(text[pos - 1]))) {
+      return 0;
+    }
+    size_t scheme_len = MatchScheme(text, pos);
+    if (scheme_len == 0) return 0;
+    size_t after_scheme = pos + scheme_len;
+    size_t domain_len = CheckDomain(text, after_scheme, /*allow_short=*/true);
+    if (domain_len == 0) return 0;
+    size_t link_end = after_scheme + domain_len;
+    while (link_end < text.size() && !IsAutolinkStopChar(text[link_end])) {
+      ++link_end;
+    }
+    link_end = AutolinkDelim(text, pos, link_end);
+    if (link_end <= pos) return 0;
+    return link_end - pos;
+  }
+
+  // Tries to match an extended email autolink starting at `pos`.
+  size_t TryMatchEmail(std::string_view text, size_t pos) const {
+    // Local part: a run of local-part characters that must be followed by '@'.
+    size_t i = pos;
+    while (i < text.size() && IsEmailLocalPartChar(text[i])) {
+      ++i;
+    }
+    if (i >= text.size() || text[i] != '@') return 0;
+    size_t at = i;
+
+    // Domain: alnum segments separated by '.', at least one period, and the
+    // final character must be alphanumeric or '.' (a trailing '.' is dropped by
+    // the delimiter trim below; a trailing '-' or '_' is invalid).
+    size_t d = at + 1;
+    int np = 0;
+    while (d < text.size()) {
+      unsigned char c = static_cast<unsigned char>(text[d]);
+      if (std::isalnum(c)) {
+        ++d;
+      } else if (c == '@') {
+        return 0;  // a second '@' cannot appear in an email address
+      } else if (c == '.' && d + 1 < text.size() &&
+                 std::isalnum(static_cast<unsigned char>(text[d + 1]))) {
+        ++np;
+        ++d;
+      } else if (c == '-' || c == '_') {
+        ++d;
+      } else {
+        break;
+      }
+    }
+    size_t domain_len = d - (at + 1);
+    if (domain_len < 2 || np == 0) return 0;
+    char last = text[d - 1];
+    if (!(std::isalpha(static_cast<unsigned char>(last)) || last == '.')) {
+      return 0;
+    }
+    size_t link_end = AutolinkDelim(text, at, d);
+    if (link_end - at < 2) return 0;
+    return link_end - pos;
+  }
+
+  // Attempts to match any extended autolink starting at `pos`; returns its
+  // length and sets `kind`, or returns 0 with `kind == AutolinkKind::None`.
+  size_t TryMatchAutolink(std::string_view text, size_t pos,
+                          AutolinkKind& kind) const {
+    unsigned char c = static_cast<unsigned char>(text[pos]);
+    if (c == 'w') {
+      size_t len = TryMatchWww(text, pos);
+      if (len) {
+        kind = AutolinkKind::Www;
+        return len;
+      }
+    } else if (c == 'h' || c == 'f') {
+      size_t len = TryMatchUrl(text, pos);
+      if (len) {
+        kind = AutolinkKind::Url;
+        return len;
+      }
+    }
+    if (std::isalnum(c)) {
+      // An email autolink can only begin at the start of a local-part run.
+      bool run_start = (pos == 0) || !IsEmailLocalPartChar(text[pos - 1]);
+      if (run_start) {
+        size_t len = TryMatchEmail(text, pos);
+        if (len) {
+          kind = AutolinkKind::Email;
+          return len;
+        }
+      }
+    }
+    kind = AutolinkKind::None;
+    return 0;
+  }
+
+  std::pmr::string MakeAutolinkDestination(std::string_view matched,
+                                           AutolinkKind kind) const {
+    if (kind == AutolinkKind::Www) {
+      return std::pmr::string("http://") + std::pmr::string(matched);
+    }
+    if (kind == AutolinkKind::Email) {
+      return std::pmr::string("mailto:") + std::pmr::string(matched);
+    }
+    return std::pmr::string(matched);
+  }
+
+  // Splits a single text span into Text/Link nodes, replacing any extended
+  // autolinks with Link nodes (the matched text becomes the link label and the
+  // scheme-appropriate URI becomes the destination).
+  void SplitAutolinks(std::string_view text,
+                      std::pmr::vector<InlineNode>& out) {
+    size_t text_start = 0;
+    size_t pos = 0;
+    auto flush = [&](size_t upto) {
+      if (text_start < upto) {
+        out.emplace_back(std::in_place_type<Text>,
+                         text.substr(text_start, upto - text_start));
+      }
+      text_start = upto;
+    };
+    while (pos < text.size()) {
+      AutolinkKind kind;
+      size_t match = TryMatchAutolink(text, pos, kind);
+      if (match > 0) {
+        flush(pos);
+        std::string_view matched = text.substr(pos, match);
+        Link link;
+        link.destination = MakeAutolinkDestination(matched, kind);
+        link.children.push_back(AddToPool(Text(matched)));
+        out.push_back(std::move(link));
+        pos += match;
+        text_start = pos;
+      } else {
+        ++pos;
+      }
+    }
+    flush(text.size());
+  }
+
+  void PostprocessAutolinks(std::pmr::vector<InlineNode>& nodes) {
+    // First consolidate adjacent text nodes. The inline parser splits text at
+    // special characters (e.g. `_` emphasis markers that do not form emphasis),
+    // which can fragment an autolink such as `a.b-c_d@a.b`. Merging the runs
+    // restores the full span so detection sees it whole. Adjacent text nodes
+    // are normally contiguous slices of the input, so the common case is a
+    // cheap view extension; a persistent copy is only needed for the rare
+    // non-contiguous run.
+    std::pmr::vector<InlineNode> consolidated;
+    consolidated.reserve(nodes.size());
+    for (auto& node : nodes) {
+      if (std::holds_alternative<Text>(node) && !consolidated.empty() &&
+          std::holds_alternative<Text>(consolidated.back())) {
+        auto& last_view = std::get<Text>(consolidated.back()).content;
+        std::string_view cur = std::get<Text>(node).content;
+        if (cur.data() == last_view.data() + last_view.size()) {
+          last_view =
+              std::string_view(last_view.data(), last_view.size() + cur.size());
+        } else {
+          std::pmr::string merged(last_view);
+          merged.append(cur);
+          std::get<Text>(consolidated.back()).content =
+              StoreString(std::move(merged));
+        }
+      } else {
+        consolidated.push_back(std::move(node));
+      }
+    }
+
+    // Then split any text nodes that contain extended autolinks.
+    std::pmr::vector<InlineNode> out;
+    out.reserve(consolidated.size());
+    for (auto& node : consolidated) {
+      if (std::holds_alternative<Text>(node)) {
+        SplitAutolinks(std::get<Text>(node).content, out);
+      } else {
+        out.push_back(std::move(node));
+      }
+    }
+    nodes = std::move(out);
+  }
 };
 
 // =============================================================================
@@ -4031,6 +4407,11 @@ class BlockParser {
   // GFM `table` extension. When false (default, CommonMark mode) tables are
   // not recognized and the corresponding syntax is left as plain paragraphs.
   bool enable_tables = false;
+
+  // GFM `autolink` extension. When true, www/url/email autolinks are
+  // recognised in plain text. The CommonMark `<...>` autolinks are always
+  // recognised regardless of this flag.
+  bool enable_autolink = false;
 
   Document Parse(std::string_view input) {
     // Reset the thread-local monotonic buffer for this parse operation.
@@ -4047,6 +4428,7 @@ class BlockParser {
     // Third pass: parse inlines
     InlineParser inline_parser(&doc.link_references, &doc.string_storage,
                                &doc.inline_nodes);
+    inline_parser.enable_autolink = enable_autolink;
     ParseInlines(doc.children, inline_parser);
 
     return doc;
@@ -6747,10 +7129,13 @@ class HtmlRenderer {
 // Public API
 // =============================================================================
 
-// Parser options. Plain CommonMark by default; set `enable_tables` to turn on
-// the GFM `table` extension.
+// Parser options. Plain CommonMark by default; individual GFM extensions can
+// be turned on: `enable_tables` (the `table` extension) and `enable_autolink`
+// (the `autolink` extension, which recognises www/url/email autolinks in plain
+// text in addition to the CommonMark `<...>` autolinks).
 struct Options {
   bool enable_tables = false;
+  bool enable_autolink = false;
 };
 
 // Parse Markdown input and return an AST
@@ -6763,6 +7148,7 @@ inline Document Parse(std::string_view input) {
 inline Document Parse(std::string_view input, const Options& options) {
   BlockParser parser;
   parser.enable_tables = options.enable_tables;
+  parser.enable_autolink = options.enable_autolink;
   return parser.Parse(input);
 }
 

@@ -96,10 +96,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(googlebenchmark)
 
-# Benchmark executable
+# Benchmark executable. libcmark-gfm-extensions_static provides the GFM
+# extensions (table, strikethrough, autolink, ...) used by the autolink
+# benchmark; the extensions include dir supplies cmark-gfm-core-extensions.h.
 add_executable(bench bench.cc)
-target_link_libraries(bench PRIVATE markus libcmark-gfm_static md4c md4c-html benchmark::benchmark)
-target_include_directories(bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cmark-gfm/src ${CMAKE_BINARY_DIR}/cmark-gfm-build/src)
+# The extensions archive must precede the core archive: GNU ld scans static
+# archives in a single left-to-right pass, and table.o (extensions) references
+# cmark_arena_push/pop (core/arena.o), so the core library must still be
+# unscanned when table.o is pulled in. Matches cmark-gfm's own link order.
+target_link_libraries(bench PRIVATE markus libcmark-gfm-extensions_static libcmark-gfm_static md4c md4c-html benchmark::benchmark)
+target_include_directories(bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cmark-gfm/src ${CMAKE_BINARY_DIR}/cmark-gfm-build/src ${CMAKE_CURRENT_SOURCE_DIR}/cmark-gfm/extensions)
 set_target_properties(bench PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )

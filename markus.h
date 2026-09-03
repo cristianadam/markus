@@ -579,6 +579,93 @@ inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
 }
 
 // =============================================================================
+// GFM tagfilter (Disallowed Raw HTML) extension
+// =============================================================================
+
+// The GFM `tagfilter` extension filters a fixed set of HTML tags out of raw
+// HTML by replacing their leading '<' with the entity "&lt;", since these tags
+// change how the surrounding rendered Markdown is interpreted (see the GFM
+// spec, "Disallowed Raw HTML (extension)").
+namespace tagfilter {
+
+// Tags filtered by the GFM tagfilter extension.
+inline constexpr std::array<std::string_view, 9> kDisallowedTags = {
+    "title",   "textarea", "style",  "xmp",       "iframe",
+    "noembed", "noframes", "script", "plaintext"};
+
+// Returns true if the tag starting at `data` (which must begin with '<') has
+// the name `tagname`, following CommonMark tag grammar: an optional leading
+// '/', the tag name (case-insensitive), then whitespace, '>', or '/>'.
+inline bool IsTag(std::string_view data, std::string_view tagname) {
+  if (data.size() < 3 || data[0] != '<') {
+    return false;
+  }
+  size_t i = 1;
+  if (data[i] == '/') {
+    ++i;
+  }
+  size_t k = 0;  // index into tagname
+  for (; i < data.size(); ++i, ++k) {
+    if (k == tagname.size()) {
+      break;
+    }
+    if (std::tolower(static_cast<unsigned char>(data[i])) !=
+        static_cast<unsigned char>(tagname[k])) {
+      return false;
+    }
+  }
+  if (i == data.size()) {
+    return false;
+  }
+  const unsigned char c = static_cast<unsigned char>(data[i]);
+  if (std::isspace(c) || c == '>') {
+    return true;
+  }
+  if (c == '/' && data.size() >= i + 2 && data[i + 1] == '>') {
+    return true;
+  }
+  return false;
+}
+
+// Returns true if the tag starting at `data` is one of the disallowed GFM tags
+// (i.e. its leading '<' must be escaped to '&lt;' when rendering).
+inline bool IsDisallowedTag(std::string_view data) {
+  for (std::string_view name : kDisallowedTags) {
+    if (IsTag(data, name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Renders a raw HTML block, escaping the leading '<' of any disallowed GFM tag
+// (matching cmark-gfm's `filter_html_block`). All other content is emitted
+// verbatim.
+inline void RenderFilteredHtmlBlock(std::string_view content,
+                                    std::pmr::string& out) {
+  const size_t len = content.size();
+  size_t pos = 0;
+  while (pos < len) {
+    const size_t lt = content.find('<', pos);
+    if (lt == std::string_view::npos) {
+      out.append(content.substr(pos));
+      break;
+    }
+    if (lt > pos) {
+      out.append(content.substr(pos, lt - pos));
+    }
+    if (IsDisallowedTag(content.substr(lt))) {
+      out.append("&lt;");
+    } else {
+      out.push_back('<');
+    }
+    pos = lt + 1;
+  }
+}
+
+}  // namespace tagfilter
+
+// =============================================================================
 // Optimized URL Encoding - In-place variant
 // =============================================================================
 
@@ -6989,6 +7076,11 @@ class BlockParser {
 
 class HtmlRenderer {
  public:
+  // GFM `tagfilter` (Disallowed Raw HTML) extension: when set, the leading
+  // '<' of disallowed HTML tags in raw HTML blocks/inlines is escaped to
+  // "&lt;".
+  bool enable_tagfilter = false;
+
   std::pmr::string Render(const Document& doc) {
     doc_ = &doc;
     std::pmr::string result;
@@ -7015,7 +7107,7 @@ class HtmlRenderer {
             } else if constexpr (std::is_same_v<T, CodeBlock>) {
               RenderCodeBlock(node, out);
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
-              out += node.content;
+              RenderHtmlBlock(node, out);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               RenderBlockQuote(node, out);
             } else if constexpr (std::is_same_v<T, List>) {
@@ -7077,6 +7169,14 @@ class HtmlRenderer {
     out += "</code></pre>\n";
   }
 
+  void RenderHtmlBlock(const HtmlBlock& block, std::pmr::string& out) {
+    if (enable_tagfilter) {
+      detail::tagfilter::RenderFilteredHtmlBlock(block.content, out);
+    } else {
+      out += block.content;
+    }
+  }
+
   void RenderBlockQuote(const BlockQuote& bq, std::pmr::string& out) {
     out += "<blockquote>\n";
     RenderBlockIds(bq.children, out, false);
@@ -7100,7 +7200,7 @@ class HtmlRenderer {
             } else if constexpr (std::is_same_v<T, CodeBlock>) {
               RenderCodeBlock(node, out);
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
-              out += node.content;
+              RenderHtmlBlock(node, out);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               RenderBlockQuote(node, out);
             } else if constexpr (std::is_same_v<T, List>) {
@@ -7280,7 +7380,13 @@ class HtmlRenderer {
               }
               out += " />";
             } else if constexpr (std::is_same_v<T, HtmlInline>) {
-              out += n.content;
+              if (enable_tagfilter &&
+                  detail::tagfilter::IsDisallowedTag(n.content)) {
+                out.append("&lt;");
+                out.append(n.content.substr(1));
+              } else {
+                out += n.content;
+              }
             }
           },
           node);
@@ -7297,14 +7403,17 @@ class HtmlRenderer {
 // (the `autolink` extension, which recognises www/url/email autolinks in plain
 // text in addition to the CommonMark `<...>` autolinks),
 // `enable_strikethrough` (the `strikethrough` extension, which wraps `~`/`~~`
-// delimited text in a <del> node), and `enable_tasklist` (the `tasklist`
+// delimited text in a <del> node), `enable_tasklist` (the `tasklist`
 // extension, which renders list items beginning with a `[ ]`/`[x]`/`[X]` marker
-// as checkboxes).
+// as checkboxes), and `enable_tagfilter` (the `tagfilter` / "Disallowed Raw
+// HTML" extension, which escapes the leading '<' of a fixed set of HTML tags
+// such as <title>, <style>, <script> and <xmp> in raw HTML output).
 struct Options {
   bool enable_tables = false;
   bool enable_autolink = false;
   bool enable_strikethrough = false;
   bool enable_tasklist = false;
+  bool enable_tagfilter = false;
 };
 
 // Parse Markdown input and return an AST
@@ -7329,6 +7438,15 @@ inline std::pmr::string RenderHtml(const Document& doc) {
   return renderer.Render(doc);
 }
 
+// Render a document AST to HTML, applying the render-time GFM extensions from
+// `options` (currently the `tagfilter` / Disallowed Raw HTML extension).
+inline std::pmr::string RenderHtml(const Document& doc,
+                                   const Options& options) {
+  HtmlRenderer renderer;
+  renderer.enable_tagfilter = options.enable_tagfilter;
+  return renderer.Render(doc);
+}
+
 // Convenience function: parse Markdown and render to HTML
 inline std::pmr::string MarkdownToHtml(std::string_view input) {
   return RenderHtml(Parse(input));
@@ -7337,7 +7455,7 @@ inline std::pmr::string MarkdownToHtml(std::string_view input) {
 // Convenience function: parse Markdown with options and render to HTML
 inline std::pmr::string MarkdownToHtml(std::string_view input,
                                        const Options& options) {
-  return RenderHtml(Parse(input, options));
+  return RenderHtml(Parse(input, options), options);
 }
 
 // Debug: print AST structure

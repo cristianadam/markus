@@ -108,6 +108,14 @@ std::map<std::string, std::vector<double>> g_markus_tasklist_times;
 std::map<std::string, std::vector<double>> g_cmark_gfm_tasklist_times;
 std::map<std::string, std::vector<double>> g_md4c_tasklist_times;
 
+// Timing data for the GFM `tagfilter` (Disallowed Raw HTML) extension
+// benchmarks (each parser with the tagfilter extension enabled, on
+// raw-HTML-heavy input). md4c has no tagfilter equivalent, so it runs in plain
+// CommonMark mode on the same input.
+std::map<std::string, std::vector<double>> g_markus_tagfilter_times;
+std::map<std::string, std::vector<double>> g_cmark_gfm_tagfilter_times;
+std::map<std::string, std::vector<double>> g_md4c_tagfilter_times;
+
 void RecordTiming(const std::string& name, double time_ms,
                   std::map<std::string, std::vector<double>>& map) {
   std::lock_guard<std::mutex> lock(g_timing_mutex);
@@ -187,7 +195,9 @@ void PrintSummary() {
                     g_cmark_gfm_strikethrough_times,
                     g_md4c_strikethrough_times);
   PrintSummaryTable("GFM Tasklist Extension", g_markus_tasklist_times,
-                    g_cmark_gfm_tasklist_times, g_md4c_tasklist_times);
+                     g_cmark_gfm_tasklist_times, g_md4c_tasklist_times);
+  PrintSummaryTable("GFM Tagfilter Extension", g_markus_tagfilter_times,
+                     g_cmark_gfm_tagfilter_times, g_md4c_tagfilter_times);
 }
 
 class SummaryReporter : public benchmark::BenchmarkReporter {
@@ -365,6 +375,27 @@ std::string CmarkGfmRenderWithTasklist(const std::string& content) {
   return result;
 }
 
+// Parse + render with cmark-gfm with the GFM `tagfilter` (Disallowed Raw HTML)
+// extension attached.
+std::string CmarkGfmRenderWithTagfilter(const std::string& content) {
+  cmark_parser* parser = cmark_parser_new(CMARK_OPT_DEFAULT);
+  cmark_syntax_extension* ext = cmark_find_syntax_extension("tagfilter");
+  if (ext != nullptr) {
+    cmark_parser_attach_syntax_extension(parser, ext);
+  }
+  cmark_parser_feed(parser, content.c_str(), content.size());
+  cmark_node* doc = cmark_parser_finish(parser);
+  // The renderer copies the extensions it needs; keep the parser alive until
+  // after rendering since it owns this list.
+  cmark_llist* extensions = cmark_parser_get_syntax_extensions(parser);
+  char* html = cmark_render_html(doc, CMARK_OPT_DEFAULT, extensions);
+  std::string result = html != nullptr ? std::string(html) : std::string();
+  cmark_parser_free(parser);
+  free(html);
+  cmark_node_free(doc);
+  return result;
+}
+
 // Build a synthetic document that is heavy in GFM extended autolinks (www,
 // http(s)/ftp URLs, and email addresses) so the autolink extension code paths
 // are actually exercised by the benchmark.
@@ -474,13 +505,61 @@ std::string GenerateTasklistSample(int lines = 4000) {
         out += "Plain prose line " + std::to_string(i) +
                " with no task list item at all, just text.\n";
         break;
-      case 5:
-        out += "- [x] parent task " + std::to_string(i) +
-               "\n  - [ ] nested subtask " + std::to_string(i) +
-               " under parent\n";
+       case 5:
+         out += "- [x] parent task " + std::to_string(i) +
+                "\n  - [ ] nested subtask " + std::to_string(i) +
+                " under parent\n";
         break;
     }
     out += '\n';
+  }
+  return out;
+}
+
+// Build a synthetic document that is heavy in raw HTML (a mix of disallowed
+// GFM tags such as <title>/<style>/<script>/<xmp>, allowed tags, closing and
+// self-closing tags, and raw HTML blocks) so the tagfilter extension code
+// paths are actually exercised by the benchmark.
+std::string GenerateTagfilterSample(int lines = 4000) {
+  std::string out;
+  out.reserve(static_cast<size_t>(lines) * 80);
+  out += "# GFM Tagfilter Extension Benchmark\n\n";
+  for (int i = 0; i < lines; ++i) {
+    switch (i % 8) {
+      case 0:
+        out += "Inline <title> and <style> plus <em>kept</em> " +
+               std::to_string(i) + ".\n\n";
+        break;
+      case 1:
+        out += "Disallowed <script> and <iframe src=\"x\"> here " +
+               std::to_string(i) + ".\n\n";
+        break;
+      case 2:
+        out += "Also <xmp> <plaintext> <noembed> <noframes> <textarea> " +
+               std::to_string(i) + ".\n\n";
+        break;
+      case 3:
+        out += "Allowed <div class=\"a\"> and <span id=\"b\"> " +
+               std::to_string(i) + " stay untouched.\n\n";
+        break;
+      case 4:
+        out += "Closing </title> and </style> plus <xmp attr=\"v\">\n\n";
+        break;
+      case 5:
+        out += "<div>\n";
+        out += "  <xmp> block disallowed " + std::to_string(i) + " </xmp>\n";
+        out += "  <div>block allowed</div>\n";
+        out += "</div>\n\n";
+        break;
+      case 6:
+        out += "<style>\nbody { color: red; } /* item " + std::to_string(i) +
+               " */\n</style>\n\n";
+        break;
+      case 7:
+        out += "Plain prose line " + std::to_string(i) +
+               " with no raw HTML tags at all.\n\n";
+        break;
+    }
   }
   return out;
 }
@@ -673,12 +752,81 @@ void RegisterTasklistBenchmarks(const std::string& content) {
                 auto& vec = *static_cast<std::vector<char>*>(userdata);
                 vec.insert(vec.end(), text, text + sz);
               },
-              &output, MD_DIALECT_COMMONMARK | MD_FLAG_TASKLISTS, 0);
+               &output, MD_DIALECT_COMMONMARK | MD_FLAG_TASKLISTS, 0);
           benchmark::DoNotOptimize(output.data());
           auto end = std::chrono::high_resolution_clock::now();
           double seconds = std::chrono::duration<double>(end - start).count();
           st.SetIterationTime(seconds);
           RecordTiming(name, seconds * 1000.0, g_md4c_tasklist_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+}
+
+void RegisterTagfilterBenchmarks(const std::string& content) {
+  const std::string name = "tagfilter-ext";
+
+  benchmark::RegisterBenchmark(
+      (name + "_markus_tagfilter").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          markus::Options options;
+          options.enable_tagfilter = true;
+          auto result = markus::MarkdownToHtml(content, options);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_markus_tagfilter_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_cmark_gfm_tagfilter").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          auto result = CmarkGfmRenderWithTagfilter(content);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_cmark_gfm_tagfilter_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_md4c_tagfilter").c_str(), [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          std::vector<char> output;
+          output.reserve(4096);
+          // md4c has no tagfilter equivalent; run in plain CommonMark mode on
+          // the same input for a baseline comparison.
+          md_html(
+              content.c_str(), static_cast<MD_SIZE>(content.size()),
+              [](const char* text, MD_SIZE sz, void* userdata) {
+                auto& vec = *static_cast<std::vector<char>*>(userdata);
+                vec.insert(vec.end(), text, text + sz);
+              },
+              &output, MD_DIALECT_COMMONMARK, 0);
+          benchmark::DoNotOptimize(output.data());
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_md4c_tagfilter_times);
         }
         if (st.iterations() > 0) {
           st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
@@ -716,15 +864,17 @@ int main(int argc, char** argv) {
       std::cerr << "  SAMPLES_DIR      Directory with .md files (default: "
                    "cmark-gfm/bench/samples)\n";
       std::cerr << "\nIn addition to the CommonMark comparison, autolink,\n"
-                   "strikethrough and tasklist benchmarks (autolink-ext_*, "
-                   "strikethrough-ext_*,\n"
-                   "tasklist-ext_*) run each parser with the matching GFM "
-                   "extension enabled\n"
-                   "on a synthetic extension-heavy document. Use "
-                   "--benchmark_filter=autolink,\n"
-                   "--benchmark_filter=strikethrough or "
-                   "--benchmark_filter=tasklist\n"
-                   "to run only those.\n";
+                    "strikethrough, tasklist and tagfilter benchmarks "
+                    "(autolink-ext_*,\n"
+                    "strikethrough-ext_*, tasklist-ext_*, tagfilter-ext_*) "
+                    "run each parser\n"
+                    "with the matching GFM extension enabled on a synthetic "
+                    "extension-heavy\n"
+                    "document. Use --benchmark_filter=autolink, "
+                    "--benchmark_filter=strikethrough,\n"
+                    "--benchmark_filter=tasklist or "
+                    "--benchmark_filter=tagfilter\n"
+                    "to run only those.\n";
       std::cerr << "\nGoogle Benchmark options:\n";
       std::cerr << "  --benchmark_min_time=N   Minimum time per benchmark run "
                    "(default: 1s)\n";
@@ -763,6 +913,7 @@ int main(int argc, char** argv) {
   RegisterAutolinkBenchmarks(GenerateAutolinkSample());
   RegisterStrikethroughBenchmarks(GenerateStrikethroughSample());
   RegisterTasklistBenchmarks(GenerateTasklistSample());
+  RegisterTagfilterBenchmarks(GenerateTagfilterSample());
 
   // Add --benchmark_repetitions for our --rounds option
   std::string reps_arg =

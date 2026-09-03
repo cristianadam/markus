@@ -22,7 +22,7 @@ void PrintUsage(const char* program_name) {
   std::cerr << "  --unsafe  Accept (and render) raw HTML (accepted for cmark "
                "compatibility)\n";
   std::cerr << "  -e <ext>  Enable a GFM extension (table, autolink, "
-               "strikethrough)\n";
+               "strikethrough, tasklist)\n";
   std::cerr << "  --help    Show this help message\n";
 }
 
@@ -63,6 +63,8 @@ int main(int argc, char* argv[]) {
           options.enable_autolink = true;
         } else if (ext == "strikethrough") {
           options.enable_strikethrough = true;
+        } else if (ext == "tasklist") {
+          options.enable_tasklist = true;
         }
       }
       ++i;  // Consume the extension name.

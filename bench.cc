@@ -102,6 +102,12 @@ std::map<std::string, std::vector<double>> g_markus_strikethrough_times;
 std::map<std::string, std::vector<double>> g_cmark_gfm_strikethrough_times;
 std::map<std::string, std::vector<double>> g_md4c_strikethrough_times;
 
+// Timing data for the GFM `tasklist` extension benchmarks (each parser with the
+// tasklist extension enabled, on tasklist-heavy input).
+std::map<std::string, std::vector<double>> g_markus_tasklist_times;
+std::map<std::string, std::vector<double>> g_cmark_gfm_tasklist_times;
+std::map<std::string, std::vector<double>> g_md4c_tasklist_times;
+
 void RecordTiming(const std::string& name, double time_ms,
                   std::map<std::string, std::vector<double>>& map) {
   std::lock_guard<std::mutex> lock(g_timing_mutex);
@@ -180,6 +186,8 @@ void PrintSummary() {
   PrintSummaryTable("GFM Strikethrough Extension", g_markus_strikethrough_times,
                     g_cmark_gfm_strikethrough_times,
                     g_md4c_strikethrough_times);
+  PrintSummaryTable("GFM Tasklist Extension", g_markus_tasklist_times,
+                    g_cmark_gfm_tasklist_times, g_md4c_tasklist_times);
 }
 
 class SummaryReporter : public benchmark::BenchmarkReporter {
@@ -337,6 +345,26 @@ std::string CmarkGfmRenderWithStrikethrough(const std::string& content) {
   return result;
 }
 
+// Parse + render with cmark-gfm with the GFM `tasklist` extension attached.
+std::string CmarkGfmRenderWithTasklist(const std::string& content) {
+  cmark_parser* parser = cmark_parser_new(CMARK_OPT_DEFAULT);
+  cmark_syntax_extension* ext = cmark_find_syntax_extension("tasklist");
+  if (ext != nullptr) {
+    cmark_parser_attach_syntax_extension(parser, ext);
+  }
+  cmark_parser_feed(parser, content.c_str(), content.size());
+  cmark_node* doc = cmark_parser_finish(parser);
+  // The renderer copies the extensions it needs; keep the parser alive until
+  // after rendering since it owns this list.
+  cmark_llist* extensions = cmark_parser_get_syntax_extensions(parser);
+  char* html = cmark_render_html(doc, CMARK_OPT_DEFAULT, extensions);
+  std::string result = html != nullptr ? std::string(html) : std::string();
+  cmark_parser_free(parser);
+  free(html);
+  cmark_node_free(doc);
+  return result;
+}
+
 // Build a synthetic document that is heavy in GFM extended autolinks (www,
 // http(s)/ftp URLs, and email addresses) so the autolink extension code paths
 // are actually exercised by the benchmark.
@@ -413,6 +441,46 @@ std::string GenerateStrikethroughSample(int lines = 4000) {
                std::to_string(i) + ".\n\n";
         break;
     }
+  }
+  return out;
+}
+
+// Build a synthetic document that is heavy in GFM task list items (a mix of
+// checked/unchecked bullets, ordered items, and some nested lists) so the
+// tasklist extension code paths are actually exercised by the benchmark.
+std::string GenerateTasklistSample(int lines = 4000) {
+  std::string out;
+  out.reserve(static_cast<size_t>(lines) * 80);
+  out += "# GFM Tasklist Extension Benchmark\n\n";
+  for (int i = 0; i < lines; ++i) {
+    switch (i % 6) {
+      case 0:
+        out +=
+            "- [ ] unchecked task item " + std::to_string(i) + " to be done\n";
+        break;
+      case 1:
+        out += "- [x] completed task item " + std::to_string(i) +
+               " already finished\n";
+        break;
+      case 2:
+        out +=
+            "1. [ ] ordered task " + std::to_string(i) + " waiting to start\n";
+        break;
+      case 3:
+        out += "2. [X] ordered task " + std::to_string(i) +
+               " done with an uppercase marker\n";
+        break;
+      case 4:
+        out += "Plain prose line " + std::to_string(i) +
+               " with no task list item at all, just text.\n";
+        break;
+      case 5:
+        out += "- [x] parent task " + std::to_string(i) +
+               "\n  - [ ] nested subtask " + std::to_string(i) +
+               " under parent\n";
+        break;
+    }
+    out += '\n';
   }
   return out;
 }
@@ -552,6 +620,73 @@ void RegisterStrikethroughBenchmarks(const std::string& content) {
       });
 }
 
+void RegisterTasklistBenchmarks(const std::string& content) {
+  const std::string name = "tasklist-ext";
+
+  benchmark::RegisterBenchmark(
+      (name + "_markus_tasklist").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          markus::Options options;
+          options.enable_tasklist = true;
+          auto result = markus::MarkdownToHtml(content, options);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_markus_tasklist_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_cmark_gfm_tasklist").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          auto result = CmarkGfmRenderWithTasklist(content);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_cmark_gfm_tasklist_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_md4c_tasklist").c_str(), [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          std::vector<char> output;
+          output.reserve(4096);
+          md_html(
+              content.c_str(), static_cast<MD_SIZE>(content.size()),
+              [](const char* text, MD_SIZE sz, void* userdata) {
+                auto& vec = *static_cast<std::vector<char>*>(userdata);
+                vec.insert(vec.end(), text, text + sz);
+              },
+              &output, MD_DIALECT_COMMONMARK | MD_FLAG_TASKLISTS, 0);
+          benchmark::DoNotOptimize(output.data());
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_md4c_tasklist_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -580,14 +715,16 @@ int main(int argc, char** argv) {
                    "samples dir\n";
       std::cerr << "  SAMPLES_DIR      Directory with .md files (default: "
                    "cmark-gfm/bench/samples)\n";
-      std::cerr << "\nIn addition to the CommonMark comparison, autolink and\n"
-                   "strikethrough benchmarks (autolink-ext_*, "
-                   "strikethrough-ext_*)\n"
-                   "run each parser with the matching GFM extension enabled on "
-                   "a synthetic\n"
-                   "extension-heavy document. Use --benchmark_filter=autolink "
-                   "or\n"
-                   "--benchmark_filter=strikethrough to run only those.\n";
+      std::cerr << "\nIn addition to the CommonMark comparison, autolink,\n"
+                   "strikethrough and tasklist benchmarks (autolink-ext_*, "
+                   "strikethrough-ext_*,\n"
+                   "tasklist-ext_*) run each parser with the matching GFM "
+                   "extension enabled\n"
+                   "on a synthetic extension-heavy document. Use "
+                   "--benchmark_filter=autolink,\n"
+                   "--benchmark_filter=strikethrough or "
+                   "--benchmark_filter=tasklist\n"
+                   "to run only those.\n";
       std::cerr << "\nGoogle Benchmark options:\n";
       std::cerr << "  --benchmark_min_time=N   Minimum time per benchmark run "
                    "(default: 1s)\n";
@@ -620,11 +757,12 @@ int main(int argc, char** argv) {
 
   RegisterBenchmarks(inputs);
 
-  // GFM autolink and strikethrough extension benchmarks: each parser with the
-  // extension enabled, on a synthetic extension-heavy document.
+  // GFM autolink, strikethrough and tasklist extension benchmarks: each parser
+  // with the extension enabled, on a synthetic extension-heavy document.
   EnsureCmarkGfmExtensions();
   RegisterAutolinkBenchmarks(GenerateAutolinkSample());
   RegisterStrikethroughBenchmarks(GenerateStrikethroughSample());
+  RegisterTasklistBenchmarks(GenerateTasklistSample());
 
   // Add --benchmark_repetitions for our --rounds option
   std::string reps_arg =

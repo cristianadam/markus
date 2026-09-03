@@ -322,6 +322,12 @@ struct HtmlBlock {
 struct ListItem {
   std::pmr::vector<BlockNodeId> children;
   bool is_tight = true;
+
+  // GFM `tasklist` extension. Set when this item's first line began with a
+  // `[ ]`/`[x]`/`[X]` marker (the marker is consumed and the item is rendered
+  // with a checkbox). `tasklist_checked` is true for `[x]`/`[X]`.
+  bool is_tasklist = false;
+  bool tasklist_checked = false;
 };
 
 struct List {
@@ -4525,6 +4531,12 @@ class BlockParser {
   // wrapped in a <del> node. Off by default for plain CommonMark behaviour.
   bool enable_strikethrough = false;
 
+  // GFM `tasklist` extension. When true, a list item whose first line begins
+  // with a `[ ]`, `[x]` or `[X]` marker (followed by a space) is treated as a
+  // task list item and rendered with a checkbox. Off by default for plain
+  // CommonMark behaviour.
+  bool enable_tasklist = false;
+
   Document Parse(std::string_view input) {
     // Reset the thread-local monotonic buffer for this parse operation.
     // All std::pmr containers created from here until the next Parse() call
@@ -6186,6 +6198,32 @@ class BlockParser {
 
         std::pmr::string first_content =
             std::pmr::string(expanded_trimmed.substr(skip));
+
+        // GFM `tasklist` extension: if the first line of the item begins with a
+        // `[ ]`, `[x]` or `[X]` marker followed by a space or tab, it is a task
+        // list item. The marker (plus any following whitespace) is consumed so
+        // the remaining text becomes the item's paragraph content, and the
+        // checked state is recorded for the renderer. Mirrors cmark-gfm's
+        // tasklist extension (marker = `[` + (space|x|X) + `]`, then at least
+        // one whitespace before other content).
+        if (enable_tasklist && first_content.size() >= 4 &&
+            first_content[0] == '[' &&
+            (first_content[1] == ' ' || first_content[1] == 'x' ||
+             first_content[1] == 'X') &&
+            first_content[2] == ']' &&
+            (first_content[3] == ' ' || first_content[3] == '\t')) {
+          item.is_tasklist = true;
+          item.tasklist_checked =
+              (first_content[1] == 'x' || first_content[1] == 'X');
+          size_t content_after_marker = 3;
+          while (content_after_marker < first_content.size() &&
+                 (first_content[content_after_marker] == ' ' ||
+                  first_content[content_after_marker] == '\t')) {
+            ++content_after_marker;
+          }
+          first_content.erase(0, content_after_marker);
+        }
+
         item_buf += first_content;
         item_buf += '\n';
         Advance();
@@ -6458,6 +6496,7 @@ class BlockParser {
         if (!item_buf.empty()) {
           BlockParser item_parser;
           item_parser.enable_tables = enable_tables;
+          item_parser.enable_tasklist = enable_tasklist;
           std::pmr::vector<BlockNode> item_blocks;
           item_parser.ParseBlocksInto(std::string_view(item_buf), *doc_,
                                       item_blocks, /*input_no_nulls=*/true);
@@ -7093,6 +7132,13 @@ class HtmlRenderer {
 
     for (const auto& item : list.items) {
       out += "<li>";
+      if (item.is_tasklist) {
+        // GFM `tasklist` extension: emit the checkbox right after the <li>,
+        // matching cmark-gfm's attribute order and trailing space.
+        out += item.tasklist_checked
+                   ? "<input type=\"checkbox\" checked=\"\" disabled=\"\" /> "
+                   : "<input type=\"checkbox\" disabled=\"\" /> ";
+      }
 
       if (list.is_tight && item.children.size() == 1) {
         // Look up the first block by ID
@@ -7249,13 +7295,16 @@ class HtmlRenderer {
 // Parser options. Plain CommonMark by default; individual GFM extensions can
 // be turned on: `enable_tables` (the `table` extension), `enable_autolink`
 // (the `autolink` extension, which recognises www/url/email autolinks in plain
-// text in addition to the CommonMark `<...>` autolinks), and
+// text in addition to the CommonMark `<...>` autolinks),
 // `enable_strikethrough` (the `strikethrough` extension, which wraps `~`/`~~`
-// delimited text in a <del> node).
+// delimited text in a <del> node), and `enable_tasklist` (the `tasklist`
+// extension, which renders list items beginning with a `[ ]`/`[x]`/`[X]` marker
+// as checkboxes).
 struct Options {
   bool enable_tables = false;
   bool enable_autolink = false;
   bool enable_strikethrough = false;
+  bool enable_tasklist = false;
 };
 
 // Parse Markdown input and return an AST
@@ -7270,6 +7319,7 @@ inline Document Parse(std::string_view input, const Options& options) {
   parser.enable_tables = options.enable_tables;
   parser.enable_autolink = options.enable_autolink;
   parser.enable_strikethrough = options.enable_strikethrough;
+  parser.enable_tasklist = options.enable_tasklist;
   return parser.Parse(input);
 }
 
@@ -7291,6 +7341,14 @@ inline std::pmr::string MarkdownToHtml(std::string_view input,
 }
 
 // Debug: print AST structure
+// Debug suffix appended to a list item line when it is a GFM task list item.
+inline const char* TasklistDebugSuffix(const ListItem& item) {
+  if (!item.is_tasklist) {
+    return "";
+  }
+  return item.tasklist_checked ? " (tasklist checked)" : " (tasklist)";
+}
+
 inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
   std::pmr::string result;
   std::pmr::string prefix(indent * 2, ' ');
@@ -7377,11 +7435,11 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
                         (n.is_ordered ? "ordered" : "unordered") +
                         (n.is_tight ? ", tight" : ", loose") + ")\n";
               for (const auto& item : n.items) {
-                result += p + "  ListItem\n";
+                result += p + "  ListItem" + TasklistDebugSuffix(item) + "\n";
                 print_block_ids(item.children, ind + 2);
               }
             } else if constexpr (std::is_same_v<T, ListItem>) {
-              result += p + "ListItem\n";
+              result += p + "ListItem" + TasklistDebugSuffix(n) + "\n";
               print_block_ids(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, Table>) {
               result +=
@@ -7429,11 +7487,11 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
                         (n.is_ordered ? "ordered" : "unordered") +
                         (n.is_tight ? ", tight" : ", loose") + ")\n";
               for (const auto& item : n.items) {
-                result += p + "  ListItem\n";
+                result += p + "  ListItem" + TasklistDebugSuffix(item) + "\n";
                 print_block_ids(item.children, ind + 2);
               }
             } else if constexpr (std::is_same_v<T, ListItem>) {
-              result += p + "ListItem\n";
+              result += p + "ListItem" + TasklistDebugSuffix(n) + "\n";
               print_block_ids(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, Table>) {
               result +=

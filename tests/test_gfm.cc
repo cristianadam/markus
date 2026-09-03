@@ -32,6 +32,17 @@ std::string GetGfmSpecPath() {
   return "cmark-gfm/test/spec.txt";
 }
 
+// The tasklist spec lives in a dedicated file (not cmark-gfm/test/spec.txt)
+// because cmark-gfm marks the tasklist examples `disabled` in its own spec, so
+// they are not exercised by the standard GFM spec section runner.
+std::string GetTasklistSpecPath() {
+  const char* path = std::getenv("MARKUS_TASKLIST_SPEC");
+  if (path && path[0] != '\0') {
+    return path;
+  }
+  return "tests/tasklist_spec.txt";
+}
+
 // Runs the cmark-gfm GFM spec examples whose section matches `pattern` against
 // markus's main binary. The runner (cmark-gfm/test/spec_tests.py) drives the
 // program in external mode, appending `--unsafe` and a `-e <ext>` flag per
@@ -86,10 +97,6 @@ std::string RunGfmSection(const std::string& pattern,
 // GFM extension features tracked against cmark-gfm's GFM spec, so that as
 // markus implements each one, the corresponding test goes green. Opt-in via
 // -DMARKUS_BUILD_GFM_TESTS=ON (excluded from the default CommonMark run).
-//
-// Task list items are intentionally omitted: their GFM spec examples are marked
-// `disabled` (checkbox markup is left to implementors), so they are not
-// spec-testable.
 #define RUN_GFM_SECTION(test_name, pattern)                                    \
   TEST(GFM, test_name) {                                                       \
     const std::string main_path = GetMainBinaryPath();                         \
@@ -103,3 +110,16 @@ RUN_GFM_SECTION(Tables, "Tables")
 RUN_GFM_SECTION(Strikethrough, "Strikethrough")
 RUN_GFM_SECTION(AutolinkExtensions, "Autolinks \\(extension\\)")
 RUN_GFM_SECTION(DisallowedRawHtml, "Disallowed")
+
+// Task list items: cmark-gfm marks the GFM spec tasklist examples `disabled`
+// (checkbox markup is left to implementors), so they are not run by the
+// standard GFM spec section runner. Instead we run a dedicated spec file
+// (tests/tasklist_spec.txt) holding the same examples (re-enabled) plus edge
+// cases, driving the main binary with `-e tasklist` and comparing normalised
+// HTML against cmark-gfm's reference output.
+TEST(GFM, TaskListItems) {
+  const std::string main_path = GetMainBinaryPath();
+  const std::string spec_path = GetTasklistSpecPath();
+  std::string result = RunGfmSection("Task list", main_path, spec_path);
+  EXPECT_EQ("PASS", result) << "GFM tasklist section failed:\n" << result;
+}

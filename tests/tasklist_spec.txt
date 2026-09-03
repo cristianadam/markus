@@ -1,0 +1,98 @@
+# Task list items (extension)
+
+GFM enables the `tasklist` extension, where a list item whose first line
+begins with a `[ ]`, `[x]` or `[X]` marker (followed by at least one
+whitespace character) is rendered with a checkbox. The expected HTML below is
+the exact cmark-gfm output; the test runner normalises both sides before
+comparing, so attribute order and self-closing style are irrelevant.
+
+The GFM spec marks these examples `disabled` (the exact checkbox markup is left
+to implementors), so they cannot be exercised by the standard GFM spec section
+runner. This dedicated spec file re-enables them (and adds edge cases) so the
+tasklist extension is spec-testable against cmark-gfm's reference output.
+
+```````````````````````````````` example tasklist
+- [ ] foo
+- [x] bar
+.
+<ul>
+<li><input type="checkbox" disabled="" /> foo</li>
+<li><input type="checkbox" checked="" disabled="" /> bar</li>
+</ul>
+````````````````````````````````
+
+Task lists can be arbitrarily nested:
+
+```````````````````````````````` example tasklist
+- [x] foo
+  - [ ] bar
+  - [x] baz
+- [ ] bim
+.
+<ul>
+<li><input type="checkbox" checked="" disabled="" /> foo
+<ul>
+<li><input type="checkbox" disabled="" /> bar</li>
+<li><input type="checkbox" checked="" disabled="" /> baz</li>
+</ul>
+</li>
+<li><input type="checkbox" disabled="" /> bim</li>
+</ul>
+````````````````````````````````
+
+Ordered lists also support task list items:
+
+```````````````````````````````` example tasklist
+1. [ ] ordered unchecked
+2. [X] ordered checked
+.
+<ol>
+<li><input type="checkbox" disabled="" /> ordered unchecked</li>
+<li><input type="checkbox" checked="" disabled="" /> ordered checked</li>
+</ol>
+````````````````````````````````
+
+The marker must be followed by at least one whitespace character; with no
+space after the closing bracket it is not a task list item:
+
+```````````````````````````````` example tasklist
+- [ ]foo
+.
+<ul>
+<li>[ ]foo</li>
+</ul>
+````````````````````````````````
+
+An uppercase `X` marks the item as checked:
+
+```````````````````````````````` example tasklist
+- [X] uppercase
+.
+<ul>
+<li><input type="checkbox" checked="" disabled="" /> uppercase</li>
+</ul>
+````````````````````````````````
+
+Extra whitespace after the marker is consumed with it:
+
+```````````````````````````````` example tasklist
+- [ ]   three spaces
+.
+<ul>
+<li><input type="checkbox" disabled="" /> three spaces</li>
+</ul>
+````````````````````````````````
+
+Mixed checked and unchecked items:
+
+```````````````````````````````` example tasklist
+- [x] a
+- [ ] b
+- [x] c
+.
+<ul>
+<li><input type="checkbox" checked="" disabled="" /> a</li>
+<li><input type="checkbox" disabled="" /> b</li>
+<li><input type="checkbox" checked="" disabled="" /> c</li>
+</ul>
+````````````````````````````````

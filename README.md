@@ -7,8 +7,11 @@ with zero external dependencies.
 _Vibe coded with Claude Opus 4.5 and Opencode (qwen 3.6 35b)_
 
 > [!CAUTION]
-> DO NOT USE IN PRODUCTION. This is completely vibe coded and has not undergone
-any reviews for memory safety.
+> DO NOT USE IN PRODUCTION. This is vibe coded and has not been reviewed by a
+> human. Memory safety has been checked with fuzzing (AddressSanitizer +
+> UndefinedBehaviorSanitizer under both libFuzzer and AFL++; see
+> [Fuzzing](#fuzzing)), which found no issues — but fuzzing finds bugs, it does
+> not prove their absence.
 
 ## Features
 
@@ -254,8 +257,49 @@ it stays out of the default CommonMark run:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DMARKUS_BUILD_GFM_TESTS=ON
 cmake --build build --target test_gfm
-ctest --test-dir build -R 'markus\.gfm\.' --output-on-failure
+ ctest --test-dir build -R 'markus\.gfm\.' --output-on-failure
 ```
+
+## Fuzzing
+
+`fuzz/` contains a coverage-guided fuzzing harness (modeled on cmark-gfm's
+`fuzz/`) that feeds a config-prefixed, quadratically-amplified Markdown body
+through both the batch path (`Parse`/`RenderHtml`/`DebugAst`) and the streaming
+path (`StreamingMarkdownParser`), with AddressSanitizer +
+UndefinedBehaviorSanitizer instrumentation. Memory safety has been checked with
+this harness under both libFuzzer and AFL++; no issues were found.
+
+- `fuzz_markus_standalone` — standalone / AFL++ driver (builds with any compiler)
+- `fuzz_markus` — libFuzzer harness (needs a clang that ships the fuzzer
+  runtime; the default Apple clang does not)
+
+```bash
+# Replay the seed corpus (quick smoke test for crashes on known inputs)
+cmake -S . -B build -DBUILD_TESTING=OFF -DMARKUS_BUILD_FUZZER=ON
+cmake --build build --target fuzz_markus_standalone
+./fuzz/run_fuzz.sh replay
+
+# AFL++ (recommended locally): build with afl-clang-fast for edge-guided
+# coverage, then run (see run_fuzz.sh afl for the dumb-mode shortcut)
+cmake -S . -B build-afl -DBUILD_TESTING=OFF \
+      -DCMAKE_CXX_COMPILER="$(which afl-clang-fast++)" \
+      -DCMAKE_C_COMPILER="$(which afl-clang-fast)" \
+      -DMARKUS_BUILD_FUZZER=ON
+cmake --build build-afl --target fuzz_markus_standalone
+afl-fuzz -m 2000 -x fuzz/fuzzing_dictionary -i fuzz/corpus -o fuzz/afl_out \
+      ./build-afl/fuzz_markus_standalone @@
+
+# libFuzzer (best in CI / Linux)
+cmake -S . -B build-fuzz -DBUILD_TESTING=OFF \
+      -DCMAKE_CXX_COMPILER=/path/to/fuzzer-capable/clang++ \
+      -DMARKUS_BUILD_FUZZER=ON -DMARKUS_BUILD_FUZZER_LIBFUZZER=ON
+cmake --build build-fuzz --target fuzz_markus
+BUILDDIR=build-fuzz ./fuzz/run_fuzz.sh libfuzzer
+```
+
+`fuzz/corpus/` holds the seed inputs and `fuzz/fuzzing_dictionary` the fuzzer
+dictionary; `fuzz/run_fuzz.sh` wraps the build-and-run commands
+(`replay` | `libfuzzer` | `afl`).
 
 ## Supported Markdown Features
 

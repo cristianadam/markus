@@ -1,0 +1,66 @@
+# Fuzzing dictionary for markus (CommonMark + GFM extension tokens).
+# libFuzzer uses these as mutation seeds; AFL++ does not read this file.
+asterisk="*"
+backtick="`"
+colon=":"
+dashes="---"
+double_quote="\""
+equals="==="
+exclamation="!"
+greater_than=">"
+hash="#"
+hyphen="-"
+indent="    "
+left_bracket="["
+left_paren="("
+less_than="<"
+pipe="|"
+plus="+"
+right_bracket="]"
+right_paren=")"
+single_quote="'"
+space=" "
+underscore="_"
+tilde="~"
+
+# CommonMark syntax
+entity_builtin="&lt;"
+entity_decimal="&#1;"
+entity_hex="&#x1;"
+tag_open="<div>"
+tag_close="</div>"
+tag_open_exclamation="<!"
+tag_open_q="<?"
+tag_cdata="<![CDATA["
+tag_cdata_close="]]>"
+backslash="\\"
+code_fence="```"
+code_fence_close="```"
+fence_tilde="~~~"
+link_open="["
+link_close="]"
+image="![alt](http://example.com/a.png)"
+refdef="[label]: http://example.com"
+
+# GFM: table
+table_row="| a | b |"
+table_sep="|---|---|"
+table_align="|:---:|---:|"
+
+# GFM: autolink
+www="www.example.com"
+email="user@example.com"
+url="https://example.com/path"
+
+# GFM: strikethrough / tasklist
+strike="~~text~~"
+task_open="- [ ] "
+task_done="- [x] "
+
+# GFM: tagfilter (disallowed raw HTML)
+script_tag="<script>"
+script_close="</script>"
+style_tag="<style>"
+iframe_tag="<iframe>"
+svg_tag="<svg>"
+onerror="onerror="

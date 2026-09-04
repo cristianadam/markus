@@ -10,6 +10,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # standard CommonMark run stays green; enable to track GFM feature progress.
 option(MARKUS_BUILD_GFM_TESTS "Build the opt-in cmark-gfm GFM feature tests" OFF)
 
+# Fuzzing harness (see fuzz/). MARKUS_BUILD_FUZZER builds the standalone / AFL++
+# driver (works with any compiler). MARKUS_BUILD_FUZZER_LIBFUZZER additionally
+# builds the libFuzzer harness; that target uses the project's
+# CMAKE_CXX_COMPILER, which must ship the fuzzer runtime (configure the tree
+# with a fuzzer-capable clang, e.g. -DCMAKE_CXX_COMPILER=/path/to/clang++).
+option(MARKUS_BUILD_FUZZER "Build the markus fuzzing harness (standalone / AFL driver)" OFF)
+option(MARKUS_BUILD_FUZZER_LIBFUZZER "Build the libFuzzer fuzzing harness" OFF)
+
 # Profile build type support (for gprof)
 set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_PROFILE} -pg")
 
@@ -37,6 +45,11 @@ target_include_directories(markus INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 # Main executable
 add_executable(main main.cc)
 target_link_libraries(main PRIVATE markus)
+
+# Fuzzing harness (standalone / AFL driver, plus optional libFuzzer target)
+if(MARKUS_BUILD_FUZZER OR MARKUS_BUILD_FUZZER_LIBFUZZER)
+  add_subdirectory(fuzz)
+endif()
 
 # Tests
 if(BUILD_TESTING)

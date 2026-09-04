@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -366,7 +367,259 @@ GEN_SPEC_TEST(2) GEN_SPEC_TEST(3) GEN_SPEC_TEST(4) GEN_SPEC_TEST(5) GEN_SPEC_TES
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 643) GEN_SPEC_TEST(644) GEN_SPEC_TEST(645) GEN_SPEC_TEST(646) GEN_SPEC_TEST(647) GEN_SPEC_TEST(648) GEN_SPEC_TEST(649) GEN_SPEC_TEST(650)
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 GEN_SPEC_TEST(651) GEN_SPEC_TEST(652) GEN_SPEC_TEST(653) GEN_SPEC_TEST(
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     654)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    GEN_SPEC_TEST(
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        655)
+GEN_SPEC_TEST(
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     655)
+
+// =============================================================================
+// Streaming API tests
+// =============================================================================
+
+namespace {
+
+std::string ToStd(const std::pmr::string& s) {
+  return std::string(s.data(), s.size());
+}
+
+std::string Regular(const std::string& input,
+                    const markus::Options& options = {}) {
+  return ToStd(markus::MarkdownToHtml(input, options));
+}
+
+// Feed the whole input at once, then flush; concatenate every emission.
+std::string StreamSingleFeed(const std::string& input,
+                             const markus::Options& options = {}) {
+  std::string out;
+  markus::StreamingMarkdownParser parser(options);
+  parser.setOutputCallback(
+      [&](std::string_view h) { out.append(h.data(), h.size()); });
+  parser.Feed(input);
+  parser.Flush();
+  return out;
+}
+
+// Feed `input` in `chunk`-byte pieces, then flush; concatenate emissions.
+std::string StreamChunked(const std::string& input, size_t chunk,
+                          const markus::Options& options = {}) {
+  std::string out;
+  markus::StreamingMarkdownParser parser(options);
+  parser.setOutputCallback(
+      [&](std::string_view h) { out.append(h.data(), h.size()); });
+  for (size_t i = 0; i < input.size(); i += chunk) {
+    size_t len = std::min(chunk, input.size() - i);
+    parser.Feed(std::string_view(input.data() + i, len));
+  }
+  parser.Flush();
+  return out;
+}
+
+// Collect each individual emission (rather than concatenating).
+std::vector<std::string> StreamEmissions(const std::string& input, size_t chunk,
+                                         const markus::Options& options = {}) {
+  std::vector<std::string> emissions;
+  markus::StreamingMarkdownParser parser(options);
+  parser.setOutputCallback([&](std::string_view h) {
+    emissions.emplace_back(h.data(), h.size());
+  });
+  for (size_t i = 0; i < input.size(); i += chunk) {
+    size_t len = std::min(chunk, input.size() - i);
+    parser.Feed(std::string_view(input.data() + i, len));
+  }
+  parser.Flush();
+  return emissions;
+}
+
+}  // namespace
+
+// The strong guarantee: feeding the entire document in one chunk and flushing
+// reproduces MarkdownToHtml exactly.
+TEST(StreamingMarkdownParser, SingleFeedMatchesRegular) {
+  const std::vector<std::string> inputs = {
+      "hello\n",
+      "para one\n\npara two\n",
+      "# heading\n",
+      "- a\n- b\n- c\n",
+      "1. one\n2. two\n",
+      "> quoted\nline\n",
+      "```\ncode\n```\n",
+      "    indented\n    code\n",
+      "<style>x</style>\nafter\n",
+      "a\n\n---\n\nb\n",
+      "text **bold** _em_ `code`\n",
+      "[link](http://x.com)\n",
+      "![img](y.png)\n",
+      "<style\n  type=\"text/css\">\n\nfoo\n",  // spec Example 173
+      "para1\n\n<style\nfoo\n",
+      "para1\n\n<style>foo</style>\npara2\n",
+      "[ref]: /url\n\n[ref]\n",
+  };
+  for (const auto& in : inputs) {
+    EXPECT_EQ(Regular(in), StreamSingleFeed(in)) << "input: " << in;
+  }
+}
+
+// Chunked (and char-by-char) feeding matches the regular output for common,
+// well-behaved inputs that have no cross-blank-line ambiguity.
+TEST(StreamingMarkdownParser, ChunkedMatchesRegular) {
+  const std::vector<std::string> inputs = {
+      "para one\n\npara two\n",
+      "# heading\n",
+      "- a\n- b\n- c\n",
+      "1. one\n2. two\n",
+      "> quoted\nline\n",
+      "```\ncode\n```\n",
+      "    indented\n    code\n",
+      "<style>x</style>\nafter\n",
+      "a\n\n---\n\nb\n",
+      "text **bold** _em_ `code`\n",
+      "[ref]: /url\n\n[ref]\n",
+      "<style\n  type=\"text/css\">\n\nfoo\n",  // spec Example 173
+  };
+  for (const auto& in : inputs) {
+    for (size_t chunk : {1u, 2u, 3u, 5u, 8u, 64u}) {
+      EXPECT_EQ(Regular(in), StreamChunked(in, chunk))
+          << "input: " << in << " chunk: " << chunk;
+    }
+  }
+}
+
+// An unterminated raw-HTML block must be held back: it is emitted neither
+// during Feed (while the block is still open) nor split across a mid-block
+// boundary, and the whole block is only emitted once it is closed or on Flush.
+TEST(StreamingMarkdownParser, UnterminatedRawHtmlIsHeldBack) {
+  // Example 173: `<style` with no closing tag absorbs the blank line and `foo`.
+  const std::string input = "<style\n  type=\"text/css\">\n\nfoo\n";
+
+  // Nothing may be emitted until the block is terminated or flushed.
+  markus::StreamingMarkdownParser parser;
+  std::string emitted_so_far;
+  parser.setOutputCallback([&](std::string_view h) {
+    emitted_so_far.append(h.data(), h.size());
+  });
+  parser.Feed(input);
+  EXPECT_EQ(std::string(), emitted_so_far)
+      << "open raw-HTML block must not be emitted before it is closed";
+  parser.Flush();
+  EXPECT_EQ(Regular(input), emitted_so_far);
+
+  // A type-6 block (no explicit end tag) is likewise held until a blank line or
+  // EOF terminates it.
+  EXPECT_EQ(Regular("<div>\nfoo\n"), StreamChunked("<div>\nfoo\n", 2));
+  EXPECT_EQ(Regular("<div>\nfoo\n\nbar\n"),
+            StreamChunked("<div>\nfoo\n\nbar\n", 2));
+}
+
+// Emissions arrive in document order, each is a prefix-continuation of the
+// output, and the trailing incomplete block is only emitted on Flush.
+TEST(StreamingMarkdownParser, ProgressiveEmissionOrder) {
+  const std::string input = "para1\n\npara2\n\npara3\n";
+  const std::string expected = Regular(input);
+
+  std::string running;
+  bool saw_trailing_held = false;
+  {
+    markus::StreamingMarkdownParser parser;
+    parser.setOutputCallback([&](std::string_view h) {
+      running.append(h.data(), h.size());
+      // Every prefix of the emitted output must itself be a prefix of the final
+      // document (blocks are never revised or reordered).
+      EXPECT_EQ(0u, expected.rfind(running, 0) == 0 ? 0u : 1u)
+          << "emissions must stay a prefix of the final output; running: "
+          << running;
+    });
+    // Feed block-aligned so the first two paragraphs complete mid-stream.
+    parser.Feed("para1\n\n");
+    parser.Feed("para2\n\n");
+    // The trailing paragraph is still open: it must not be emitted yet.
+    parser.Feed("para3\n");
+    saw_trailing_held = (running == Regular("para1\n\npara2\n\n"));
+    parser.Flush();
+  }
+  EXPECT_TRUE(saw_trailing_held)
+      << "the trailing (incomplete) paragraph must be held until Flush; got: "
+      << running;
+  EXPECT_EQ(expected, running);
+}
+
+// GFM extensions stream identically to the regular (non-streaming) renderer.
+TEST(StreamingMarkdownParser, GfmOptionsMatchRegular) {
+  struct Case {
+    markus::Options options;
+    std::string input;
+  };
+  const std::vector<Case> cases = {
+      {markus::Options{.enable_tables = true},
+       "| a | b |\n|---|---|\n| 1 | 2 |\n"},
+      {markus::Options{.enable_strikethrough = true}, "~~gone~~\n"},
+      {markus::Options{.enable_tasklist = true}, "- [x] done\n- [ ] todo\n"},
+      {markus::Options{.enable_autolink = true},
+       "visit https://example.com now\n"},
+      {markus::Options{.enable_tables = true, .enable_tasklist = true},
+       "- [ ] a\n\n| x |\n|---|\n| y |\n"},
+  };
+  for (const auto& c : cases) {
+    EXPECT_EQ(Regular(c.input, c.options), StreamSingleFeed(c.input, c.options))
+        << "single-feed mismatch for GFM input: " << c.input;
+  }
+}
+
+// A link reference defined before its use resolves even when they arrive in
+// separate chunks.
+TEST(StreamingMarkdownParser, LinkRefDefinedBeforeUseResolves) {
+  const std::string input = "[ref]: /url\n\n[ref]\n";
+  // The definition line settles (and is remembered) before the use is emitted.
+  EXPECT_EQ(Regular(input), StreamChunked(input, 2));
+  EXPECT_EQ(Regular(input), StreamSingleFeed(input));
+}
+
+// Inherent one-pass limitation: a reference link used before its definition
+// arrives cannot be retroactively turned into a link, because the earlier
+// paragraph has already been emitted. The definition is still remembered for
+// any *later* use.
+TEST(StreamingMarkdownParser, ForwardRefLimitDocumented) {
+  const std::string input = "[ref]\n\n[ref]: /url\n";
+  // Use first, then definition. The emitted paragraph keeps the literal text.
+  EXPECT_EQ(std::string("<p>[ref]</p>\n"),
+            StreamChunked(input, input.find_first_of('\n') + 1));
+  // By contrast, the full document (single feed) resolves it.
+  EXPECT_EQ(Regular(input), StreamSingleFeed(input));
+}
+
+// Empty Feed() is a no-op; Reset() discards all buffered content and link
+// references, behaving like a fresh parser.
+TEST(StreamingMarkdownParser, ResetAndEmptyFeed) {
+  markus::StreamingMarkdownParser parser;
+  std::string out;
+  parser.setOutputCallback(
+      [&](std::string_view h) { out.append(h.data(), h.size()); });
+
+  parser.Feed("");  // no-op
+  EXPECT_TRUE(parser.empty());
+  parser.Flush();
+  EXPECT_EQ(std::string(), out);
+
+  parser.Feed("para1\n");
+  parser.Reset();
+  EXPECT_TRUE(parser.empty());
+  parser.Feed("para2\n");
+  parser.Flush();
+  EXPECT_EQ(Regular("para2\n"), out)
+      << "content before Reset() must be discarded; got: " << out;
+}
+
+// A line without a trailing newline cannot be completed; it is held together
+// with subsequent input until a newline arrives, then (if still open) until
+// Flush.
+TEST(StreamingMarkdownParser, PartialLineHeldUntilNewline) {
+  markus::StreamingMarkdownParser parser;
+  std::string out;
+  parser.setOutputCallback(
+      [&](std::string_view h) { out.append(h.data(), h.size()); });
+  parser.Feed("para");
+  EXPECT_TRUE(parser.empty() == false);
+  EXPECT_EQ(std::string(), out);  // no newline yet: nothing can be emitted
+  parser.Feed(" more\n");
+  parser.Flush();
+  EXPECT_EQ(Regular("para more\n"), out);
+}
 
 }  // namespace

@@ -2486,6 +2486,9 @@ class LineBuffer {
     return std::string_view(data_ptr_ + offset, len);
   }
 
+  // Byte offset (into the underlying data buffer) where line `idx` begins.
+  size_t OffsetOf(size_t idx) const { return line_offsets_[idx].offset; }
+
  private:
   struct LineOffset {
     size_t offset;
@@ -2756,6 +2759,295 @@ inline std::pmr::string DecodeEscapes(std::string_view text) {
   }
 
   return result;
+}
+
+// Classify a line as an HTML block start. Returns the block type (1-7) and,
+// for types 1-5, the end condition (a line containing it terminates the block);
+// for types 6-7 the end condition is empty (they end at a blank line). Returns
+// type 0 if the line does not start an HTML block. `trimmed` is the line with
+// leading whitespace removed.
+inline std::pair<int, std::string_view> ClassifyHtmlBlock(
+    std::string_view trimmed) {
+  int block_type = 0;
+  std::string_view end_condition;
+
+  // Type 1: <script>, <pre>, <style>, <textarea>
+  static constexpr std::array type1_tags = {
+      std::pair(std::string_view("<script"), std::string_view("</script>")),
+      std::pair(std::string_view("<pre"), std::string_view("</pre>")),
+      std::pair(std::string_view("<style"), std::string_view("</style>")),
+      std::pair(std::string_view("<textarea"), std::string_view("</textarea>"))};
+  for (auto [open_prefix, close_cond] : type1_tags) {
+    if (StartsWithInsensitive(trimmed, open_prefix)) {
+      if (trimmed.size() == open_prefix.size()) {
+        block_type = 1;
+        end_condition = close_cond;
+        break;
+      }
+      char next = trimmed[open_prefix.size()];
+      if (next == ' ' || next == '>' || next == '\t' || next == '\n') {
+        block_type = 1;
+        end_condition = close_cond;
+        break;
+      }
+    }
+  }
+
+  // Type 2: <!-- comment --> (text after <!-- cannot start with > or ->)
+  if (block_type == 0 && trimmed.starts_with("<!--")) {
+    if (trimmed.size() > 4) {
+      char next = trimmed[4];
+      if (next != '>' &&
+          !(next == '-' && trimmed.size() > 5 && trimmed[5] == '>')) {
+        block_type = 2;
+        end_condition = "-->";
+      }
+    } else if (trimmed.size() == 4) {
+      block_type = 2;
+      end_condition = "-->";
+    }
+  }
+
+  // Type 3: <? processing instruction ?>
+  if (block_type == 0 && trimmed.starts_with("<?")) {
+    block_type = 3;
+    end_condition = "?>";
+  }
+
+  // Type 4: <!DOCTYPE
+  if (block_type == 0 && StartsWithInsensitive(trimmed, "<!doctype")) {
+    block_type = 4;
+    end_condition = ">";
+  }
+
+  // Type 5: <![CDATA[
+  if (block_type == 0 && trimmed.starts_with("<![CDATA[")) {
+    block_type = 5;
+    end_condition = "]]>";
+  }
+
+  // Type 6: Block-level HTML tags
+  static constexpr std::array type6_tags = {
+      std::string_view("address"), std::string_view("article"),
+      std::string_view("aside"), std::string_view("base"),
+      std::string_view("basefont"), std::string_view("blockquote"),
+      std::string_view("body"), std::string_view("caption"),
+      std::string_view("center"), std::string_view("col"),
+      std::string_view("colgroup"), std::string_view("dd"),
+      std::string_view("details"), std::string_view("dialog"),
+      std::string_view("dir"), std::string_view("div"),
+      std::string_view("dl"), std::string_view("dt"),
+      std::string_view("fieldset"), std::string_view("figcaption"),
+      std::string_view("figure"), std::string_view("footer"),
+      std::string_view("form"), std::string_view("frame"),
+      std::string_view("frameset"), std::string_view("h1"),
+      std::string_view("h2"), std::string_view("h3"), std::string_view("h4"),
+      std::string_view("h5"), std::string_view("h6"), std::string_view("head"),
+      std::string_view("header"), std::string_view("hr"),
+      std::string_view("html"), std::string_view("iframe"),
+      std::string_view("legend"), std::string_view("li"),
+      std::string_view("link"), std::string_view("main"),
+      std::string_view("menu"), std::string_view("menuitem"),
+      std::string_view("nav"), std::string_view("noframes"),
+      std::string_view("ol"), std::string_view("optgroup"),
+      std::string_view("option"), std::string_view("p"),
+      std::string_view("param"), std::string_view("search"),
+      std::string_view("section"), std::string_view("summary"),
+      std::string_view("table"), std::string_view("tbody"),
+      std::string_view("td"), std::string_view("tfoot"),
+      std::string_view("th"), std::string_view("thead"),
+      std::string_view("title"), std::string_view("tr"),
+      std::string_view("track"), std::string_view("ul")};
+
+  if (block_type == 0) {
+    bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
+    size_t tag_start = is_closing ? 2 : 1;
+
+    size_t tag_end = tag_start;
+    while (tag_end < trimmed.size() &&
+           (std::isalnum(static_cast<unsigned char>(trimmed[tag_end])) ||
+            trimmed[tag_end] == '-')) {
+      ++tag_end;
+    }
+
+    if (tag_end > tag_start) {
+      std::string_view tag_name_sv = trimmed.substr(tag_start, tag_end - tag_start);
+      for (auto t : type6_tags) {
+        if (StartsWithInsensitive(tag_name_sv, t) &&
+            tag_name_sv.size() == t.size()) {
+          if (tag_end < trimmed.size()) {
+            char next = trimmed[tag_end];
+            if (next == ' ' || next == '>' || next == '\t' || next == '/' ||
+                next == '\n') {
+              block_type = 6;
+              break;
+            }
+          } else {
+            block_type = 6;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Type 7: Other HTML tags (complete tag followed only by whitespace)
+  if (block_type == 0) {
+    bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
+    size_t tag_start = is_closing ? 2 : 1;
+
+    if (tag_start < trimmed.size() &&
+        std::isalpha(static_cast<unsigned char>(trimmed[tag_start]))) {
+      size_t tag_end = tag_start + 1;
+      while (tag_end < trimmed.size() &&
+             (std::isalnum(static_cast<unsigned char>(trimmed[tag_end])) ||
+              trimmed[tag_end] == '-')) {
+        ++tag_end;
+      }
+
+      bool valid_tag = false;
+      if (tag_end < trimmed.size()) {
+        char next = trimmed[tag_end];
+        valid_tag = (next == ' ' || next == '\t' || next == '/' || next == '>');
+      }
+      if (valid_tag) {
+        if (is_closing) {
+          size_t search_pos = tag_end;
+          while (search_pos < trimmed.size() &&
+                 (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t')) {
+            ++search_pos;
+          }
+          if (search_pos < trimmed.size() && trimmed[search_pos] == '>') {
+            bool only_whitespace = true;
+            for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {
+              if (trimmed[j] != ' ' && trimmed[j] != '\t') {
+                only_whitespace = false;
+                break;
+              }
+            }
+            if (only_whitespace) {
+              block_type = 7;
+            }
+          }
+        } else {
+          size_t search_pos = tag_end;
+          bool valid_attributes = true;
+          bool need_whitespace = false;
+
+          while (search_pos < trimmed.size() && valid_attributes) {
+            char c = trimmed[search_pos];
+            if (c == '>') {
+              break;
+            } else if (c == '/') {
+              if (search_pos + 1 < trimmed.size() &&
+                  trimmed[search_pos + 1] == '>') {
+                search_pos++;
+              } else {
+                valid_attributes = false;
+              }
+            } else if (c == ' ' || c == '\t' || c == '\n') {
+              ++search_pos;
+              need_whitespace = false;
+            } else if (!need_whitespace &&
+                       (std::isalpha(static_cast<unsigned char>(c)) || c == '_' ||
+                        c == ':')) {
+              ++search_pos;
+              while (search_pos < trimmed.size() &&
+                     (std::isalnum(static_cast<unsigned char>(trimmed[search_pos])) ||
+                      trimmed[search_pos] == '_' || trimmed[search_pos] == ':' ||
+                      trimmed[search_pos] == '.' || trimmed[search_pos] == '-')) {
+                ++search_pos;
+              }
+              while (search_pos < trimmed.size() &&
+                     (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t' ||
+                      trimmed[search_pos] == '\n')) {
+                ++search_pos;
+                need_whitespace = false;
+              }
+              if (search_pos < trimmed.size() && trimmed[search_pos] == '=') {
+                ++search_pos;
+                while (search_pos < trimmed.size() &&
+                       (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t' ||
+                        trimmed[search_pos] == '\n')) {
+                  ++search_pos;
+                }
+                if (search_pos >= trimmed.size()) {
+                  valid_attributes = false;
+                } else if (trimmed[search_pos] == '"' ||
+                           trimmed[search_pos] == '\'') {
+                  char quote = trimmed[search_pos];
+                  ++search_pos;
+                  while (search_pos < trimmed.size() &&
+                         trimmed[search_pos] != quote) {
+                    ++search_pos;
+                  }
+                  if (search_pos >= trimmed.size()) {
+                    valid_attributes = false;
+                  } else {
+                    ++search_pos;
+                    need_whitespace = true;
+                  }
+                } else {
+                  while (search_pos < trimmed.size()) {
+                    char vc = trimmed[search_pos];
+                    if (vc == ' ' || vc == '\t' || vc == '\n' || vc == '"' ||
+                        vc == '\'' || vc == '=' || vc == '<' || vc == '>' ||
+                        vc == '`') {
+                      break;
+                    }
+                    ++search_pos;
+                  }
+                  need_whitespace = true;
+                }
+              }
+            } else {
+              valid_attributes = false;
+            }
+          }
+          if (valid_attributes && search_pos < trimmed.size() &&
+              trimmed[search_pos] == '>') {
+            bool only_whitespace = true;
+            for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {
+              if (trimmed[j] != ' ' && trimmed[j] != '\t') {
+                only_whitespace = false;
+                break;
+              }
+            }
+            if (only_whitespace) {
+              block_type = 7;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return {block_type, end_condition};
+}
+
+// Determine whether the HTML block starting at line `start` (0-based) of the
+// buffer described by `lines` is terminated within the lines [start, limit).
+// `type`/`end_condition` come from ClassifyHtmlBlock. A `limit` of 0 means "up
+// to the end of `lines`".
+inline bool HtmlBlockTerminated(const LineBuffer& lines, size_t start,
+                                int type, std::string_view end_condition,
+                                size_t limit = 0) {
+  if (limit == 0) limit = lines.size();
+  if (type >= 1 && type <= 5) {
+    for (size_t i = start; i < limit; ++i) {
+      if (StringContainsInsensitive(lines[i], end_condition)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // Types 6 and 7 end at the first blank line.
+  for (size_t i = start + 1; i < limit; ++i) {
+    if (IsBlankLine(lines[i])) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace detail
@@ -4646,6 +4938,41 @@ class BlockParser {
     return doc;
   }
 
+  // Parse input as a fresh document, but pre-seed its link reference map with
+  // `initial_refs` (references defined earlier, e.g. in a previous streaming
+  // chunk). Already-defined labels win over later duplicates (first definition
+  // wins), so seeding preserves document order across chunks.
+  Document Parse(std::string_view input, const LinkRefMap& initial_refs) {
+    ResetParseResource();
+
+    Document doc;
+    if (!initial_refs.empty()) {
+      doc.link_references.insert(doc.link_references.end(),
+                                 initial_refs.begin(), initial_refs.end());
+    }
+    std::pmr::vector<BlockNode> top_blocks;
+    ParseBlocksInto(input, doc, top_blocks);
+    doc.children = std::move(top_blocks);
+
+    // Third pass: parse inlines
+    InlineParser inline_parser(&doc.link_references, &doc.string_storage,
+                               &doc.inline_nodes);
+    inline_parser.enable_autolink = enable_autolink;
+    inline_parser.enable_strikethrough = enable_strikethrough;
+    ParseInlines(doc.children, inline_parser);
+
+    return doc;
+  }
+
+  // Extract only the link reference definitions from `input` into `out`,
+  // without building blocks or inlines. First definition wins for duplicates.
+  void ExtractLinkRefs(std::string_view input, LinkRefMap& out) {
+    if (input.find('[') == std::string_view::npos) return;
+    lines_ = std::make_unique<detail::LineBuffer>(input);
+    line_idx_ = 0;
+    ExtractLinkReferences(out);
+  }
+
   void ParseBlocksInto(std::string_view input, Document& doc,
                        std::pmr::vector<BlockNode>& blocks,
                        bool input_no_nulls = false) {
@@ -4656,7 +4983,7 @@ class BlockParser {
 
     // First pass: extract link reference definitions (skip if no '[' present)
     if (input.find('[') != std::string_view::npos) {
-      ExtractLinkReferences(doc);
+      ExtractLinkReferences(doc.link_references);
     }
 
     // Second pass: parse blocks
@@ -4756,7 +5083,7 @@ class BlockParser {
     return {std::pmr::string(s.substr(0, end)), end};
   }
 
-  void ExtractLinkReferences(Document& doc) {
+  void ExtractLinkReferences(LinkRefMap& refs) {
     // Track fenced code block state
     bool in_fenced_code = false;
     char fence_char = 0;
@@ -5110,14 +5437,12 @@ class BlockParser {
       }
 
       // Only add if not already defined (sorted insertion)
-      auto ref_it = std::lower_bound(doc.link_references.begin(),
-                                     doc.link_references.end(), normalized,
+      auto ref_it = std::lower_bound(refs.begin(), refs.end(), normalized,
                                      LinkRefComparator{});
-      if (ref_it == doc.link_references.end() || ref_it->first != normalized) {
+      if (ref_it == refs.end() || ref_it->first != normalized) {
         // Insert in sorted position
-        doc.link_references.emplace(
-            ref_it, std::move(normalized),
-            std::pair{detail::EncodeUrl(destination), title});
+        refs.emplace(ref_it, std::move(normalized),
+                     std::pair{detail::EncodeUrl(destination), title});
       }
       // After successful link ref extraction, next line starts fresh
       prev_line_had_content = false;
@@ -5559,308 +5884,7 @@ class BlockParser {
     if (trimmed.empty() || trimmed[0] != '<') [[unlikely]]
       return false;
 
-    int block_type = 0;
-    std::pmr::string end_condition_storage;  // Only used for types 2-5
-    std::string_view end_condition_sv;  // Points to storage or static array
-
-    // Type 1: <script>, <pre>, <style>, <textarea>
-    // Each entry is {opening tag prefix, closing tag end condition}
-    static constexpr std::array type1_tags = {
-        std::pair(std::string_view("<script"), std::string_view("</script>")),
-        std::pair(std::string_view("<pre"), std::string_view("</pre>")),
-        std::pair(std::string_view("<style"), std::string_view("</style>")),
-        std::pair(std::string_view("<textarea"),
-                  std::string_view("</textarea>"))};
-    for (auto [open_prefix, close_cond] : type1_tags) {
-      if (detail::StartsWithInsensitive(trimmed, open_prefix)) {
-        // Tag at end of line, or followed by space/tab/>/newline
-        if (trimmed.size() == open_prefix.size()) {
-          block_type = 1;
-          end_condition_sv = close_cond;
-          break;
-        }
-        char next = trimmed[open_prefix.size()];
-        if (next == ' ' || next == '>' || next == '\t' || next == '\n') {
-          block_type = 1;
-          end_condition_sv = close_cond;
-          break;
-        }
-      }
-    }
-
-    // Type 2: <!-- comment -->
-    // The text after <!-- cannot start with > or -> (per CommonMark spec)
-    if (block_type == 0 && trimmed.starts_with("<!--")) {
-      // Check that what follows is not > or ->
-      if (trimmed.size() > 4) {
-        char next = trimmed[4];
-        if (next != '>' &&
-            !(next == '-' && trimmed.size() > 5 && trimmed[5] == '>')) {
-          block_type = 2;
-          end_condition_storage = "-->";
-          end_condition_sv = end_condition_storage;
-        }
-      } else if (trimmed.size() == 4) {
-        // Just "<!--" with nothing after - valid start
-        block_type = 2;
-        end_condition_storage = "-->";
-        end_condition_sv = end_condition_storage;
-      }
-    }
-
-    // Type 3: <? processing instruction ?>
-    if (block_type == 0 && trimmed.starts_with("<?")) {
-      block_type = 3;
-      end_condition_storage = "?>";
-      end_condition_sv = end_condition_storage;
-    }
-
-    // Type 4: <!DOCTYPE
-    if (block_type == 0 &&
-        detail::StartsWithInsensitive(trimmed, "<!doctype")) {
-      block_type = 4;
-      end_condition_storage = ">";
-      end_condition_sv = end_condition_storage;
-    }
-
-    // Type 5: <![CDATA[
-    if (block_type == 0 && trimmed.starts_with("<![CDATA[")) {
-      block_type = 5;
-      end_condition_storage = "]]>";
-      end_condition_sv = end_condition_storage;
-    }
-
-    // Type 6: Block-level HTML tags
-    static constexpr std::array type6_tags = {
-        std::string_view("address"),  std::string_view("article"),
-        std::string_view("aside"),    std::string_view("base"),
-        std::string_view("basefont"), std::string_view("blockquote"),
-        std::string_view("body"),     std::string_view("caption"),
-        std::string_view("center"),   std::string_view("col"),
-        std::string_view("colgroup"), std::string_view("dd"),
-        std::string_view("details"),  std::string_view("dialog"),
-        std::string_view("dir"),      std::string_view("div"),
-        std::string_view("dl"),       std::string_view("dt"),
-        std::string_view("fieldset"), std::string_view("figcaption"),
-        std::string_view("figure"),   std::string_view("footer"),
-        std::string_view("form"),     std::string_view("frame"),
-        std::string_view("frameset"), std::string_view("h1"),
-        std::string_view("h2"),       std::string_view("h3"),
-        std::string_view("h4"),       std::string_view("h5"),
-        std::string_view("h6"),       std::string_view("head"),
-        std::string_view("header"),   std::string_view("hr"),
-        std::string_view("html"),     std::string_view("iframe"),
-        std::string_view("legend"),   std::string_view("li"),
-        std::string_view("link"),     std::string_view("main"),
-        std::string_view("menu"),     std::string_view("menuitem"),
-        std::string_view("nav"),      std::string_view("noframes"),
-        std::string_view("ol"),       std::string_view("optgroup"),
-        std::string_view("option"),   std::string_view("p"),
-        std::string_view("param"),    std::string_view("search"),
-        std::string_view("section"),  std::string_view("summary"),
-        std::string_view("table"),    std::string_view("tbody"),
-        std::string_view("td"),       std::string_view("tfoot"),
-        std::string_view("th"),       std::string_view("thead"),
-        std::string_view("title"),    std::string_view("tr"),
-        std::string_view("track"),    std::string_view("ul")};
-
-    if (block_type == 0) {
-      bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
-      size_t tag_start = is_closing ? 2 : 1;
-
-      size_t tag_end = tag_start;
-      while (tag_end < trimmed.size() &&
-             (std::isalnum(static_cast<unsigned char>(trimmed[tag_end])) ||
-              trimmed[tag_end] == '-')) {
-        ++tag_end;
-      }
-
-      if (tag_end > tag_start) {
-        std::string_view tag_name_sv =
-            trimmed.substr(tag_start, tag_end - tag_start);
-
-        for (auto t : type6_tags) {
-          if (detail::StartsWithInsensitive(tag_name_sv, t) &&
-              tag_name_sv.size() == t.size()) {
-            // Check for valid tag ending
-            if (tag_end < trimmed.size()) {
-              char next = trimmed[tag_end];
-              if (next == ' ' || next == '>' || next == '\t' || next == '/' ||
-                  next == '\n') {
-                block_type = 6;
-                break;
-              }
-            } else {
-              block_type = 6;
-              break;
-            }
-          }
-        }
-      }
-    }
-
-    // Type 7: Other HTML tags (not interrupted by blank line same as type 6)
-    // Must be a complete tag followed only by whitespace
-    if (block_type == 0) {
-      // Check for opening or closing tag
-      bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
-      size_t tag_start = is_closing ? 2 : 1;
-
-      if (tag_start < trimmed.size() &&
-          std::isalpha(static_cast<unsigned char>(trimmed[tag_start]))) {
-        size_t tag_end = tag_start + 1;
-        while (tag_end < trimmed.size() &&
-               (std::isalnum(static_cast<unsigned char>(trimmed[tag_end])) ||
-                trimmed[tag_end] == '-')) {
-          ++tag_end;
-        }
-
-        // After tag name, must have valid HTML tag continuation: whitespace, /,
-        // > Anything else (like + or :) means this isn't a valid HTML tag
-        bool valid_tag = false;
-        if (tag_end >= trimmed.size()) {
-          // Just tag name, no closing - not valid
-        } else {
-          char next = trimmed[tag_end];
-          valid_tag =
-              (next == ' ' || next == '\t' || next == '/' || next == '>');
-        }
-        if (valid_tag) {
-          // For closing tags, only whitespace is allowed after tag name
-          if (is_closing) {
-            size_t search_pos = tag_end;
-            // Skip whitespace
-            while (
-                search_pos < trimmed.size() &&
-                (trimmed[search_pos] == ' ' || trimmed[search_pos] == '\t')) {
-              ++search_pos;
-            }
-            // Must end with >
-            if (search_pos < trimmed.size() && trimmed[search_pos] == '>') {
-              // Check rest is whitespace
-              bool only_whitespace = true;
-              for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {
-                if (trimmed[j] != ' ' && trimmed[j] != '\t') {
-                  only_whitespace = false;
-                  break;
-                }
-              }
-              if (only_whitespace) {
-                block_type = 7;
-              }
-            }
-          } else {
-            // Validate attributes properly for type 7 HTML block
-            size_t search_pos = tag_end;
-            bool valid_attributes = true;
-            bool need_whitespace =
-                false;  // Track if we need whitespace before next attribute
-
-            while (search_pos < trimmed.size() && valid_attributes) {
-              char c = trimmed[search_pos];
-
-              if (c == '>') {
-                break;  // Found end of tag
-              } else if (c == '/') {
-                // Self-closing, must be followed by >
-                if (search_pos + 1 < trimmed.size() &&
-                    trimmed[search_pos + 1] == '>') {
-                  search_pos++;  // Will break on next iteration
-                } else {
-                  valid_attributes = false;
-                }
-              } else if (c == ' ' || c == '\t' || c == '\n') {
-                ++search_pos;             // Skip whitespace
-                need_whitespace = false;  // Whitespace seen
-              } else if (!need_whitespace &&
-                         (std::isalpha(static_cast<unsigned char>(c)) ||
-                          c == '_' || c == ':')) {
-                // Start of attribute name (must have whitespace before if not
-                // first)
-                ++search_pos;
-                while (search_pos < trimmed.size()) {
-                  char ac = trimmed[search_pos];
-                  if (std::isalnum(static_cast<unsigned char>(ac)) ||
-                      ac == '_' || ac == ':' || ac == '.' || ac == '-') {
-                    ++search_pos;
-                  } else {
-                    break;
-                  }
-                }
-                // Skip whitespace after attribute name
-                while (search_pos < trimmed.size() &&
-                       (trimmed[search_pos] == ' ' ||
-                        trimmed[search_pos] == '\t' ||
-                        trimmed[search_pos] == '\n')) {
-                  ++search_pos;
-                  need_whitespace = false;
-                }
-                // Optional attribute value
-                if (search_pos < trimmed.size() && trimmed[search_pos] == '=') {
-                  ++search_pos;
-                  // Skip whitespace after =
-                  while (search_pos < trimmed.size() &&
-                         (trimmed[search_pos] == ' ' ||
-                          trimmed[search_pos] == '\t' ||
-                          trimmed[search_pos] == '\n')) {
-                    ++search_pos;
-                  }
-                  if (search_pos >= trimmed.size()) {
-                    valid_attributes = false;
-                  } else if (trimmed[search_pos] == '"' ||
-                             trimmed[search_pos] == '\'') {
-                    char quote = trimmed[search_pos];
-                    ++search_pos;
-                    while (search_pos < trimmed.size() &&
-                           trimmed[search_pos] != quote) {
-                      ++search_pos;
-                    }
-                    if (search_pos >= trimmed.size()) {
-                      valid_attributes = false;
-                    } else {
-                      ++search_pos;  // Skip closing quote
-                      need_whitespace =
-                          true;  // Need whitespace before next attr
-                    }
-                  } else {
-                    // Unquoted value
-                    while (search_pos < trimmed.size()) {
-                      char vc = trimmed[search_pos];
-                      if (vc == ' ' || vc == '\t' || vc == '\n' || vc == '"' ||
-                          vc == '\'' || vc == '=' || vc == '<' || vc == '>' ||
-                          vc == '`') {
-                        break;
-                      }
-                      ++search_pos;
-                    }
-                    need_whitespace = true;  // Need whitespace before next attr
-                  }
-                }
-              } else {
-                // Invalid character - not valid HTML tag
-                valid_attributes = false;
-              }
-            }
-
-            if (valid_attributes && search_pos < trimmed.size() &&
-                trimmed[search_pos] == '>') {
-              // Check that rest of line is only whitespace
-              bool only_whitespace = true;
-              for (size_t j = search_pos + 1; j < trimmed.size(); ++j) {
-                if (trimmed[j] != ' ' && trimmed[j] != '\t') {
-                  only_whitespace = false;
-                  break;
-                }
-              }
-              if (only_whitespace) {
-                block_type = 7;
-              }
-            }
-          }  // End of else for opening tags
-        }
-      }
-    }
-
+    auto [block_type, end_condition_sv] = detail::ClassifyHtmlBlock(trimmed);
     if (block_type == 0) [[unlikely]]
       return false;
 
@@ -7456,6 +7480,255 @@ inline std::pmr::string MarkdownToHtml(std::string_view input) {
 inline std::pmr::string MarkdownToHtml(std::string_view input,
                                        const Options& options) {
   return RenderHtml(Parse(input, options), options);
+}
+
+// =============================================================================
+// Streaming API - progressive rendering of incrementally-arriving Markdown
+// =============================================================================
+//
+// `StreamingMarkdownParser` accepts Markdown in arbitrary chunks (e.g. as it
+// arrives over a network) and emits finished blocks as HTML through a callback
+// as soon as they can no longer change. This is useful for progressive
+// rendering where the full document is not available up front.
+//
+// Semantics:
+// - `Feed(chunk)` appends to the internal buffer and emits every block that is
+//   now guaranteed to be final. A block is final once its terminating line has
+//   been seen (or it is an inherently atomic block such as a heading).
+// - The trailing block that may still grow (an open paragraph, block quote,
+//   list, code block, ...) is held back until `Feed` supplies its terminator or
+//   `Flush()` is called.
+// - `Flush()` emits any remaining buffered content, treating the end of input
+//   as a block terminator.
+// - `Reset()` discards all buffered state (the output callback is retained).
+// - Each block's HTML is emitted exactly once and never revised.
+//
+// Link references: definitions are remembered across chunks, so a reference
+// defined before its use (the common case) resolves correctly even when they
+// arrive in different chunks. A reference used before it is defined cannot be
+// resolved retroactively (the definition has not arrived yet); it is rendered
+// literally, matching the limitation inherent to any one-pass stream.
+//
+// Example:
+//   StreamingMarkdownParser parser;
+//   parser.setOutputCallback([](std::string_view html) {
+//     write_to_network(html);
+//   });
+//   parser.Feed(chunk1);
+//   parser.Feed(chunk2);
+//   parser.Flush();
+
+using HtmlStreamCallback = std::function<void(std::string_view html)>;
+
+class StreamingMarkdownParser {
+ public:
+  StreamingMarkdownParser() = default;
+  explicit StreamingMarkdownParser(const Options& options) { SetOptions(options); }
+
+  void SetOptions(const Options& options) {
+    options_ = options;
+    parser_.enable_tables = options.enable_tables;
+    parser_.enable_autolink = options.enable_autolink;
+    parser_.enable_strikethrough = options.enable_strikethrough;
+    parser_.enable_tasklist = options.enable_tasklist;
+  }
+
+  const Options& options() const { return options_; }
+
+  void setOutputCallback(HtmlStreamCallback callback) {
+    on_html_ = std::move(callback);
+  }
+
+  // Append a chunk of Markdown and emit any newly-finalized blocks.
+  void Feed(std::string_view chunk) {
+    if (chunk.empty()) return;
+    pending_.append(chunk.data(), chunk.size());
+    EmitCompletedBlocks();
+  }
+
+  // Emit any remaining buffered content (end-of-input).
+  void Flush() {
+    if (pending_.empty()) return;
+    if (pending_.find('[') != std::string::npos) {
+      parser_.ExtractLinkRefs(pending_, running_link_refs_);
+    }
+    std::pmr::string html =
+        RenderHtml(parser_.Parse(pending_, running_link_refs_), options_);
+    pending_.clear();
+    if (!html.empty() && on_html_) {
+      on_html_(std::string_view(html));
+    }
+  }
+
+  // Discard all buffered content and link references.
+  void Reset() {
+    pending_.clear();
+    running_link_refs_.clear();
+  }
+
+  bool empty() const { return pending_.empty(); }
+
+ private:
+  // Render `input` (seeded with the running link references) to a std::string.
+  std::string RenderSeeded(std::string_view input) {
+    Document doc = parser_.Parse(input, running_link_refs_);
+    std::pmr::string html = RenderHtml(doc, options_);
+    return std::string(html.data(), html.size());
+  }
+
+  // Emit every block in `pending_` that is guaranteed final, leaving only the
+  // trailing (possibly incomplete) block buffered.
+  void EmitCompletedBlocks() {
+    if (pending_.empty()) return;
+
+    // The final line of the buffer has no terminating newline and may still
+    // grow, so only whole lines (up to and including the last '\n') can be
+    // considered. Everything after the last newline is always held back.
+    size_t line_end = 0;
+    for (size_t i = pending_.size(); i >= 1; --i) {
+      if (pending_[i - 1] == '\n') {
+        line_end = i;
+        break;
+      }
+    }
+    if (line_end == 0) return;  // only a partial line; wait for more data
+
+    const std::string settled = pending_.substr(0, line_end);
+
+    // Remember any link reference definitions in the settled (whole-line)
+    // portion. Extracting only from `settled` — not the held-back tail, whose
+    // final line is still arriving — means an incomplete definition cannot lock
+    // in a truncated destination via first-definition-wins.
+    if (settled.find('[') != std::string::npos) {
+      parser_.ExtractLinkRefs(settled, running_link_refs_);
+    }
+
+    const std::string full_html = RenderSeeded(settled);
+
+    // An unterminated raw-HTML block is invisible to the sentinel probe below,
+    // so it is detected directly here and held back from its first line. This
+    // must come first: `settled` ends with a newline, so its (empty) final line
+    // is raw-HTML content; for block types 1-5 that shifts the sentinel and
+    // makes the probe read "incomplete" (leading to a mid-block cut), while for
+    // types 6-7 the sentinel is absorbed verbatim and the probe reads
+    // "complete". Both are wrong for an open block. (Skipped when the buffer
+    // holds NULs, since then LineBuffer copies and its byte offsets no longer
+    // index `pending_`.)
+    if (pending_.find('\0') == std::string::npos) {
+      detail::LineBuffer lines(settled);
+      const std::string::size_type html_start =
+          OpenTrailingHtmlBlockStart(lines, full_html);
+      if (html_start != std::string::npos) {
+        if (html_start == 0) return;  // hold back the whole buffer
+        const std::string emit_html = RenderSeeded(pending_.substr(0, html_start));
+        pending_ = pending_.substr(html_start);
+        if (!emit_html.empty() && on_html_) {
+          on_html_(std::string_view(emit_html));
+        }
+        return;
+      }
+    }
+
+    // Probe whether the trailing block is complete by appending a sentinel as
+    // the immediate next line (no blank line before it). If the last block is
+    // still open, the sentinel is absorbed into it and the render stops starting
+    // with full_html. A plain sentinel is a lazy continuation of open
+    // paragraphs/quotes/list items and plain content for fenced/HTML blocks; an
+    // additionally indented sentinel is a continuation for indented code blocks.
+    // If either is absorbed, the last block is still open.
+    static constexpr const char* kSentinel = "markus-stream-sentinel";
+    const std::string probe_plain = RenderSeeded(settled + kSentinel + "\n");
+    const std::string probe_indented =
+        RenderSeeded(settled + "    " + kSentinel + "\n");
+    const bool probes_complete =
+        probe_plain.rfind(full_html, 0) == 0 &&
+        probe_indented.rfind(full_html, 0) == 0;
+
+    // `cut` is the byte offset in `pending_` up to which we emit now; anything
+    // from `cut` onward is held back for later.
+    size_t cut;
+    if (probes_complete) {
+      cut = line_end;  // Trailing block is final: emit all settled lines.
+    } else {
+      // The last block is incomplete; emit only the complete leading blocks.
+      // The cut point is the largest line boundary (before `line_end`) whose
+      // render is a prefix of the full render, i.e. the start of the trailing
+      // block.
+      cut = 0;
+      for (size_t i = line_end; i >= 1; --i) {
+        if (i >= line_end) continue;
+        if (pending_[i - 1] != '\n') continue;
+        const std::string h = RenderSeeded(pending_.substr(0, i));
+        if (full_html.rfind(h, 0) == 0) {
+          cut = i;
+          break;
+        }
+      }
+    }
+
+    if (cut == 0) return;  // whole buffer is a single incomplete block
+    const std::string emit_html =
+        (cut == line_end) ? full_html : RenderSeeded(pending_.substr(0, cut));
+    pending_ = pending_.substr(cut);
+
+    if (!emit_html.empty() && on_html_) {
+      on_html_(std::string_view(emit_html));
+    }
+  }
+
+  // Byte offset (into `pending_`/`settled`) of the first line of the trailing
+  // top-level block, when that block is an unterminated raw-HTML block. Returns
+  // npos otherwise. The sentinel completeness probe is blind to such a block, so
+  // it is detected here directly. `lines` is the LineBuffer over `settled`,
+  // which always ends with a newline; its final (empty) line is only an artifact
+  // of that trailing newline, so termination is tested against the lines before
+  // it (whose content is final) rather than against the artifact line itself.
+  std::string::size_type OpenTrailingHtmlBlockStart(
+      const detail::LineBuffer& lines, const std::string& full_html) {
+    // `lines` always has a final empty line (the artifact of `settled`'s
+    // trailing newline); termination is tested against the lines before it.
+    const size_t limit = lines.size() - 1;
+    for (size_t i = 0; i < limit; ++i) {
+      const std::string_view line = lines[i];
+      if (line.empty()) continue;
+      auto [type, end_condition] =
+          detail::ClassifyHtmlBlock(detail::TrimLeft(line));
+      if (type == 0) continue;
+      // Only a block that is not terminated by any real line can still grow.
+      if (detail::HtmlBlockTerminated(lines, i, type, end_condition, limit)) {
+        continue;
+      }
+      // The preceding lines must render to a prefix of the full render, i.e.
+      // this line is a genuine top-level block start (not a lazy continuation of
+      // a paragraph or a line inside a fenced code block).
+      std::string lead;
+      for (size_t j = 0; j < i; ++j) {
+        lead.append(lines[j].data(), lines[j].size());
+        lead.push_back('\n');
+      }
+      const std::string lead_html = RenderSeeded(lead);
+      if (full_html.rfind(lead_html, 0) == 0) {
+        return lines.OffsetOf(i);
+      }
+    }
+    return std::string::npos;
+  }
+
+  Options options_;
+  BlockParser parser_;
+  HtmlStreamCallback on_html_;
+  std::string pending_;
+  LinkRefMap running_link_refs_;
+};
+
+// Convenience: stream the whole input through the callback (feed + flush).
+inline void StreamMarkdownToHtml(std::string_view input,
+                                 HtmlStreamCallback callback,
+                                 const Options& options = Options{}) {
+  StreamingMarkdownParser parser(options);
+  parser.setOutputCallback(std::move(callback));
+  parser.Feed(input);
+  parser.Flush();
 }
 
 // Debug: print AST structure

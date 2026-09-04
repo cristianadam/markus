@@ -19,6 +19,7 @@ any reviews for memory safety.
 - **High Performance**: Efficient parsing with lookup tables and inline optimizations
 - **Full Unicode Support**: UTF-8 encoding/decoding, case folding, punctuation detection
 - **AST Access**: Parse to an Abstract Syntax Tree for inspection or custom rendering
+- **Streaming**: Feed Markdown in chunks as it arrives and emit finished blocks incrementally
 - **Google Style**: Clean, readable codebase following Google C++ Style Guide
 
 ## Quick Start
@@ -98,6 +99,41 @@ Available extensions:
 | Task list | `-e tasklist` | `enable_tasklist` | `- [x]` checkboxes |
 | Tag filter | `-e tagfilter` | `enable_tagfilter` | Drops disallowed raw HTML tags |
 
+### Streaming
+
+Feed Markdown incrementally (e.g. as it arrives over a network) and emit
+finished blocks through a callback as soon as they can no longer change:
+
+```cpp
+#include "markus.h"
+
+int main() {
+    markus::StreamingMarkdownParser parser;
+    parser.setOutputCallback([](std::string_view html) {
+        std::cout << html;  // e.g. send to a client
+    });
+    parser.Feed("# Hello\n\nThis arrives ");
+    parser.Feed("in chunks.\n");
+    parser.Flush();  // emit anything still buffered at end of input
+    return 0;
+}
+```
+
+Semantics:
+
+- `Feed(chunk)` appends the chunk and emits every block that is now final.
+  The trailing block that may still grow (open paragraph, list, code block,
+  ...) is held back until its terminator arrives or `Flush()` is called.
+- Each block's HTML is emitted exactly once, in order, and is identical to
+  the output of `markus::MarkdownToHtml` for the same input.
+- Link reference definitions are remembered across chunks, so a reference
+  defined in an earlier chunk resolves in a later one. A reference used
+  before its definition arrives renders literally (inherent to one-pass
+  streaming).
+
+GFM extensions are supported the same way as in `MarkdownToHtml` (pass a
+`markus::Options` to the constructor).
+
 ## API Reference
 
 ### Core Functions
@@ -110,6 +146,8 @@ Available extensions:
 | `markus::Parse(input, options)` | Parse to AST with GFM extensions enabled |
 | `markus::RenderHtml(doc)` | Render AST to HTML |
 | `markus::DebugAst(doc)` | Get a debug string representation of the AST |
+| `markus::StreamingMarkdownParser` | Feed Markdown in chunks; emit completed blocks via callback (`Feed`, `Flush`, `Reset`) |
+| `markus::StreamMarkdownToHtml(input, callback)` | Convenience: feed whole input, then flush |
 
 `markus::Options` controls GFM extensions (`enable_tables`, `enable_autolink`,
 `enable_strikethrough`, `enable_tasklist`, `enable_tagfilter`).
@@ -195,6 +233,9 @@ echo "# Title" | ./build/main --ast
 # Enable GFM extensions (tables, strikethrough, task lists, ...)
 printf '| A | B |\n|---|---|\n| 1 | 2 |\n\n~~gone~~\n- [x] done\n' \
   | ./build/main -e table -e strikethrough -e tasklist
+
+# Stream HTML output as blocks complete (progressive rendering)
+echo "**bold** text" | ./build/main --stream
 ```
 
 ## Testing
@@ -202,7 +243,7 @@ printf '| A | B |\n|---|---|\n| 1 | 2 |\n\n~~gone~~\n- [x] done\n' \
 The test suite uses the official CommonMark spec tests:
 
 ```bash
-# Run all 655 CommonMark spec tests
+# Run all tests (655 CommonMark spec tests + streaming API tests)
 ./run_tests.sh
 ```
 

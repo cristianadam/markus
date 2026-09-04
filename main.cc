@@ -13,17 +13,19 @@ namespace {
 
 void PrintUsage(const char* program_name) {
   std::cerr << "Usage: " << program_name
-            << " [--ast] [--unsafe] [-e <ext> ...]\n";
+            << " [--ast] [--stream] [--unsafe] [-e <ext> ...]\n";
   std::cerr << "\n";
   std::cerr << "Reads markdown from stdin and outputs HTML to stdout.\n";
   std::cerr << "\n";
   std::cerr << "Options:\n";
-  std::cerr << "  --ast     Print the AST instead of HTML output\n";
-  std::cerr << "  --unsafe  Accept (and render) raw HTML (accepted for cmark "
-               "compatibility)\n";
-  std::cerr << "  -e <ext>  Enable a GFM extension (table, autolink, "
+  std::cerr << "  --ast      Print the AST instead of HTML output\n";
+  std::cerr << "  --stream   Stream HTML output as blocks are parsed "
+                "(progressive rendering)\n";
+  std::cerr << "  --unsafe   Accept (and render) raw HTML (accepted for cmark "
+                "compatibility)\n";
+  std::cerr << "  -e <ext>   Enable a GFM extension (table, autolink, "
                 "strikethrough, tasklist, tagfilter)\n";
-  std::cerr << "  --help    Show this help message\n";
+  std::cerr << "  --help     Show this help message\n";
 }
 
 std::string ReadStdin() {
@@ -41,6 +43,7 @@ int main(int argc, char* argv[]) {
 #endif
 
   bool ast_mode = false;
+  bool stream_mode = false;
   markus::Options options;
 
   for (int i = 1; i < argc; ++i) {
@@ -51,6 +54,8 @@ int main(int argc, char* argv[]) {
     }
     if (arg == "--ast") {
       ast_mode = true;
+    } else if (arg == "--stream") {
+      stream_mode = true;
     } else if (arg == "--unsafe") {
       // Raw HTML is always passed through; the flag is accepted for
       // cmark/cmark-gfm compatibility.
@@ -71,6 +76,22 @@ int main(int argc, char* argv[]) {
       }
       ++i;  // Consume the extension name.
     }
+  }
+
+  if (stream_mode) {
+    // Read stdin incrementally and emit HTML as blocks finalize, so the flag
+    // exercises the progressive path even for piped input.
+    markus::StreamingMarkdownParser parser(options);
+    parser.setOutputCallback([](std::string_view html) {
+      std::cout.write(html.data(), html.size());
+      std::cout.flush();
+    });
+    char buf[256];
+    while (std::cin.read(buf, sizeof(buf)), std::cin.gcount() > 0) {
+      parser.Feed(std::string_view(buf, std::cin.gcount()));
+    }
+    parser.Flush();
+    return 0;
   }
 
   std::string markdown = ReadStdin();

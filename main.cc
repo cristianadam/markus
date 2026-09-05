@@ -87,10 +87,15 @@ int main(int argc, char* argv[]) {
       std::cout.flush();
     });
     char buf[256];
-    while (std::cin.read(buf, sizeof(buf)), std::cin.gcount() > 0) {
-      parser.Feed(std::string_view(buf, std::cin.gcount()));
+    try {
+      while (std::cin.read(buf, sizeof(buf)), std::cin.gcount() > 0) {
+        parser.Feed(std::string_view(buf, std::cin.gcount()));
+      }
+      parser.Flush();
+    } catch (const std::length_error& e) {
+      std::cerr << "markus: " << e.what() << "\n";
+      return 1;
     }
-    parser.Flush();
     return 0;
   }
 

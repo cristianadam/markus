@@ -16,6 +16,7 @@
 #include <memory_resource>
 #include <ranges>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -26,25 +27,22 @@
 namespace markus {
 
 // =============================================================================
-// PMR Memory Resource - Monotonic Buffer for Parser Allocations
+// Memory Management / Allocation Model
 // =============================================================================
-// Uses a thread-local monotonic_buffer_resource so ALL std::pmr containers
-// created during Parse() allocate from a single growing buffer via pointer
-// bumping (O(1)) instead of individual heap allocations. Dramatically reduces
-// allocation overhead in the parser's many temporary vectors and strings.
-
-inline std::pmr::monotonic_buffer_resource& GetParseResource() {
-  static thread_local std::pmr::monotonic_buffer_resource resource{256 * 1024};
-  return resource;
-}
-
-inline void ResetParseResource() {
-  auto& res = GetParseResource();
-  res.release();
-  // Re-initialize with fresh state but keep the underlying buffer
-  // release() frees nothing on monotonic_buffer_resource, it just returns
-  // the buffer. The next allocation will reuse from the start.
-}
+// All parser containers are std::pmr types using the default PMR resource
+// (std::pmr::get_default_resource(), i.e. new/delete). Every allocation is
+// owned by the Document (or the returned std::pmr::string) and is freed when
+// that object is destroyed - memory does not accumulate across Parse() calls.
+//
+// A Document is self-contained: every string_view it exposes (Text and
+// HtmlInline nodes, decoded entities) refers to storage owned by the Document
+// itself (Document::string_storage), so the original Markdown input does NOT
+// need to outlive the Document. Two Documents are independent; holding several
+// at once is safe.
+//
+// Note: callers may install a process-wide default PMR resource via
+// std::pmr::set_default_resource(); the containers above will then allocate
+// from it, and its lifetime semantics apply to Documents as well.
 
 // Lightweight result type optimized for parser functions.
 // Replaces std::optional<T> to avoid overhead from type tracking
@@ -54,28 +52,37 @@ inline void ResetParseResource() {
 template <typename T>
 struct Result {
   bool has_value = false;
-  alignas(T) unsigned char storage[sizeof(T)];
+  alignas(T) unsigned char storage[sizeof(T)]{};
 
   Result() = default;
   Result(const Result&) = delete;
   Result& operator=(const Result&) = delete;
 
-  Result(Result&& other) noexcept : has_value(other.has_value) {
-    if (has_value) {
-      new (storage) T(std::move(*reinterpret_cast<T*>(other.storage)));
+  // Moves are exception-safe: the value is moved into a temporary first, so a
+  // throwing move leaves both operands in a valid state (this one empty).
+  Result(Result&& other) : has_value(false) {
+    if (other.has_value) {
+      T tmp = std::move(*reinterpret_cast<T*>(other.storage));
+      new (storage) T(std::move(tmp));
       other.has_value = false;
+      has_value = true;
     }
   }
 
-  Result& operator=(Result&& other) noexcept {
+  Result& operator=(Result&& other) {
     if (this != &other) {
-      if (has_value) {
-        reinterpret_cast<T*>(storage)->~T();
-      }
-      has_value = other.has_value;
-      if (has_value) {
-        new (storage) T(std::move(*reinterpret_cast<T*>(other.storage)));
+      if (other.has_value) {
+        T tmp = std::move(*reinterpret_cast<T*>(other.storage));
+        if (has_value) {
+          reinterpret_cast<T*>(storage)->~T();
+          has_value = false;
+        }
+        new (storage) T(std::move(tmp));
         other.has_value = false;
+        has_value = true;
+      } else if (has_value) {
+        reinterpret_cast<T*>(storage)->~T();
+        has_value = false;
       }
     }
     return *this;
@@ -225,6 +232,9 @@ constexpr BlockNodeId kInvalidBlockNodeId = ~uint32_t(0);
 // =============================================================================
 
 struct Text {
+  // Non-owning view. Always refers to storage owned by the enclosing
+  // Document (its string_storage), never to the original Markdown input.
+  // Valid for the lifetime of that Document.
   std::string_view content;
 
   explicit Text(std::string_view c) : content(c) {}
@@ -267,6 +277,8 @@ struct Image {
 };
 
 struct HtmlInline {
+  // Non-owning view, same lifetime contract as Text::content (owned by the
+  // enclosing Document, never the original Markdown input).
   std::string_view content;
 
   explicit HtmlInline(std::string_view c) : content(c) {}
@@ -411,6 +423,13 @@ struct LinkRefComparator {
   }
 };
 
+// Parsed Markdown AST.
+//
+// Lifetime: a Document is self-contained. All inline text (Text and
+// HtmlInline nodes) and decoded entities reference storage owned by this
+// Document (see string_storage below), so the original Markdown input does
+// NOT need to outlive the Document. All memory is released when the Document
+// is destroyed; holding multiple Documents simultaneously is safe.
 struct Document {
   std::pmr::vector<BlockNode> children;
 
@@ -586,6 +605,11 @@ inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
 // HTML by replacing their leading '<' with the entity "&lt;", since these tags
 // change how the surrounding rendered Markdown is interpreted (see the GFM
 // spec, "Disallowed Raw HTML (extension)").
+//
+// Note: URL scheme filtering (e.g. blocking `javascript:` in link/image hrefs)
+// is intentionally out of scope here, matching cmark-gfm/GFM, which also only
+// percent-escape hrefs rather than inspect their scheme. Sanitising link
+// schemes is a consumer / HTML-sanitiser concern.
 namespace tagfilter {
 
 // Tags filtered by the GFM tagfilter extension.
@@ -888,10 +912,13 @@ inline bool IsDigit(uint8_t c) { return (kCharClassTable[c] & 2) != 0; }
 inline bool IsAlnum(uint8_t c) { return (kCharClassTable[c] & 4) != 0; }
 inline bool IsXDigit(uint8_t c) { return (kCharClassTable[c] & 8) != 0; }
 
-// Parse unsigned integer directly from string_view without temporary allocation
+// Parse unsigned integer directly from string_view without temporary
+// allocation. Values that would overflow uint32_t are clamped to UINT32_MAX
+// (callers validate the range; e.g. entity code points map to U+FFFD).
 inline bool ParseUint(std::string_view sv, uint32_t& out, int base) {
   if (sv.empty()) return false;
   uint32_t result = 0;
+  bool overflowed = false;
   for (char c : sv) {
     int digit = 0;
     if (c >= '0' && c <= '9')
@@ -903,7 +930,15 @@ inline bool ParseUint(std::string_view sv, uint32_t& out, int base) {
     else
       return false;
     if (digit >= base) return false;
-    result = result * base + digit;
+    if (!overflowed) {
+      const uint32_t d = static_cast<uint32_t>(digit);
+      if (result > (UINT32_MAX - d) / static_cast<uint32_t>(base)) {
+        overflowed = true;
+        result = UINT32_MAX;
+      } else {
+        result = result * static_cast<uint32_t>(base) + d;
+      }
+    }
   }
   out = result;
   return true;
@@ -3025,31 +3060,6 @@ inline std::pair<int, std::string_view> ClassifyHtmlBlock(
   return {block_type, end_condition};
 }
 
-// Determine whether the HTML block starting at line `start` (0-based) of the
-// buffer described by `lines` is terminated within the lines [start, limit).
-// `type`/`end_condition` come from ClassifyHtmlBlock. A `limit` of 0 means "up
-// to the end of `lines`".
-inline bool HtmlBlockTerminated(const LineBuffer& lines, size_t start,
-                                int type, std::string_view end_condition,
-                                size_t limit = 0) {
-  if (limit == 0) limit = lines.size();
-  if (type >= 1 && type <= 5) {
-    for (size_t i = start; i < limit; ++i) {
-      if (StringContainsInsensitive(lines[i], end_condition)) {
-        return true;
-      }
-    }
-    return false;
-  }
-  // Types 6 and 7 end at the first blank line.
-  for (size_t i = start + 1; i < limit; ++i) {
-    if (IsBlankLine(lines[i])) {
-      return true;
-    }
-  }
-  return false;
-}
-
 }  // namespace detail
 
 using detail::CaseFold;
@@ -4916,13 +4926,16 @@ class BlockParser {
   // CommonMark behaviour.
   bool enable_tasklist = false;
 
-  Document Parse(std::string_view input) {
-    // Reset the thread-local monotonic buffer for this parse operation.
-    // All std::pmr containers created from here until the next Parse() call
-    // will allocate from this single growing buffer via pointer bumping,
-    // eliminating individual heap allocation overhead.
-    ResetParseResource();
+  // Internal: describes the last top-level block produced by the most recent
+  // Parse()/ParseBlocksInto() call. Used by StreamingMarkdownParser to decide
+  // where (if anywhere) the settled buffer can be cut without re-rendering.
+  // Line indices are 0-based into the input's lines (detail::LineBuffer).
+  bool has_last_top_block = false;
+  size_t last_top_block_start_line = 0;
+  size_t last_top_block_end_line = 0;    // exclusive
+  bool last_top_block_terminated = true;  // cannot absorb a further line
 
+  Document Parse(std::string_view input) {
     Document doc;
     std::pmr::vector<BlockNode> top_blocks;
     ParseBlocksInto(input, doc, top_blocks);
@@ -4943,8 +4956,6 @@ class BlockParser {
   // chunk). Already-defined labels win over later duplicates (first definition
   // wins), so seeding preserves document order across chunks.
   Document Parse(std::string_view input, const LinkRefMap& initial_refs) {
-    ResetParseResource();
-
     Document doc;
     if (!initial_refs.empty()) {
       doc.link_references.insert(doc.link_references.end(),
@@ -4981,6 +4992,16 @@ class BlockParser {
     line_idx_ = 0;
     parent_link_refs_ = &doc.link_references;
 
+    // Number of real lines: LineBuffer appends one empty artifact line when
+    // the input ends with a line terminator; that artifact is not content.
+    real_line_count_ = lines_->size();
+    if (!input.empty() && (input.back() == '\n' || input.back() == '\r')) {
+      --real_line_count_;
+    }
+
+    has_last_top_block = false;
+    last_top_block_terminated = true;
+
     // First pass: extract link reference definitions (skip if no '[' present)
     if (input.find('[') != std::string_view::npos) {
       ExtractLinkReferences(doc.link_references);
@@ -4998,6 +5019,63 @@ class BlockParser {
   size_t line_idx_ = 0;
   LinkRefMap* parent_link_refs_ = nullptr;
   Document* doc_ = nullptr;
+
+  // Real (non-artifact) line count of the current input, set by
+  // ParseBlocksInto. A block that consumes lines up to (but not past) the
+  // end of the real content may still grow and is reported as unterminated.
+  size_t real_line_count_ = 0;
+  bool last_fence_found_closing_ = true;
+  bool last_html_end_condition_found_ = true;
+  size_t last_table_start_line_ = 0;
+
+  // Record the block just pushed onto `blocks` as the last top-level block.
+  // `iter_start_line` is the line on which the producing loop iteration began;
+  // for tables the block actually starts later (at the header row), so the
+  // line remembered by TryBuildTable is used instead.
+  void RecordLastTopBlock(const std::pmr::vector<BlockNode>& blocks,
+                          size_t iter_start_line) {
+    const BlockNode& last = blocks.back();
+    last_top_block_start_line =
+        std::holds_alternative<Table>(last) ? last_table_start_line_
+                                            : iter_start_line;
+    last_top_block_end_line = line_idx_;
+
+    // A block that stopped before the end of the input was terminated by a
+    // real line (blank line, interrupt, closing fence, end condition) and
+    // cannot absorb further lines.
+    bool terminated = last_top_block_end_line < real_line_count_;
+    std::visit(
+        [this, &terminated](const auto& n) {
+          using T = std::decay_t<decltype(n)>;
+          if constexpr (std::is_same_v<T, Heading> ||
+                        std::is_same_v<T, ThematicBreak>) {
+            // Atomic single-line blocks are final as soon as their line has
+            // been seen.
+            terminated = true;
+          } else if constexpr (std::is_same_v<T, CodeBlock>) {
+            if (n.is_fenced) {
+              // A fence consumes to its closing fence or to end-of-input;
+              // only the closing fence makes it final (a fence closed on the
+              // final real line has end_line >= real_line_count_).
+              terminated = last_fence_found_closing_;
+            }
+            // Indented code: general rule (blank line terminates, EOF does not).
+          } else if constexpr (std::is_same_v<T, HtmlBlock>) {
+            if (n.block_type <= 5) {
+              // Types 1-5 consume to the end-condition line or end-of-input.
+              terminated = last_html_end_condition_found_;
+            }
+            // Types 6-7: general rule (a real blank line terminates; the
+            // trailing-newline artifact line does not).
+          }
+          // Paragraph, List, BlockQuote, Table: general rule. Lists and
+          // block quotes can be re-opened after a blank line by a further
+          // item/quote line, so reaching end-of-input leaves them open.
+        },
+        last);
+    last_top_block_terminated = terminated;
+    has_last_top_block = true;
+  }
 
   bool AtEnd() const { return !lines_ || line_idx_ >= lines_->size(); }
 
@@ -5461,32 +5539,41 @@ class BlockParser {
         continue;
       }
 
+      const size_t iter_start_line = line_idx_;
+
       // Check for various block types
       if (TryParseThematicBreak(blocks)) {
+        RecordLastTopBlock(blocks, iter_start_line);
         continue;
       }
 
       if (TryParseAtxHeading(blocks)) {
+        RecordLastTopBlock(blocks, iter_start_line);
         continue;
       }
 
       if (TryParseFencedCodeBlock(blocks)) {
+        RecordLastTopBlock(blocks, iter_start_line);
         continue;
       }
 
       if (TryParseHtmlBlock(blocks)) {
+        RecordLastTopBlock(blocks, iter_start_line);
         continue;
       }
 
       if (TryParseBlockQuote(blocks)) {
+        RecordLastTopBlock(blocks, iter_start_line);
         continue;
       }
 
       if (TryParseList(blocks)) {
+        RecordLastTopBlock(blocks, iter_start_line);
         continue;
       }
 
       if (TryParseIndentedCodeBlock(blocks)) {
+        RecordLastTopBlock(blocks, iter_start_line);
         continue;
       }
 
@@ -5497,6 +5584,7 @@ class BlockParser {
 
       // Default: paragraph (may include setext heading, or a GFM table)
       ParseParagraph(blocks);
+      RecordLastTopBlock(blocks, iter_start_line);
     }
   }
 
@@ -5869,6 +5957,7 @@ class BlockParser {
       content.pop_back();
     }
 
+    last_fence_found_closing_ = found_closing;
     blocks.emplace_back(std::in_place_type<CodeBlock>, std::move(info_string),
                         std::move(content), true);
     return true;
@@ -5890,6 +5979,7 @@ class BlockParser {
 
     // Collect HTML block content
     std::pmr::string content;
+    bool end_condition_found = false;
 
     while (!AtEnd()) {
       std::string_view html_line = CurrentLine();
@@ -5899,6 +5989,7 @@ class BlockParser {
       // Check for end condition using case-insensitive search (no temp string)
       if (block_type <= 5 &&
           detail::StringContainsInsensitive(html_line, end_condition_sv)) {
+        end_condition_found = true;
         Advance();
         break;
       }
@@ -5912,6 +6003,7 @@ class BlockParser {
       }
     }
 
+    last_html_end_condition_found_ = end_condition_found;
     blocks.emplace_back(std::in_place_type<HtmlBlock>, std::move(content),
                         block_type);
     return true;
@@ -6690,6 +6782,10 @@ class BlockParser {
   // delimiter and body rows) and fill `out`. Returns false without consuming
   // anything when it is not a table.
   bool TryBuildTable(std::string_view header_line, Table* out) {
+    // The header row is the current line at call time; remember it so the
+    // Table (which may be pushed after a leading Paragraph) reports its real
+    // start line.
+    last_table_start_line_ = line_idx_;
     if (line_idx_ + 1 >= lines_->size()) return false;
     std::string_view next_raw = (*lines_)[line_idx_ + 1];
     std::string_view next_line = detail::TrimLeft(next_raw);
@@ -7431,7 +7527,9 @@ class HtmlRenderer {
 // extension, which renders list items beginning with a `[ ]`/`[x]`/`[X]` marker
 // as checkboxes), and `enable_tagfilter` (the `tagfilter` / "Disallowed Raw
 // HTML" extension, which escapes the leading '<' of a fixed set of HTML tags
-// such as <title>, <style>, <script> and <xmp> in raw HTML output).
+// such as <title>, <style>, <script> and <xmp> in raw HTML output; it does not
+// filter URL schemes such as `javascript:` - that is a consumer/sanitiser
+// concern, matching cmark-gfm/GFM).
 struct Options {
   bool enable_tables = false;
   bool enable_autolink = false;
@@ -7497,7 +7595,17 @@ inline std::pmr::string MarkdownToHtml(std::string_view input,
 //   been seen (or it is an inherently atomic block such as a heading).
 // - The trailing block that may still grow (an open paragraph, block quote,
 //   list, code block, ...) is held back until `Feed` supplies its terminator or
-//   `Flush()` is called.
+//   `Flush()` is called. Containers that can be re-opened after a blank line
+//   (block quotes, lists) are held back until definitively terminated, so a
+//   further `> ` or item line rejoins the same block rather than starting a new
+//   one.
+// - `Feed` only re-parses when the chunk contains a '\n'; a chunk without one
+//   cannot finalize any block, so it is buffered at (near) zero cost. This is
+//   what keeps byte/char-by-byte streaming (e.g. LLM output) cheap and bounds
+//   the work done per feed to one or two parses of the held-back tail.
+// - The held-back buffer is capped (default 4 MiB, see `setPendingLimit`). A
+//   chunk that would push the buffer past the limit throws
+//   `std::length_error` and leaves the buffer unchanged.
 // - `Flush()` emits any remaining buffered content, treating the end of input
 //   as a block terminator.
 // - `Reset()` discards all buffered state (the output callback is retained).
@@ -7539,10 +7647,24 @@ class StreamingMarkdownParser {
     on_html_ = std::move(callback);
   }
 
+  // Set the maximum size of the held-back buffer (default 4 MiB). A `Feed`
+  // that would push the buffer past this limit throws `std::length_error`.
+  void setPendingLimit(size_t limit) { pending_limit_ = limit; }
+
   // Append a chunk of Markdown and emit any newly-finalized blocks.
+  //
+  // Nothing can finalize on a chunk without a newline, so that case is buffered
+  // without re-parsing (the fast path that makes char/byte-by-byte streaming
+  // cheap). The held-back buffer is capped by `pending_limit_`; a chunk that
+  // would exceed it throws `std::length_error` and leaves the buffer unchanged.
   void Feed(std::string_view chunk) {
     if (chunk.empty()) return;
+    if (chunk.size() > pending_limit_ ||
+        chunk.size() > pending_limit_ - pending_.size()) {
+      throw std::length_error("markus: streaming pending buffer limit exceeded");
+    }
     pending_.append(chunk.data(), chunk.size());
+    if (chunk.find('\n') == std::string_view::npos) return;
     EmitCompletedBlocks();
   }
 
@@ -7577,7 +7699,18 @@ class StreamingMarkdownParser {
   }
 
   // Emit every block in `pending_` that is guaranteed final, leaving only the
-  // trailing (possibly incomplete) block buffered.
+  // trailing (possibly incomplete) top-level block buffered.
+  //
+  // How it works: the settled portion is `pending_` up to and including the
+  // last '\n'. Rendering it yields a `last_top_block` with a termination flag
+  // (see BlockParser::RecordLastTopBlock). If that block is terminated, the
+  // whole settled portion is final and is emitted. If it is still open (an open
+  // paragraph / block quote / list / code block / HTML block that can absorb a
+  // further line), only the leading complete blocks are emitted and the open
+  // block is held back from its first line. Holding the block back from its
+  // first line (rather than guessing via a sentinel probe) is what lets
+  // re-openable containers (lists, block quotes) be rejoined across the blank
+  // lines that separate their items.
   void EmitCompletedBlocks() {
     if (pending_.empty()) return;
 
@@ -7598,72 +7731,23 @@ class StreamingMarkdownParser {
     // Remember any link reference definitions in the settled (whole-line)
     // portion. Extracting only from `settled` — not the held-back tail, whose
     // final line is still arriving — means an incomplete definition cannot lock
-    // in a truncated destination via first-definition-wins.
+    // in a truncated destination via first-definition-wins. Extracting from the
+    // whole settled portion (including the trailing open block) also makes
+    // references defined inside it available to the prefix render via the seed.
     if (settled.find('[') != std::string::npos) {
       parser_.ExtractLinkRefs(settled, running_link_refs_);
     }
 
+    // Full render of the settled portion; this also records the trailing
+    // block's termination state on parser_ (which the prefix render below will
+    // clobber, so it is read before that).
     const std::string full_html = RenderSeeded(settled);
-
-    // An unterminated raw-HTML block is invisible to the sentinel probe below,
-    // so it is detected directly here and held back from its first line. This
-    // must come first: `settled` ends with a newline, so its (empty) final line
-    // is raw-HTML content; for block types 1-5 that shifts the sentinel and
-    // makes the probe read "incomplete" (leading to a mid-block cut), while for
-    // types 6-7 the sentinel is absorbed verbatim and the probe reads
-    // "complete". Both are wrong for an open block. (Skipped when the buffer
-    // holds NULs, since then LineBuffer copies and its byte offsets no longer
-    // index `pending_`.)
-    if (pending_.find('\0') == std::string::npos) {
-      detail::LineBuffer lines(settled);
-      const std::string::size_type html_start =
-          OpenTrailingHtmlBlockStart(lines, full_html);
-      if (html_start != std::string::npos) {
-        if (html_start == 0) return;  // hold back the whole buffer
-        const std::string emit_html = RenderSeeded(pending_.substr(0, html_start));
-        pending_ = pending_.substr(html_start);
-        if (!emit_html.empty() && on_html_) {
-          on_html_(std::string_view(emit_html));
-        }
-        return;
-      }
-    }
-
-    // Probe whether the trailing block is complete by appending a sentinel as
-    // the immediate next line (no blank line before it). If the last block is
-    // still open, the sentinel is absorbed into it and the render stops starting
-    // with full_html. A plain sentinel is a lazy continuation of open
-    // paragraphs/quotes/list items and plain content for fenced/HTML blocks; an
-    // additionally indented sentinel is a continuation for indented code blocks.
-    // If either is absorbed, the last block is still open.
-    static constexpr const char* kSentinel = "markus-stream-sentinel";
-    const std::string probe_plain = RenderSeeded(settled + kSentinel + "\n");
-    const std::string probe_indented =
-        RenderSeeded(settled + "    " + kSentinel + "\n");
-    const bool probes_complete =
-        probe_plain.rfind(full_html, 0) == 0 &&
-        probe_indented.rfind(full_html, 0) == 0;
 
     // `cut` is the byte offset in `pending_` up to which we emit now; anything
     // from `cut` onward is held back for later.
-    size_t cut;
-    if (probes_complete) {
-      cut = line_end;  // Trailing block is final: emit all settled lines.
-    } else {
-      // The last block is incomplete; emit only the complete leading blocks.
-      // The cut point is the largest line boundary (before `line_end`) whose
-      // render is a prefix of the full render, i.e. the start of the trailing
-      // block.
-      cut = 0;
-      for (size_t i = line_end; i >= 1; --i) {
-        if (i >= line_end) continue;
-        if (pending_[i - 1] != '\n') continue;
-        const std::string h = RenderSeeded(pending_.substr(0, i));
-        if (full_html.rfind(h, 0) == 0) {
-          cut = i;
-          break;
-        }
-      }
+    size_t cut = line_end;
+    if (parser_.has_last_top_block && !parser_.last_top_block_terminated) {
+      cut = ByteOffsetOfLine(settled, parser_.last_top_block_start_line);
     }
 
     if (cut == 0) return;  // whole buffer is a single incomplete block
@@ -7676,42 +7760,29 @@ class StreamingMarkdownParser {
     }
   }
 
-  // Byte offset (into `pending_`/`settled`) of the first line of the trailing
-  // top-level block, when that block is an unterminated raw-HTML block. Returns
-  // npos otherwise. The sentinel completeness probe is blind to such a block, so
-  // it is detected here directly. `lines` is the LineBuffer over `settled`,
-  // which always ends with a newline; its final (empty) line is only an artifact
-  // of that trailing newline, so termination is tested against the lines before
-  // it (whose content is final) rather than against the artifact line itself.
-  std::string::size_type OpenTrailingHtmlBlockStart(
-      const detail::LineBuffer& lines, const std::string& full_html) {
-    // `lines` always has a final empty line (the artifact of `settled`'s
-    // trailing newline); termination is tested against the lines before it.
-    const size_t limit = lines.size() - 1;
-    for (size_t i = 0; i < limit; ++i) {
-      const std::string_view line = lines[i];
-      if (line.empty()) continue;
-      auto [type, end_condition] =
-          detail::ClassifyHtmlBlock(detail::TrimLeft(line));
-      if (type == 0) continue;
-      // Only a block that is not terminated by any real line can still grow.
-      if (detail::HtmlBlockTerminated(lines, i, type, end_condition, limit)) {
-        continue;
-      }
-      // The preceding lines must render to a prefix of the full render, i.e.
-      // this line is a genuine top-level block start (not a lazy continuation of
-      // a paragraph or a line inside a fenced code block).
-      std::string lead;
-      for (size_t j = 0; j < i; ++j) {
-        lead.append(lines[j].data(), lines[j].size());
-        lead.push_back('\n');
-      }
-      const std::string lead_html = RenderSeeded(lead);
-      if (full_html.rfind(lead_html, 0) == 0) {
-        return lines.OffsetOf(i);
+  // Byte offset in `s` where 0-based line `line_idx` begins, counting line
+  // starts exactly the way detail::LineBuffer does (a line is terminated by
+  // '\n', or by '\r' optionally followed by '\n'). This scans the raw bytes, so
+  // it stays correct even when the input contains NULs (where LineBuffer would
+  // copy and its offsets would no longer index `s`). Linear in `s`.
+  static size_t ByteOffsetOfLine(const std::string& s, size_t line_idx) {
+    size_t line = 0;
+    size_t line_start = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+      char c = s[i];
+      if (c == '\n') {
+        if (line == line_idx) return line_start;
+        ++line;
+        line_start = i + 1;
+      } else if (c == '\r') {
+        if (line == line_idx) return line_start;
+        ++line;
+        if (i + 1 < s.size() && s[i + 1] == '\n') ++i;
+        line_start = i + 1;
       }
     }
-    return std::string::npos;
+    if (line == line_idx) return line_start;
+    return s.size();
   }
 
   Options options_;
@@ -7719,6 +7790,7 @@ class StreamingMarkdownParser {
   HtmlStreamCallback on_html_;
   std::string pending_;
   LinkRefMap running_link_refs_;
+  size_t pending_limit_ = 4 * 1024 * 1024;
 };
 
 // Convenience: stream the whole input through the callback (feed + flush).

@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -620,6 +621,146 @@ TEST(StreamingMarkdownParser, PartialLineHeldUntilNewline) {
   parser.Feed(" more\n");
   parser.Flush();
   EXPECT_EQ(Regular("para more\n"), out);
+}
+
+// A block quote interrupted by a blank (empty) quote line is still the same
+// block: a further `> ` line re-joins it rather than starting a second
+// blockquote. This is the correctness fix over the old sentinel probe.
+TEST(StreamingMarkdownParser, QuoteRejoinsAfterBlankLine) {
+  const std::string whole = "> a\n>\n> more\n";
+  std::string out;
+  markus::StreamingMarkdownParser parser;
+  parser.setOutputCallback(
+      [&](std::string_view h) { out.append(h.data(), h.size()); });
+  parser.Feed("> a\n");
+  parser.Feed(">\n");
+  parser.Feed("> more\n");
+  parser.Flush();
+  EXPECT_EQ(Regular(whole), out)
+      << "an open block quote must re-join across the blank quote line, not "
+      << "split into two; got: " << out;
+}
+
+// Same for lists: a further item after the separating blank line extends the
+// same (loose) list instead of opening a new one.
+TEST(StreamingMarkdownParser, ListRejoinsAfterBlankLine) {
+  const std::string whole = "1. a\n\n2. b\n";
+  std::string out;
+  markus::StreamingMarkdownParser parser;
+  parser.setOutputCallback(
+      [&](std::string_view h) { out.append(h.data(), h.size()); });
+  parser.Feed("1. a\n\n");
+  parser.Feed("2. b\n");
+  parser.Flush();
+  EXPECT_EQ(Regular(whole), out)
+      << "an open list must re-join across the blank line (one loose <ol>), "
+      << "not two lists; got: " << out;
+}
+
+// The held-back buffer is capped. A chunk that would push it past the limit
+// throws std::length_error and leaves the buffer unchanged; a large enough
+// limit handles the same input fine.
+TEST(StreamingMarkdownParser, PendingLimit) {
+  std::string chunk(19, 'a');
+  chunk.push_back('\n');  // 20 bytes, contains a newline
+
+  markus::StreamingMarkdownParser small;
+  small.setPendingLimit(16);
+  EXPECT_THROW(small.Feed(chunk), std::length_error);
+  EXPECT_TRUE(small.empty());  // buffer unchanged (nothing appended before throw)
+
+  markus::StreamingMarkdownParser big;
+  std::string out;
+  big.setOutputCallback(
+      [&](std::string_view h) { out.append(h.data(), h.size()); });
+  big.setPendingLimit(1024);
+  big.Feed(chunk);
+  big.Flush();
+  EXPECT_EQ(Regular(chunk), out);
+}
+
+// A large (>= 256 KB) mixed document streamed in small chunks reproduces the
+// regular output exactly, at several chunk sizes.
+TEST(StreamingMarkdownParser, LargeChunkedMatchesRegular) {
+  std::string input;
+  input.reserve(280 * 1024);
+  for (int i = 0; input.size() < 256 * 1024; ++i) {
+    switch (i % 6) {
+      case 0:
+        input += "# Heading " + std::to_string(i) + "\n";
+        break;
+      case 1:
+        input +=
+            "A paragraph with **bold** and `code` number " + std::to_string(i) +
+            ".\n\n";
+        break;
+      case 2:
+        input += "- item one\n- item two " + std::to_string(i) + "\n\n";
+        break;
+      case 3:
+        input += "```\ncode line " + std::to_string(i) + "\n```\n";
+        break;
+      case 4:
+        input += "> quote line " + std::to_string(i) + "\n>\n> more\n\n";
+        break;
+      case 5:
+        input += "1. first\n2. second " + std::to_string(i) + "\n\n";
+        break;
+    }
+  }
+  for (size_t chunk : {3u, 1024u, 8192u}) {
+    EXPECT_EQ(Regular(input), StreamChunked(input, chunk))
+        << "chunk: " << chunk << " size: " << input.size();
+  }
+}
+
+// A single large (>= 256 KB) fenced code block streamed in small chunks
+// completes on Flush with output identical to the regular render. The block
+// stays open (held back) until its closing fence, so this guards the cost of
+// re-rendering a large open trailing block.
+TEST(StreamingMarkdownParser, StreamedLargeOpenBlock) {
+  std::string input = "```\n";
+  while (input.size() < 260 * 1024) {
+    input += "line of code that is reasonably long\n";
+  }
+  input += "```\n";
+  for (size_t chunk : {257u, 4096u}) {
+    EXPECT_EQ(Regular(input), StreamChunked(input, chunk))
+        << "chunk: " << chunk << " size: " << input.size();
+  }
+}
+
+// Out-of-range / overflowing numeric character references must produce
+// deterministic output (the ParseUint overflow clamp to UINT32_MAX), never an
+// undefined wrapped code point. The inline path rejects the out-of-range
+// reference and renders it literally; the fenced-code info-string path clamps
+// to U+FFFD.
+TEST(Markus, ParseUintOverflow) {
+  EXPECT_EQ(std::string("<p>&amp;#99999999999999;</p>\n"),
+            Regular("&#99999999999999;"));
+  const std::string hex40(40, 'f');
+  EXPECT_EQ(std::string("<p>&amp;#x") + hex40 + ";</p>\n",
+            Regular("&#x" + hex40 + ";"));
+  const std::string info_expected =
+      "<pre><code class=\"language-\xEF\xBF\xBD\">code\n</code></pre>\n";
+  EXPECT_EQ(info_expected, Regular("```&#99999999999999;\ncode\n```\n"));
+}
+
+// Repeated parse+render of the same document is byte-for-byte stable across
+// many iterations (functional guard; memory flatness is verified separately).
+TEST(Markus, RepeatedParseStable) {
+  std::string doc;
+  doc.reserve(60 * 1024);
+  for (int i = 0; i < 400; ++i) {
+    doc += "## Section " + std::to_string(i) + "\n\n";
+    doc += "Text with **bold**, *em* and `code` plus a [link](http://x.com/i) " +
+           std::to_string(i) + ".\n\n";
+    doc += "```\ncode " + std::to_string(i) + "\n```\n\n";
+  }
+  const std::string first = Regular(doc);
+  for (int i = 0; i < 200; ++i) {
+    EXPECT_EQ(first, Regular(doc)) << "iteration " << i << " size " << doc.size();
+  }
 }
 
 }  // namespace

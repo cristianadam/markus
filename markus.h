@@ -127,6 +127,7 @@ struct Paragraph;
 struct Heading;
 struct ThematicBreak;
 struct CodeBlock;
+struct DetailsBlock;
 struct HtmlBlock;
 struct BlockQuote;
 struct List;
@@ -154,6 +155,7 @@ enum class NodeType {
   kHeading,
   kThematicBreak,
   kCodeBlock,
+  kDetailsBlock,
   kHtmlBlock,
   kBlockQuote,
   kList,
@@ -184,6 +186,8 @@ inline std::string_view NodeTypeToString(NodeType type) {
       return "ThematicBreak";
     case NodeType::kCodeBlock:
       return "CodeBlock";
+    case NodeType::kDetailsBlock:
+      return "DetailsBlock";
     case NodeType::kHtmlBlock:
       return "HtmlBlock";
     case NodeType::kBlockQuote:
@@ -314,12 +318,27 @@ struct CodeBlock {
   std::pmr::string info_string;  // Language hint (e.g., "cpp", "python")
   std::pmr::string content;
   bool is_fenced = false;
+  char fence_char = 0;  // '`' or '~' when fenced, 0 for indented code blocks
 
   CodeBlock() = default;
-  CodeBlock(std::pmr::string info, std::pmr::string content, bool fenced)
+  CodeBlock(std::pmr::string info, std::pmr::string content, bool fenced,
+            char fence = 0)
       : info_string(std::move(info)),
         content(std::move(content)),
-        is_fenced(fenced) {}
+        is_fenced(fenced),
+        fence_char(fence) {}
+};
+
+// A GitHub-style collapsible `<details>` section. Produced when a type-6 HTML
+// block starts with a `<details>` tag; the block then consumes lines until the
+// matching `</details>` line (blank lines do not terminate it, unlike other
+// type-6 HTML blocks). `summary` holds the text of the optional `<summary>`
+// child; `content` is the raw (unparsed) text between the end of `</summary>`
+// (or the opening tag) and the `</details>` line.
+struct DetailsBlock {
+  std::pmr::string summary;
+  std::pmr::string content;
+  bool closed = false;  // false when the input ended before </details>
 };
 
 struct HtmlBlock {
@@ -399,7 +418,8 @@ struct Table {
 
 // Variant type for block content
 using BlockNode = std::variant<Paragraph, Heading, ThematicBreak, CodeBlock,
-                               HtmlBlock, BlockQuote, List, ListItem, Table>;
+                               DetailsBlock, HtmlBlock, BlockQuote, List,
+                               ListItem, Table>;
 
 // Type alias for link references - sorted vector with binary search
 // Much faster than unordered_map for typical document sizes (< 50 refs)
@@ -1610,6 +1630,17 @@ inline bool StringContainsInsensitive(std::string_view str,
     if (match) return true;
   }
   return false;
+}
+
+// Case-insensitive substring search returning the index of the first
+// occurrence of `needle` in `hay` (or npos).
+inline size_t FindInsensitive(std::string_view hay, std::string_view needle) {
+  if (needle.empty() || hay.size() < needle.size())
+    return std::string_view::npos;
+  for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+    if (StartsWithInsensitive(hay.substr(i, needle.size()), needle)) return i;
+  }
+  return std::string_view::npos;
 }
 
 // Count leading spaces (tabs count as 4 spaces to next tab stop)
@@ -5060,6 +5091,10 @@ class BlockParser {
               terminated = last_fence_found_closing_;
             }
             // Indented code: general rule (blank line terminates, EOF does not).
+          } else if constexpr (std::is_same_v<T, DetailsBlock>) {
+            // A section closed by </details> is complete; one that reached
+            // end-of-input without the closing tag may still grow.
+            terminated = n.closed;
           } else if constexpr (std::is_same_v<T, HtmlBlock>) {
             if (n.block_type <= 5) {
               // Types 1-5 consume to the end-condition line or end-of-input.
@@ -5959,7 +5994,73 @@ class BlockParser {
 
     last_fence_found_closing_ = found_closing;
     blocks.emplace_back(std::in_place_type<CodeBlock>, std::move(info_string),
-                        std::move(content), true);
+                        std::move(content), true, fence_char);
+    return true;
+  }
+
+  // Parse a GitHub-style <details> section that starts on the current line.
+  // Unlike other type-6 HTML blocks, blank lines do not terminate the block:
+  // lines are consumed until a line beginning with the closing </details> tag
+  // (case-insensitive) or end of input. Emits a single DetailsBlock.
+  bool TryParseDetailsBlock(std::pmr::vector<BlockNode>& blocks) {
+    std::pmr::string raw;
+    bool closed = false;
+    while (!AtEnd()) {
+      std::string_view line = CurrentLine();
+      auto trimmed = detail::TrimLeft(line);
+      if (detail::StartsWithInsensitive(trimmed, "</details")) {
+        closed = true;
+        Advance();
+        break;
+      }
+      raw += line;
+      raw += '\n';
+      Advance();
+    }
+
+    // A closing tag on the same line as the opening tag closes the section.
+    if (!closed) {
+      size_t close = detail::FindInsensitive(raw, "</details");
+      if (close != std::string_view::npos) {
+        raw.erase(close);
+        closed = true;
+      }
+    }
+
+    // Drop the trailing newline of the final line.
+    if (!raw.empty() && raw.back() == '\n') raw.pop_back();
+
+    // Locate the optional <summary> ... </summary> child.
+    std::pmr::string summary;
+    size_t content_start = 0;
+    size_t summary_open = detail::FindInsensitive(raw, "<summary");
+    if (summary_open != std::string_view::npos) {
+      size_t tag_end = raw.find('>', summary_open);
+      if (tag_end != std::string_view::npos) {
+        size_t summary_close =
+            detail::FindInsensitive(raw.substr(tag_end), "</summary>");
+        if (summary_close != std::string_view::npos) {
+          // Absolute range of the summary text: after the '>' of the opening
+          // <summary ...> tag up to the start of the closing </summary> tag.
+          summary.assign(raw.substr(tag_end + 1, summary_close - 1));
+          summary = std::pmr::string(detail::Trim(summary));
+          content_start = tag_end + summary_close +
+                          std::string_view("</summary>").size();
+        }
+      }
+    } else {
+      // No <summary> child: content starts after the opening <details ...> tag.
+      size_t tag_end = raw.find('>');
+      if (tag_end != std::string_view::npos) content_start = tag_end + 1;
+    }
+
+    std::pmr::string content;
+    if (content_start < raw.size()) {
+      content.assign(raw.substr(content_start));
+    }
+
+    blocks.emplace_back(std::in_place_type<DetailsBlock>, std::move(summary),
+                        std::move(content), closed);
     return true;
   }
 
@@ -5976,6 +6077,13 @@ class BlockParser {
     auto [block_type, end_condition_sv] = detail::ClassifyHtmlBlock(trimmed);
     if (block_type == 0) [[unlikely]]
       return false;
+
+    // GitHub-style <details> section: consume until the matching </details>
+    // line and emit a structured DetailsBlock instead of a raw HtmlBlock.
+    if (block_type == 6 &&
+        detail::StartsWithInsensitive(trimmed, "<details")) {
+      return TryParseDetailsBlock(blocks);
+    }
 
     // Collect HTML block content
     std::pmr::string content;
@@ -7226,6 +7334,8 @@ class HtmlRenderer {
               out += "<hr />\n";
             } else if constexpr (std::is_same_v<T, CodeBlock>) {
               RenderCodeBlock(node, out);
+            } else if constexpr (std::is_same_v<T, DetailsBlock>) {
+              RenderDetailsBlock(node, out);
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
               RenderHtmlBlock(node, out);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
@@ -7319,6 +7429,8 @@ class HtmlRenderer {
               out += "<hr />\n";
             } else if constexpr (std::is_same_v<T, CodeBlock>) {
               RenderCodeBlock(node, out);
+            } else if constexpr (std::is_same_v<T, DetailsBlock>) {
+              RenderDetailsBlock(node, out);
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
               RenderHtmlBlock(node, out);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
@@ -7333,6 +7445,14 @@ class HtmlRenderer {
           },
           block);
     }
+  }
+
+  void RenderDetailsBlock(const DetailsBlock& block, std::pmr::string& out) {
+    out += "<details><summary>";
+    detail::EscapeHtmlTo(block.summary, out);
+    out += "</summary>";
+    detail::EscapeHtmlTo(block.content, out);
+    out += "</details>\n";
   }
 
   void RenderList(const List& list, std::pmr::string& out) {
@@ -7626,6 +7746,31 @@ inline std::pmr::string MarkdownToHtml(std::string_view input,
 //   parser.Feed(chunk2);
 //   parser.Flush();
 
+// Byte offset in `s` where 0-based line `line_idx` begins, counting line
+// starts exactly the way detail::LineBuffer does (a line is terminated by
+// '\n', or by '\r' optionally followed by '\n'). This scans the raw bytes, so
+// it stays correct even when the input contains NULs (where LineBuffer would
+// copy and its offsets would no longer index `s`). Linear in `s`.
+inline size_t ByteOffsetOfLine(const std::string& s, size_t line_idx) {
+  size_t line = 0;
+  size_t line_start = 0;
+  for (size_t i = 0; i < s.size(); ++i) {
+    char c = s[i];
+    if (c == '\n') {
+      if (line == line_idx) return line_start;
+      ++line;
+      line_start = i + 1;
+    } else if (c == '\r') {
+      if (line == line_idx) return line_start;
+      ++line;
+      if (i + 1 < s.size() && s[i + 1] == '\n') ++i;
+      line_start = i + 1;
+    }
+  }
+  if (line == line_idx) return line_start;
+  return s.size();
+}
+
 using HtmlStreamCallback = std::function<void(std::string_view html)>;
 
 class StreamingMarkdownParser {
@@ -7760,34 +7905,153 @@ class StreamingMarkdownParser {
     }
   }
 
-  // Byte offset in `s` where 0-based line `line_idx` begins, counting line
-  // starts exactly the way detail::LineBuffer does (a line is terminated by
-  // '\n', or by '\r' optionally followed by '\n'). This scans the raw bytes, so
-  // it stays correct even when the input contains NULs (where LineBuffer would
-  // copy and its offsets would no longer index `s`). Linear in `s`.
-  static size_t ByteOffsetOfLine(const std::string& s, size_t line_idx) {
-    size_t line = 0;
-    size_t line_start = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-      char c = s[i];
-      if (c == '\n') {
-        if (line == line_idx) return line_start;
-        ++line;
-        line_start = i + 1;
-      } else if (c == '\r') {
-        if (line == line_idx) return line_start;
-        ++line;
-        if (i + 1 < s.size() && s[i + 1] == '\n') ++i;
-        line_start = i + 1;
+  Options options_;
+  BlockParser parser_;
+  HtmlStreamCallback on_html_;
+  std::string pending_;
+  LinkRefMap running_link_refs_;
+  size_t pending_limit_ = 4 * 1024 * 1024;
+};
+
+// =============================================================================
+// AST streaming API - progressive rendering to custom targets (e.g. a GUI
+// document model) without going through HTML.
+// =============================================================================
+//
+// `StreamingBlockParser` accepts Markdown in arbitrary chunks and delivers
+// finished *top-level blocks as an AST* through a callback as soon as they can
+// no longer change. This is the counterpart of `StreamingMarkdownParser` for
+// consumers that render from the AST instead of HTML.
+//
+// The callback receives the `Document` the blocks were parsed into together
+// with the half-open range `[first, last)` of top-level blocks to render
+// (`Document::children`). The Document is only guaranteed to be valid while
+// the callback runs; everything the consumer needs (text, node pools, decoded
+// strings) is read-only state of that Document.
+//
+// The finalization semantics match `StreamingMarkdownParser`: a block is
+// emitted once its terminating line has been seen (or it is atomic); the
+// trailing block that may still grow is held back until its terminator
+// arrives or `Flush()` is called. Each top-level block is delivered exactly
+// once, in order.
+
+using BlockStreamCallback =
+    std::function<void(const Document&, size_t first, size_t last)>;
+
+class StreamingBlockParser {
+ public:
+  StreamingBlockParser() = default;
+  explicit StreamingBlockParser(const Options& options) { SetOptions(options); }
+
+  void SetOptions(const Options& options) {
+    options_ = options;
+    parser_.enable_tables = options.enable_tables;
+    parser_.enable_autolink = options.enable_autolink;
+    parser_.enable_strikethrough = options.enable_strikethrough;
+    parser_.enable_tasklist = options.enable_tasklist;
+  }
+
+  const Options& options() const { return options_; }
+
+  void setBlockCallback(BlockStreamCallback callback) {
+    on_blocks_ = std::move(callback);
+  }
+
+  // Set the maximum size of the held-back buffer (default 4 MiB). A `Feed`
+  // that would push the buffer past this limit throws `std::length_error`.
+  void setPendingLimit(size_t limit) { pending_limit_ = limit; }
+
+  // Append a chunk of Markdown and deliver any newly-finalized blocks.
+  //
+  // Nothing can finalize on a chunk without a newline, so that case is
+  // buffered without re-parsing (the fast path that makes char/byte-by-byte
+  // streaming cheap).
+  void Feed(std::string_view chunk) {
+    if (chunk.empty()) return;
+    if (chunk.size() > pending_limit_ ||
+        chunk.size() > pending_limit_ - pending_.size()) {
+      throw std::length_error("markus: streaming pending buffer limit exceeded");
+    }
+    pending_.append(chunk.data(), chunk.size());
+    if (chunk.find('\n') == std::string_view::npos) return;
+    EmitCompletedBlocks();
+  }
+
+  // Deliver any remaining buffered content (end-of-input).
+  void Flush() {
+    if (pending_.empty()) return;
+    if (pending_.find('[') != std::string::npos) {
+      parser_.ExtractLinkRefs(pending_, running_link_refs_);
+    }
+    Document doc = parser_.Parse(pending_, running_link_refs_);
+    pending_.clear();
+    if (!doc.children.empty() && on_blocks_) {
+      on_blocks_(doc, 0, doc.children.size());
+    }
+  }
+
+  // Discard all buffered content and link references.
+  void Reset() {
+    pending_.clear();
+    running_link_refs_.clear();
+  }
+
+  bool empty() const { return pending_.empty(); }
+
+ private:
+  // Deliver every block in `pending_` that is guaranteed final, leaving only
+  // the trailing (possibly incomplete) top-level block buffered.
+  //
+  // The settled portion is `pending_` up to and including the last '\n'.
+  // Parsing it yields a Document whose last top-level block carries the
+  // termination flag recorded by BlockParser (see RecordLastTopBlock). If
+  // that block is still open, it is held back: it is the last element of
+  // `Document::children` and starts at `last_top_block_start_line`.
+  void EmitCompletedBlocks() {
+    if (pending_.empty()) return;
+
+    // The final line of the buffer has no terminating newline and may still
+    // grow, so only whole lines (up to and including the last '\n') can be
+    // considered. Everything after the last newline is always held back.
+    size_t line_end = 0;
+    for (size_t i = pending_.size(); i >= 1; --i) {
+      if (pending_[i - 1] == '\n') {
+        line_end = i;
+        break;
       }
     }
-    if (line == line_idx) return line_start;
-    return s.size();
+    if (line_end == 0) return;  // only a partial line; wait for more data
+
+    const std::string settled = pending_.substr(0, line_end);
+
+    // Remember any link reference definitions in the settled (whole-line)
+    // portion so references defined in an earlier chunk resolve in later
+    // ones (first definition wins).
+    if (settled.find('[') != std::string::npos) {
+      parser_.ExtractLinkRefs(settled, running_link_refs_);
+    }
+
+    Document doc = parser_.Parse(settled, running_link_refs_);
+
+    size_t first = 0;
+    size_t last = doc.children.size();
+    size_t cut = line_end;
+    if (parser_.has_last_top_block && !parser_.last_top_block_terminated &&
+        last > first) {
+      // The trailing top-level block may still grow: hold it back.
+      --last;
+      cut = ByteOffsetOfLine(settled, parser_.last_top_block_start_line);
+    }
+    pending_ = pending_.substr(cut);
+
+    if (first != last && on_blocks_) {
+      on_blocks_(doc, first, last);
+    }
   }
 
   Options options_;
   BlockParser parser_;
-  HtmlStreamCallback on_html_;
+  BlockStreamCallback on_blocks_;
   std::string pending_;
   LinkRefMap running_link_refs_;
   size_t pending_limit_ = 4 * 1024 * 1024;
@@ -7888,6 +8152,10 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
                                         ? ""
                                         : std::format(" ({})", n.info_string));
               result += "\n";
+            } else if constexpr (std::is_same_v<T, DetailsBlock>) {
+              result += std::format(
+                  "{}DetailsBlock (summary: \"{}\", {})\n", p, n.summary,
+                  n.closed ? "closed" : "open");
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
               result += std::format("{}HtmlBlock (type {})\n", p, n.block_type);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
@@ -7940,6 +8208,10 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
                                         ? ""
                                         : std::format(" ({})", n.info_string));
               result += "\n";
+            } else if constexpr (std::is_same_v<T, DetailsBlock>) {
+              result += std::format(
+                  "{}DetailsBlock (summary: \"{}\", {})\n", p, n.summary,
+                  n.closed ? "closed" : "open");
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
               result += std::format("{}HtmlBlock (type {})\n", p, n.block_type);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {

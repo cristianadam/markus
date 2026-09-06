@@ -22,7 +22,8 @@ _Vibe coded with Claude Opus 4.5 and Opencode (qwen 3.6 35b)_
 - **High Performance**: Efficient parsing with lookup tables and inline optimizations
 - **Full Unicode Support**: UTF-8 encoding/decoding, case folding, punctuation detection
 - **AST Access**: Parse to an Abstract Syntax Tree for inspection or custom rendering
-- **Streaming**: Feed Markdown in chunks as it arrives and emit finished blocks incrementally
+- **Streaming**: Feed Markdown in chunks as it arrives and emit finished blocks incrementally — as HTML (`StreamingMarkdownParser`) or as AST block ranges (`StreamingBlockParser`) for custom renderers
+- **GitHub `<details>` Sections**: Line-leading `<details>` blocks parse into a structured `DetailsBlock` (summary + content)
 - **Google Style**: Clean, readable codebase following Google C++ Style Guide
 
 ## Quick Start
@@ -102,6 +103,13 @@ Available extensions:
 | Task list | `-e tasklist` | `enable_tasklist` | `- [x]` checkboxes |
 | Tag filter | `-e tagfilter` | `enable_tagfilter` | Drops disallowed raw HTML tags |
 
+GitHub-style collapsible `<details>` sections are always recognized (no
+option): a type-6 HTML block whose line starts with a `<details>` tag parses
+into a structured `DetailsBlock` carrying the optional `<summary>` text and
+the raw (unparsed) section content. Unlike other type-6 HTML blocks, blank
+lines do not terminate the section; it ends at the line beginning with the
+closing `</details>` tag or at end of input (where `closed` is `false`).
+
 ### Streaming
 
 Feed Markdown incrementally (e.g. as it arrives over a network) and emit
@@ -137,6 +145,46 @@ Semantics:
 GFM extensions are supported the same way as in `MarkdownToHtml` (pass a
 `markus::Options` to the constructor).
 
+### AST Streaming (`StreamingBlockParser`)
+
+For consumers that render from the AST instead of HTML (e.g. a GUI document
+model), `StreamingBlockParser` delivers finished **top-level blocks as AST
+nodes** through a callback as soon as they can no longer change:
+
+```cpp
+#include "markus.h"
+
+int main() {
+    markus::StreamingBlockParser parser;
+    parser.setBlockCallback(
+        [](const markus::Document& doc, size_t first, size_t last) {
+            for (size_t i = first; i < last; ++i) {
+                // Render doc.children[i] (a markus::BlockNode) to the target.
+            }
+        });
+    parser.Feed("# Hello\n\nThis arrives ");
+    parser.Feed("in chunks.\n");
+    parser.Flush();  // deliver anything still buffered at end of input
+    return 0;
+}
+```
+
+The callback receives the `Document` the blocks were parsed into plus the
+half-open range `[first, last)` of top-level blocks to render
+(`Document::children`). The `Document` is only guaranteed to be valid while
+the callback runs; copy out anything you need to keep.
+
+The finalization semantics match `StreamingMarkdownParser`: each top-level
+block is delivered exactly once, in order, as soon as its terminating line
+has been seen (or it is atomic); the trailing block that may still grow is
+held back until its terminator arrives or `Flush()` is called. A block is
+never revised after delivery, so consumers can render it into a
+live/updating document model. `Feed` on a chunk without a newline is a
+cheap buffer append (no re-parse), which keeps byte-by-byte streaming fast.
+As with the HTML streaming parser, a held-back buffer limit
+(`setPendingLimit`, default 4 MiB) guards against unbounded growth and
+exceeding it throws `std::length_error`.
+
 ## API Reference
 
 ### Core Functions
@@ -149,7 +197,8 @@ GFM extensions are supported the same way as in `MarkdownToHtml` (pass a
 | `markus::Parse(input, options)` | Parse to AST with GFM extensions enabled |
 | `markus::RenderHtml(doc)` | Render AST to HTML |
 | `markus::DebugAst(doc)` | Get a debug string representation of the AST |
-| `markus::StreamingMarkdownParser` | Feed Markdown in chunks; emit completed blocks via callback (`Feed`, `Flush`, `Reset`) |
+| `markus::StreamingMarkdownParser` | Feed Markdown in chunks; emit completed blocks' HTML via callback (`Feed`, `Flush`, `Reset`) |
+| `markus::StreamingBlockParser` | Feed Markdown in chunks; deliver completed top-level blocks as an AST range (`Document`, `[first, last)`) via callback — for custom/progressive renderers |
 | `markus::StreamMarkdownToHtml(input, callback)` | Convenience: feed whole input, then flush |
 
 `markus::Options` controls GFM extensions (`enable_tables`, `enable_autolink`,
@@ -164,7 +213,8 @@ GFM extensions are supported the same way as in `MarkdownToHtml` (pass a
 | `Paragraph` | Text paragraph |
 | `Heading` | ATX heading (levels 1-6) |
 | `ThematicBreak` | Horizontal rule (`---`, `***`, `___`) |
-| `CodeBlock` | Fenced or indented code block |
+| `CodeBlock` | Fenced or indented code block (`fence_char` is `` '`' ``/`'~'` when fenced, `0` when indented) |
+| `DetailsBlock` | GitHub-style collapsible `<details>` section (`summary`, raw `content`, `closed`) |
 | `HtmlBlock` | Raw HTML block |
 | `BlockQuote` | Block quotation |
 | `List` | Ordered or unordered list |
@@ -264,8 +314,9 @@ cmake --build build --target test_gfm
 
 `fuzz/` contains a coverage-guided fuzzing harness (modeled on cmark-gfm's
 `fuzz/`) that feeds a config-prefixed, quadratically-amplified Markdown body
-through both the batch path (`Parse`/`RenderHtml`/`DebugAst`) and the streaming
-path (`StreamingMarkdownParser`), with AddressSanitizer +
+through the batch path (`Parse`/`RenderHtml`/`DebugAst`) and both streaming
+paths (`StreamingMarkdownParser` for HTML, `StreamingBlockParser` for AST
+block ranges), with AddressSanitizer +
 UndefinedBehaviorSanitizer instrumentation. Memory safety has been checked with
 this harness under both libFuzzer and AFL++; no issues were found.
 

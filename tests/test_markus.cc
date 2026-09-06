@@ -763,4 +763,362 @@ TEST(Markus, RepeatedParseStable) {
   }
 }
 
+// =============================================================================
+// DetailsBlock (GitHub-style <details> sections)
+// =============================================================================
+
+const markus::DetailsBlock* GetDetails(const markus::Document& doc, size_t idx) {
+  if (idx >= doc.children.size()) return nullptr;
+  return std::get_if<markus::DetailsBlock>(&doc.children[idx]);
+}
+
+TEST(DetailsBlock, ParsesSummaryAndContent) {
+  const std::string input = "<details>\n<summary>Analysis</summary>\n"
+                            "body line 1\nbody line 2\n</details>\n";
+  markus::Document doc = markus::Parse(input);
+  ASSERT_EQ(1u, doc.children.size());
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  EXPECT_TRUE(d->closed);
+  EXPECT_EQ("Analysis", ToStd(d->summary));
+  EXPECT_NE(std::string::npos, ToStd(d->content).find("body line 1\nbody line 2"));
+}
+
+TEST(DetailsBlock, NoSummary) {
+  markus::Document doc = markus::Parse("<details>body text</details>\n");
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  EXPECT_TRUE(d->closed);
+  EXPECT_EQ("", ToStd(d->summary));
+  EXPECT_EQ("body text", ToStd(d->content));
+}
+
+TEST(DetailsBlock, UnclosedAtEofIsOpen) {
+  const std::string input = "<details>\n<summary>s</summary>\nbody\n";
+  markus::Document doc = markus::Parse(input);
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  EXPECT_FALSE(d->closed);
+  // DebugAst reports the open state.
+  EXPECT_NE(std::string::npos, ToStd(markus::DebugAst(doc)).find("open"));
+}
+
+TEST(DetailsBlock, BlankLinesDoNotTerminate) {
+  // Unlike a plain type-6 HTML block (which ends at a blank line), a
+  // <details> section consumes through blank lines until </details>.
+  const std::string input = "<details>\n<summary>s</summary>\n\nbody\n"
+                            "</details>\n\nafter\n";
+  markus::Document doc = markus::Parse(input);
+  ASSERT_EQ(2u, doc.children.size());
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  EXPECT_TRUE(d->closed);
+  EXPECT_NE(std::string::npos, ToStd(d->content).find("body"));
+  EXPECT_NE(nullptr, std::get_if<markus::Paragraph>(&doc.children[1]));
+}
+
+TEST(DetailsBlock, CaseInsensitiveTags) {
+  markus::Document doc =
+      markus::Parse("<DeTaIlS><SUMMARY>x</SUMMARY>y</dEtAiLs>\n");
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  EXPECT_TRUE(d->closed);
+  EXPECT_EQ("x", ToStd(d->summary));
+  EXPECT_EQ("y", ToStd(d->content));
+}
+
+TEST(DetailsBlock, RendersHtml) {
+  const std::string input = "<details>\n<summary>Analysis</summary>\n"
+                            "body\n</details>\n";
+  const std::string html = Regular(input);
+  EXPECT_NE(std::string::npos, html.find("<details><summary>Analysis</summary>"));
+  EXPECT_NE(std::string::npos, html.find("body</details>"));
+}
+
+TEST(DetailsBlock, HtmlIsEscaped) {
+  const std::string input =
+      "<details><summary><b>bold</b></summary>&lt;tag&gt;</details>\n";
+  const std::string html = Regular(input);
+  // The structured renderer re-escapes its raw text: no live <b> in output.
+  EXPECT_EQ(std::string::npos, html.find("<summary><b>"));
+  EXPECT_NE(std::string::npos, html.find("&lt;b&gt;"));
+}
+
+// A <details> tag that is not a line-leading type-6 open tag does not start
+// a section: mid-line tags stay inline HTML in a paragraph, and other tag
+// names (e.g. <detailsx>) stay plain HTML blocks.
+TEST(DetailsBlock, NotATagStaysHtml) {
+  {
+    markus::Document doc = markus::Parse("x <details> y\n\npara\n");
+    ASSERT_EQ(2u, doc.children.size());
+    EXPECT_NE(nullptr, std::get_if<markus::Paragraph>(&doc.children[0]));
+  }
+  {
+    markus::Document doc = markus::Parse("<detailsx>\n\npara\n");
+    ASSERT_EQ(2u, doc.children.size());
+    EXPECT_NE(nullptr, std::get_if<markus::HtmlBlock>(&doc.children[0]));
+  }
+}
+
+// =============================================================================
+// CodeBlock::fence_char
+// =============================================================================
+
+TEST(CodeBlock, FenceChar) {
+  {
+    markus::Document doc = markus::Parse("```\ncode\n```\n");
+    const auto& c = std::get<markus::CodeBlock>(doc.children[0]);
+    EXPECT_TRUE(c.is_fenced);
+    EXPECT_EQ('`', c.fence_char);
+  }
+  {
+    markus::Document doc = markus::Parse("~~~\ncode\n~~~\n");
+    const auto& c = std::get<markus::CodeBlock>(doc.children[0]);
+    EXPECT_TRUE(c.is_fenced);
+    EXPECT_EQ('~', c.fence_char);
+  }
+  {
+    markus::Document doc = markus::Parse("    indented\n    code\n");
+    const auto& c = std::get<markus::CodeBlock>(doc.children[0]);
+    EXPECT_FALSE(c.is_fenced);
+    EXPECT_EQ(0, c.fence_char);
+  }
+}
+
+// =============================================================================
+// StreamingBlockParser (AST streaming API)
+// =============================================================================
+
+// Render only the top-level block range [first, last) of a Document.
+std::string RenderRange(const markus::Document& doc, size_t first, size_t last) {
+  markus::Document sub = doc;
+  sub.children.assign(doc.children.begin() + first, doc.children.begin() + last);
+  return ToStd(markus::RenderHtml(sub));
+}
+
+std::string BlockStreamSingleFeed(const std::string& input,
+                                  const markus::Options& options = {}) {
+  std::string out;
+  markus::StreamingBlockParser parser(options);
+  parser.setBlockCallback([&](const markus::Document& doc, size_t first,
+                              size_t last) { out += RenderRange(doc, first, last); });
+  parser.Feed(input);
+  parser.Flush();
+  return out;
+}
+
+std::string BlockStreamChunked(const std::string& input, size_t chunk,
+                               const markus::Options& options = {}) {
+  std::string out;
+  markus::StreamingBlockParser parser(options);
+  parser.setBlockCallback([&](const markus::Document& doc, size_t first,
+                              size_t last) { out += RenderRange(doc, first, last); });
+  for (size_t i = 0; i < input.size(); i += chunk) {
+    size_t len = std::min(chunk, input.size() - i);
+    parser.Feed(std::string_view(input.data() + i, len));
+  }
+  parser.Flush();
+  return out;
+}
+
+TEST(StreamingBlockParser, SingleFeedMatchesRegular) {
+  const std::vector<std::string> inputs = {
+      "hello\n",
+      "para one\n\npara two\n",
+      "# heading\n",
+      "- a\n- b\n- c\n",
+      "1. one\n2. two\n",
+      "> quoted\nline\n",
+      "```\ncode\n```\n",
+      "    indented\n    code\n",
+      "a\n\n---\n\nb\n",
+      "text **bold** _em_ `code`\n",
+      "[link](http://x.com)\n",
+      "[ref]: /url\n\n[ref]\n",
+      "<details>\n<summary>s</summary>\nbody\n</details>\n\nafter\n",
+  };
+  for (const auto& in : inputs) {
+    EXPECT_EQ(Regular(in), BlockStreamSingleFeed(in)) << "input: " << in;
+  }
+}
+
+TEST(StreamingBlockParser, ChunkedMatchesRegular) {
+  const std::vector<std::string> inputs = {
+      "para one\n\npara two\n",
+      "# heading\n",
+      "- a\n- b\n- c\n",
+      "1. one\n2. two\n",
+      "> quoted\nline\n",
+      "```\ncode\n```\n",
+      "    indented\n    code\n",
+      "text **bold** _em_ `code`\n",
+      "<details>\n<summary>Analysis</summary>\n\nbody\n</details>\n",
+  };
+  for (const auto& in : inputs) {
+    for (size_t chunk : {1u, 2u, 3u, 5u, 8u, 64u}) {
+      EXPECT_EQ(Regular(in), BlockStreamChunked(in, chunk))
+          << "input: " << in << " chunk: " << chunk;
+    }
+  }
+}
+
+TEST(StreamingBlockParser, GfmOptionsMatchRegular) {
+  struct Case {
+    markus::Options options;
+    std::string input;
+  };
+  const std::vector<Case> cases = {
+      {markus::Options{.enable_tables = true},
+       "| a | b |\n|---|---|\n| 1 | 2 |\n"},
+      {markus::Options{.enable_strikethrough = true}, "~~gone~~\n"},
+      {markus::Options{.enable_tasklist = true}, "- [x] done\n- [ ] todo\n"},
+      {markus::Options{.enable_autolink = true},
+       "visit https://example.com now\n"},
+  };
+  for (const auto& c : cases) {
+    EXPECT_EQ(Regular(c.input, c.options),
+              BlockStreamChunked(c.input, 3, c.options))
+        << "input: " << c.input;
+  }
+}
+
+// Each top-level block is delivered exactly once, in document order; the
+// trailing block that may still grow is held back until Flush.
+TEST(StreamingBlockParser, ProgressiveEmissionOrder) {
+  const std::string input = "para1\n\npara2\n\npara3\n";
+  const std::string expected = Regular(input);
+
+  std::string running;
+  size_t blocks_delivered = 0;
+  bool trailing_held = false;
+  {
+    markus::StreamingBlockParser parser;
+    parser.setBlockCallback([&](const markus::Document& doc, size_t first,
+                                size_t last) {
+      EXPECT_EQ(0u, first) << "emissions must be prefix ranges in order";
+      blocks_delivered += last - first;
+      running += RenderRange(doc, first, last);
+      // Every prefix of the emitted output must itself be a prefix of the
+      // final document (blocks are never revised or reordered).
+      EXPECT_EQ(0u, expected.rfind(running, 0) == 0 ? 0u : 1u)
+          << "emissions must stay a prefix of the final output; running: "
+          << running;
+    });
+    parser.Feed("para1\n\n");
+    EXPECT_EQ(1u, blocks_delivered);
+    parser.Feed("para2\n\n");
+    EXPECT_EQ(2u, blocks_delivered);
+    // The trailing paragraph is still open: it must not be emitted yet.
+    parser.Feed("para3\n");
+    trailing_held = (blocks_delivered == 2);
+    parser.Flush();
+  }
+  EXPECT_TRUE(trailing_held)
+      << "the trailing (incomplete) paragraph must be held until Flush";
+  EXPECT_EQ(3u, blocks_delivered);
+  EXPECT_EQ(expected, running);
+}
+
+// An open fenced code block is held back until its closing fence arrives.
+TEST(StreamingBlockParser, OpenCodeBlockHeldBack) {
+  const std::string input = "before\n\n```\ncode\n```\nafter\n";
+  size_t blocks_delivered = 0;
+  std::string running;
+  markus::StreamingBlockParser parser;
+  parser.setBlockCallback([&](const markus::Document& doc, size_t first,
+                              size_t last) {
+    blocks_delivered += last - first;
+    running += RenderRange(doc, first, last);
+  });
+  parser.Feed("before\n\n");
+  EXPECT_EQ(1u, blocks_delivered);
+  parser.Feed("```\ncode\n");  // fence still open
+  EXPECT_EQ(1u, blocks_delivered) << "open code block must be held back";
+  parser.Feed("```\nafter\n");
+  EXPECT_EQ(2u, blocks_delivered) << "code block completes on its closing fence";
+  parser.Flush();
+  EXPECT_EQ(3u, blocks_delivered);
+  EXPECT_EQ(Regular(input), running);
+}
+
+// An unclosed <details> section is held back until </details> (or Flush).
+TEST(StreamingBlockParser, DetailsHeldBackUntilClosed) {
+  const std::string open = "<details>\n<summary>s</summary>\nbody\n";
+  const std::string input = open + "</details>\n";
+  size_t blocks_delivered = 0;
+  std::string running;
+  markus::StreamingBlockParser parser;
+  parser.setBlockCallback([&](const markus::Document& doc, size_t first,
+                              size_t last) {
+    blocks_delivered += last - first;
+    running += RenderRange(doc, first, last);
+  });
+  parser.Feed(open);
+  EXPECT_EQ(0u, blocks_delivered)
+      << "an unclosed <details> section must be held back";
+  parser.Feed("</details>\n");
+  EXPECT_EQ(1u, blocks_delivered);
+  parser.Flush();
+  EXPECT_EQ(Regular(input), running);
+
+  // An unclosed section at end-of-input is delivered (open) on Flush.
+  std::string flush_out;
+  size_t flush_blocks = 0;
+  {
+    markus::StreamingBlockParser p2;
+    p2.setBlockCallback([&](const markus::Document& doc, size_t first,
+                            size_t last) {
+      flush_blocks += last - first;
+      flush_out += RenderRange(doc, first, last);
+    });
+    p2.Feed(open);
+    p2.Flush();
+  }
+  EXPECT_EQ(1u, flush_blocks);
+  EXPECT_EQ(Regular(open), flush_out);
+}
+
+// A link reference defined in an earlier chunk resolves in a later one.
+TEST(StreamingBlockParser, LinkRefDefinedBeforeUseResolves) {
+  const std::string input = "[ref]: /url\n\n[ref]\n";
+  EXPECT_EQ(Regular(input), BlockStreamChunked(input, 2));
+  EXPECT_EQ(Regular(input), BlockStreamSingleFeed(input));
+}
+
+// Empty Feed() is a no-op; Reset() discards buffered content and references.
+TEST(StreamingBlockParser, ResetAndEmptyFeed) {
+  markus::StreamingBlockParser parser;
+  std::string out;
+  parser.setBlockCallback(
+      [&](const markus::Document& doc, size_t first, size_t last) {
+        out += RenderRange(doc, first, last);
+      });
+
+  parser.Feed("");  // no-op
+  EXPECT_TRUE(parser.empty());
+  parser.Flush();
+  EXPECT_EQ(std::string(), out);
+
+  parser.Feed("para1\n");
+  parser.Reset();
+  EXPECT_TRUE(parser.empty());
+  parser.Feed("para2\n");
+  parser.Flush();
+  EXPECT_EQ(Regular("para2\n"), out)
+      << "content before Reset() must be discarded; got: " << out;
+}
+
+// A Feed that would push the held-back buffer past setPendingLimit throws
+// std::length_error and leaves the buffer unchanged.
+TEST(StreamingBlockParser, PendingLimit) {
+  markus::StreamingBlockParser small;
+  small.setPendingLimit(4);
+  EXPECT_THROW(small.Feed("12345\n"), std::length_error);
+  EXPECT_TRUE(small.empty());
+
+  markus::StreamingBlockParser big;
+  big.setPendingLimit(1024);
+  EXPECT_NO_THROW(big.Feed(std::string(1024, 'a')));
+}
+
 }  // namespace

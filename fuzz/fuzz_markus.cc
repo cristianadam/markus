@@ -4,9 +4,9 @@
 // prepended to the raw Markdown body. The config selects which GFM extensions
 // are enabled and drives a quadratic amplifier (a repeated segment) so the
 // fuzzer can reach the parser's worst-case paths. Every input is run through
-// both the batch path (Parse + RenderHtml + AST debug) and the streaming path
-// (StreamingMarkdownParser), in "whole document" and "many small chunks"
-// shapes.
+// the batch path (Parse + RenderHtml + AST debug) and both streaming paths
+// (StreamingMarkdownParser for HTML, StreamingBlockParser for AST block
+// ranges), in "whole document" and "many small chunks" shapes.
 //
 // Build (libFuzzer; needs a clang that ships the fuzzer runtime, not the
 // default Apple clang):
@@ -121,6 +121,32 @@ void RunStreaming(const std::string& md, const markus::Options& o, uint32_t chun
   (void)collected;
 }
 
+// Exercise the AST streaming path (StreamingBlockParser): validate the
+// delivered [first, last) ranges and traverse each delivered block's variant
+// payload (cheap visit) while the Document is guaranteed valid.
+void RunStreamingAst(const std::string& md, const markus::Options& o,
+                     uint32_t chunk) {
+  markus::StreamingBlockParser parser(o);
+  parser.setBlockCallback(
+      [](const markus::Document& doc, size_t first, size_t last) {
+        if (first > last || last > doc.children.size()) return;
+        for (size_t i = first; i < last; ++i) {
+          std::visit([](const auto& n) { (void)n; }, doc.children[i]);
+        }
+      });
+  if (chunk == 0) {
+    parser.Feed(md);
+  } else {
+    size_t c = chunk;
+    if (c < 1) c = 1;
+    for (size_t i = 0; i < md.size(); i += c) {
+      const size_t n = (md.size() - i < c) ? (md.size() - i) : c;
+      parser.Feed(md.substr(i, n));
+    }
+  }
+  parser.Flush();
+}
+
 }  // namespace
 
 extern "C" int LLVMFuzzerInitialize(int* /*argc*/, char*** /*argv*/) { return 0; }
@@ -150,6 +176,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   size_t sc = cfg.stream_chunk;
   if (sc < min_chunk) sc = min_chunk;
   RunStreaming(smd, opts, static_cast<uint32_t>(sc));
+  RunStreamingAst(smd, opts, /*chunk=*/0);
+  RunStreamingAst(smd, opts, static_cast<uint32_t>(sc));
   return 0;
 }
 

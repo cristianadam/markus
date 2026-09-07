@@ -333,11 +333,12 @@ struct CodeBlock {
 // block starts with a `<details>` tag; the block then consumes lines until the
 // matching `</details>` line (blank lines do not terminate it, unlike other
 // type-6 HTML blocks). `summary` holds the text of the optional `<summary>`
-// child; `content` is the raw (unparsed) text between the end of `</summary>`
-// (or the opening tag) and the `</details>` line.
+// child; `children` are the markdown blocks parsed from the section body
+// (the text between the end of `</summary>` (or the opening tag) and the
+// `</details>` line), stored in the document's block pool.
 struct DetailsBlock {
   std::pmr::string summary;
-  std::pmr::string content;
+  std::pmr::vector<BlockNodeId> children;
   bool closed = false;  // false when the input ended before </details>
 };
 
@@ -6054,13 +6055,38 @@ class BlockParser {
       if (tag_end != std::string_view::npos) content_start = tag_end + 1;
     }
 
+    if (content_start == 0) {
+      // The opening <details ...> tag was never terminated by '>' (e.g. a
+      // partially streamed tag). Recursing into ParseBlocks with the same
+      // input would never make progress and overflow the stack, so fall back
+      // to a plain (unclosed) HTML block.
+      last_html_end_condition_found_ = false;
+      blocks.emplace_back(std::in_place_type<HtmlBlock>, std::move(raw), 6);
+      return true;
+    }
+
     std::pmr::string content;
     if (content_start < raw.size()) {
       content.assign(raw.substr(content_start));
     }
 
+    // Parse the section body as regular markdown so its block structure
+    // (paragraphs, code blocks, lists, ...) is preserved.
+    std::pmr::vector<BlockNodeId> children;
+    if (!content.empty()) {
+      BlockParser body_parser;
+      body_parser.enable_tables = enable_tables;
+      body_parser.enable_tasklist = enable_tasklist;
+      std::pmr::vector<BlockNode> body_blocks;
+      body_parser.ParseBlocksInto(std::string_view(content), *doc_,
+                                  body_blocks, /*input_no_nulls=*/true);
+      for (auto& node : body_blocks) {
+        children.push_back(doc_->AddBlock(std::move(node)));
+      }
+    }
+
     blocks.emplace_back(std::in_place_type<DetailsBlock>, std::move(summary),
-                        std::move(content), closed);
+                        std::move(children), closed);
     return true;
   }
 
@@ -7242,6 +7268,8 @@ class BlockParser {
               doc_->string_storage.push_back(std::move(node.raw_content));
               std::string_view stable_content = doc_->string_storage.back();
               node.children = parser.Parse(stable_content);
+            } else if constexpr (std::is_same_v<T, DetailsBlock>) {
+              ParseInlines(node.children, parser);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               ParseInlines(node.children, parser);
             } else if constexpr (std::is_same_v<T, List>) {
@@ -7277,6 +7305,8 @@ class BlockParser {
               doc_->string_storage.push_back(std::move(node.raw_content));
               std::string_view stable_content = doc_->string_storage.back();
               node.children = parser.Parse(stable_content);
+            } else if constexpr (std::is_same_v<T, DetailsBlock>) {
+              ParseInlines(node.children, parser);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
               ParseInlines(node.children, parser);
             } else if constexpr (std::is_same_v<T, List>) {
@@ -7451,7 +7481,7 @@ class HtmlRenderer {
     out += "<details><summary>";
     detail::EscapeHtmlTo(block.summary, out);
     out += "</summary>";
-    detail::EscapeHtmlTo(block.content, out);
+    RenderBlockIds(block.children, out, /*in_tight_list=*/false);
     out += "</details>\n";
   }
 
@@ -7998,6 +8028,12 @@ class StreamingBlockParser {
 
   bool empty() const { return pending_.empty(); }
 
+  // The currently held-back tail: the trailing block that may still grow (or a
+  // partial final line). Consumers that want to preview the in-progress block
+  // can parse it with `Parse` and re-render it after every `Feed`; the tail is
+  // not part of the finalised-block stream.
+  const std::string& pending() const { return pending_; }
+
  private:
   // Deliver every block in `pending_` that is guaranteed final, leaving only
   // the trailing (possibly incomplete) top-level block buffered.
@@ -8156,6 +8192,7 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
               result += std::format(
                   "{}DetailsBlock (summary: \"{}\", {})\n", p, n.summary,
                   n.closed ? "closed" : "open");
+              print_block_ids(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
               result += std::format("{}HtmlBlock (type {})\n", p, n.block_type);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {
@@ -8212,6 +8249,7 @@ inline std::pmr::string DebugAst(const Document& doc, int indent = 0) {
               result += std::format(
                   "{}DetailsBlock (summary: \"{}\", {})\n", p, n.summary,
                   n.closed ? "closed" : "open");
+              print_block_ids(n.children, ind + 1);
             } else if constexpr (std::is_same_v<T, HtmlBlock>) {
               result += std::format("{}HtmlBlock (type {})\n", p, n.block_type);
             } else if constexpr (std::is_same_v<T, BlockQuote>) {

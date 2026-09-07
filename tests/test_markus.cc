@@ -781,7 +781,10 @@ TEST(DetailsBlock, ParsesSummaryAndContent) {
   ASSERT_NE(nullptr, d);
   EXPECT_TRUE(d->closed);
   EXPECT_EQ("Analysis", ToStd(d->summary));
-  EXPECT_NE(std::string::npos, ToStd(d->content).find("body line 1\nbody line 2"));
+  // The body is parsed markdown: one paragraph child.
+  ASSERT_EQ(1u, d->children.size());
+  ASSERT_NE(nullptr,
+            std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
 }
 
 TEST(DetailsBlock, NoSummary) {
@@ -790,7 +793,9 @@ TEST(DetailsBlock, NoSummary) {
   ASSERT_NE(nullptr, d);
   EXPECT_TRUE(d->closed);
   EXPECT_EQ("", ToStd(d->summary));
-  EXPECT_EQ("body text", ToStd(d->content));
+  ASSERT_EQ(1u, d->children.size());
+  ASSERT_NE(nullptr,
+            std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
 }
 
 TEST(DetailsBlock, UnclosedAtEofIsOpen) {
@@ -803,6 +808,20 @@ TEST(DetailsBlock, UnclosedAtEofIsOpen) {
   EXPECT_NE(std::string::npos, ToStd(markus::DebugAst(doc)).find("open"));
 }
 
+// A partially streamed opening <details tag (never terminated by '>') must
+// fall back to a plain HTML block instead of recursing into the body parser
+// with the same input, which would never make progress and overflow the
+// stack.
+TEST(DetailsBlock, PartialOpeningTagIsHtmlBlock) {
+  markus::Document doc = markus::Parse("<details");
+  ASSERT_EQ(1u, doc.children.size());
+  EXPECT_NE(nullptr, std::get_if<markus::HtmlBlock>(&doc.children[0]));
+
+  doc = markus::Parse("<details class=x\n<summary");
+  ASSERT_EQ(1u, doc.children.size());
+  EXPECT_NE(nullptr, std::get_if<markus::HtmlBlock>(&doc.children[0]));
+}
+
 TEST(DetailsBlock, BlankLinesDoNotTerminate) {
   // Unlike a plain type-6 HTML block (which ends at a blank line), a
   // <details> section consumes through blank lines until </details>.
@@ -813,7 +832,9 @@ TEST(DetailsBlock, BlankLinesDoNotTerminate) {
   const markus::DetailsBlock* d = GetDetails(doc, 0);
   ASSERT_NE(nullptr, d);
   EXPECT_TRUE(d->closed);
-  EXPECT_NE(std::string::npos, ToStd(d->content).find("body"));
+  ASSERT_EQ(1u, d->children.size());
+  ASSERT_NE(nullptr,
+            std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
   EXPECT_NE(nullptr, std::get_if<markus::Paragraph>(&doc.children[1]));
 }
 
@@ -824,7 +845,9 @@ TEST(DetailsBlock, CaseInsensitiveTags) {
   ASSERT_NE(nullptr, d);
   EXPECT_TRUE(d->closed);
   EXPECT_EQ("x", ToStd(d->summary));
-  EXPECT_EQ("y", ToStd(d->content));
+  ASSERT_EQ(1u, d->children.size());
+  ASSERT_NE(nullptr,
+            std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
 }
 
 TEST(DetailsBlock, RendersHtml) {
@@ -832,7 +855,8 @@ TEST(DetailsBlock, RendersHtml) {
                             "body\n</details>\n";
   const std::string html = Regular(input);
   EXPECT_NE(std::string::npos, html.find("<details><summary>Analysis</summary>"));
-  EXPECT_NE(std::string::npos, html.find("body</details>"));
+  EXPECT_NE(std::string::npos, html.find("<p>body</p>"));
+  EXPECT_NE(std::string::npos, html.find("</details>"));
 }
 
 TEST(DetailsBlock, HtmlIsEscaped) {
@@ -842,6 +866,29 @@ TEST(DetailsBlock, HtmlIsEscaped) {
   // The structured renderer re-escapes its raw text: no live <b> in output.
   EXPECT_EQ(std::string::npos, html.find("<summary><b>"));
   EXPECT_NE(std::string::npos, html.find("&lt;b&gt;"));
+}
+
+TEST(DetailsBlock, BodyIsParsedAsMarkdown) {
+  const std::string input = "<details>\n<summary>s</summary>\n"
+                            "**bold** and `code`\n"
+                            "```\ncode block\n```\n"
+                            "- item\n"
+                            "</details>\n";
+  markus::Document doc = markus::Parse(input);
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  ASSERT_EQ(3u, d->children.size());
+  ASSERT_NE(nullptr,
+            std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
+  ASSERT_NE(nullptr,
+            std::get_if<markus::CodeBlock>(&doc.block_nodes[d->children[1]]));
+  ASSERT_NE(nullptr,
+            std::get_if<markus::List>(&doc.block_nodes[d->children[2]]));
+
+  const std::string html = Regular(input);
+  EXPECT_NE(std::string::npos, html.find("<strong>bold</strong>"));
+  EXPECT_NE(std::string::npos, html.find("<pre><code>code block\n</code></pre>"));
+  EXPECT_NE(std::string::npos, html.find("<li>item</li>"));
 }
 
 // A <details> tag that is not a line-leading type-6 open tag does not start
@@ -1076,6 +1123,24 @@ TEST(StreamingBlockParser, DetailsHeldBackUntilClosed) {
   }
   EXPECT_EQ(1u, flush_blocks);
   EXPECT_EQ(Regular(open), flush_out);
+}
+
+// Streaming a <details> section byte by byte means the held-back tail is
+// repeatedly an opening tag without its terminating '>' (e.g. "<details").
+// That must not recurse into the details body parser forever.
+TEST(StreamingBlockParser, DetailsStreamedByteByByte) {
+  const std::string input = "<details>\n<summary>s</summary>\nbody\n"
+                            "</details>\n";
+  markus::StreamingBlockParser parser;
+  std::string running;
+  parser.setBlockCallback([&](const markus::Document& doc, size_t first,
+                              size_t last) {
+    running += RenderRange(doc, first, last);
+  });
+  for (char c : input)
+    parser.Feed(std::string(1, c));
+  parser.Flush();
+  EXPECT_EQ(Regular(input), running);
 }
 
 // A link reference defined in an earlier chunk resolves in a later one.

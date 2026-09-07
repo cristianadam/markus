@@ -23,7 +23,7 @@ _Vibe coded with Claude Opus 4.5 and Opencode (qwen 3.6 35b)_
 - **Full Unicode Support**: UTF-8 encoding/decoding, case folding, punctuation detection
 - **AST Access**: Parse to an Abstract Syntax Tree for inspection or custom rendering
 - **Streaming**: Feed Markdown in chunks as it arrives and emit finished blocks incrementally — as HTML (`StreamingMarkdownParser`) or as AST block ranges (`StreamingBlockParser`) for custom renderers
-- **GitHub `<details>` Sections**: Line-leading `<details>` blocks parse into a structured `DetailsBlock` (summary + content)
+- **GitHub `<details>` Sections**: Line-leading `<details>` blocks parse into a structured `DetailsBlock` (summary + parsed markdown body blocks)
 - **Google Style**: Clean, readable codebase following Google C++ Style Guide
 
 ## Quick Start
@@ -106,9 +106,10 @@ Available extensions:
 GitHub-style collapsible `<details>` sections are always recognized (no
 option): a type-6 HTML block whose line starts with a `<details>` tag parses
 into a structured `DetailsBlock` carrying the optional `<summary>` text and
-the raw (unparsed) section content. Unlike other type-6 HTML blocks, blank
-lines do not terminate the section; it ends at the line beginning with the
-closing `</details>` tag or at end of input (where `closed` is `false`).
+the section body parsed as regular markdown blocks (`children`). Unlike other
+type-6 HTML blocks, blank lines do not terminate the section; it ends at the
+line beginning with the closing `</details>` tag or at end of input (where
+`closed` is `false`).
 
 ### Streaming
 
@@ -214,7 +215,7 @@ exceeding it throws `std::length_error`.
 | `Heading` | ATX heading (levels 1-6) |
 | `ThematicBreak` | Horizontal rule (`---`, `***`, `___`) |
 | `CodeBlock` | Fenced or indented code block (`fence_char` is `` '`' ``/`'~'` when fenced, `0` when indented) |
-| `DetailsBlock` | GitHub-style collapsible `<details>` section (`summary`, raw `content`, `closed`) |
+| `DetailsBlock` | GitHub-style collapsible `<details>` section (`summary`, parsed markdown `children`, `closed`) |
 | `HtmlBlock` | Raw HTML block |
 | `BlockQuote` | Block quotation |
 | `List` | Ordered or unordered list |

@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Windows: trim rarely-used Windows headers and drop the min/max macros before
+# <windows.h> is included (gtest and our tests pull it in); the min/max macros
+# otherwise expand std::min/std::max and break the build under MSVC.
+if(WIN32)
+  add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
 # Opt-in GFM feature tests (cmark-gfm GFM spec vs markus). Off by default so the
 # standard CommonMark run stays green; enable to track GFM feature progress.
 option(MARKUS_BUILD_GFM_TESTS "Build the opt-in cmark-gfm GFM feature tests" OFF)

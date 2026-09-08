@@ -780,7 +780,10 @@ TEST(DetailsBlock, ParsesSummaryAndContent) {
   const markus::DetailsBlock* d = GetDetails(doc, 0);
   ASSERT_NE(nullptr, d);
   EXPECT_TRUE(d->closed);
-  EXPECT_EQ("Analysis", ToStd(d->summary));
+  // The summary is parsed markdown: one paragraph.
+  ASSERT_EQ(1u, d->summary.size());
+  ASSERT_NE(nullptr,
+            std::get_if<markus::Paragraph>(&doc.block_nodes[d->summary[0]]));
   // The body is parsed markdown: one paragraph child.
   ASSERT_EQ(1u, d->children.size());
   ASSERT_NE(nullptr,
@@ -792,7 +795,7 @@ TEST(DetailsBlock, NoSummary) {
   const markus::DetailsBlock* d = GetDetails(doc, 0);
   ASSERT_NE(nullptr, d);
   EXPECT_TRUE(d->closed);
-  EXPECT_EQ("", ToStd(d->summary));
+  EXPECT_TRUE(d->summary.empty());
   ASSERT_EQ(1u, d->children.size());
   ASSERT_NE(nullptr,
             std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
@@ -844,7 +847,9 @@ TEST(DetailsBlock, CaseInsensitiveTags) {
   const markus::DetailsBlock* d = GetDetails(doc, 0);
   ASSERT_NE(nullptr, d);
   EXPECT_TRUE(d->closed);
-  EXPECT_EQ("x", ToStd(d->summary));
+  ASSERT_EQ(1u, d->summary.size());
+  ASSERT_NE(nullptr,
+            std::get_if<markus::Paragraph>(&doc.block_nodes[d->summary[0]]));
   ASSERT_EQ(1u, d->children.size());
   ASSERT_NE(nullptr,
             std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
@@ -854,18 +859,51 @@ TEST(DetailsBlock, RendersHtml) {
   const std::string input = "<details>\n<summary>Analysis</summary>\n"
                             "body\n</details>\n";
   const std::string html = Regular(input);
-  EXPECT_NE(std::string::npos, html.find("<details><summary>Analysis</summary>"));
+  // The summary is parsed markdown, so it renders as a block inside <summary>.
+  EXPECT_NE(std::string::npos, html.find("<details><summary>"));
+  EXPECT_NE(std::string::npos, html.find("<summary><p>Analysis</p>\n</summary>"));
   EXPECT_NE(std::string::npos, html.find("<p>body</p>"));
   EXPECT_NE(std::string::npos, html.find("</details>"));
 }
 
-TEST(DetailsBlock, HtmlIsEscaped) {
+TEST(DetailsBlock, SummaryIsMarkdown) {
+  // The <summary> content is parsed as markdown (like the body), so inline
+  // markup renders and entities round-trip, instead of being escaped as text.
   const std::string input =
-      "<details><summary><b>bold</b></summary>&lt;tag&gt;</details>\n";
+      "<details><summary>**bold** and `code`</summary>&lt;tag&gt;</details>\n";
   const std::string html = Regular(input);
-  // The structured renderer re-escapes its raw text: no live <b> in output.
-  EXPECT_EQ(std::string::npos, html.find("<summary><b>"));
-  EXPECT_NE(std::string::npos, html.find("&lt;b&gt;"));
+  EXPECT_NE(std::string::npos, html.find("<summary>"));
+  EXPECT_NE(std::string::npos, html.find("<strong>bold</strong>"));
+  EXPECT_NE(std::string::npos, html.find("<code>code</code>"));
+  // The body entity decodes to text and re-escapes on render.
+  EXPECT_NE(std::string::npos, html.find("<p>&lt;tag&gt;</p>"));
+}
+
+TEST(DetailsBlock, MarkdownHeadingInSummary) {
+  const std::string input = "<details>\n<summary>\n"
+                            "\n#### Markdown *in* `summary`\n\n"
+                            "</summary>\n\nHi.\n\n</details>\n";
+  markus::Document doc = markus::Parse(input);
+  ASSERT_EQ(1u, doc.children.size());
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  EXPECT_TRUE(d->closed);
+  // The summary holds a level-4 heading (with inline emphasis + code); the
+  // body holds a single paragraph.
+  ASSERT_EQ(1u, d->summary.size());
+  const auto* heading =
+      std::get_if<markus::Heading>(&doc.block_nodes[d->summary[0]]);
+  ASSERT_NE(nullptr, heading);
+  EXPECT_EQ(4, heading->level);
+  ASSERT_EQ(1u, d->children.size());
+  ASSERT_NE(nullptr,
+            std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
+
+  const std::string html = Regular(input);
+  EXPECT_NE(std::string::npos, html.find("<h4>"));
+  EXPECT_NE(std::string::npos, html.find("<em>in</em>"));
+  EXPECT_NE(std::string::npos, html.find("<code>summary</code>"));
+  EXPECT_NE(std::string::npos, html.find("<p>Hi.</p>"));
 }
 
 TEST(DetailsBlock, BodyIsParsedAsMarkdown) {

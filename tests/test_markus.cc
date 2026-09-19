@@ -855,6 +855,43 @@ TEST(DetailsBlock, CaseInsensitiveTags) {
             std::get_if<markus::Paragraph>(&doc.block_nodes[d->children[0]]));
 }
 
+TEST(DetailsBlock, KeepsOpeningTagAttributes) {
+  const std::string input = "<details data-tool=\"true\" class='toolcall' open>\n"
+                            "<summary>s</summary>\nbody\n</details>\n";
+  markus::Document doc = markus::Parse(input);
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  ASSERT_EQ(3u, d->attributes.size());
+  EXPECT_EQ("data-tool", ToStd(d->attributes[0].first));
+  EXPECT_EQ("true", ToStd(d->attributes[0].second));
+  EXPECT_EQ("class", ToStd(d->attributes[1].first));
+  EXPECT_EQ("toolcall", ToStd(d->attributes[1].second));
+  // Boolean attribute: present, with an empty value.
+  EXPECT_EQ("open", ToStd(d->attributes[2].first));
+  EXPECT_TRUE(d->attributes[2].second.empty());
+}
+
+TEST(DetailsBlock, AttributesWithoutAttributesAreEmpty) {
+  markus::Document doc = markus::Parse("<details><summary>s</summary>b</details>\n");
+  const markus::DetailsBlock* d = GetDetails(doc, 0);
+  ASSERT_NE(nullptr, d);
+  EXPECT_TRUE(d->attributes.empty());
+}
+
+TEST(DetailsBlock, RendersHtmlWithAttributes) {
+  const std::string input = "<details data-tool=\"true\">\n<summary>s</summary>\n"
+                            "body\n</details>\n";
+  const std::string html = Regular(input);
+  EXPECT_NE(std::string::npos, html.find("<details data-tool=\"true\"><summary>"));
+  // Attributes survive a round trip through the parser.
+  markus::Document reparsed = markus::Parse(html);
+  const markus::DetailsBlock* d = GetDetails(reparsed, 0);
+  ASSERT_NE(nullptr, d);
+  ASSERT_EQ(1u, d->attributes.size());
+  EXPECT_EQ("data-tool", ToStd(d->attributes[0].first));
+  EXPECT_EQ("true", ToStd(d->attributes[0].second));
+}
+
 TEST(DetailsBlock, RendersHtml) {
   const std::string input = "<details>\n<summary>Analysis</summary>\n"
                             "body\n</details>\n";

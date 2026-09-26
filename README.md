@@ -426,11 +426,11 @@ Benchmarks compare Markus against [cmark-gfm](https://github.com/github/cmark-gf
 
 | Platform | Markus vs cmark-gfm | Markus vs md4c |
 |----------|---------------------|----------------|
-| Ubuntu (Linux) | 1.25x slower | 2.19x slower |
-| Windows | 1.16x slower | 2.52x slower |
-| macOS (Apple M1) | 1.06x faster | 2.10x slower |
+| Ubuntu (Linux) | 1.30x faster | 1.41x slower |
+| Windows | 1.45x faster | 1.48x slower |
+| macOS (Apple M1) | 1.61x faster | 1.36x slower |
 
-**Average: ~1.12x vs cmark-gfm, ~2.27x slower than md4c.**
+**Average: ~1.44x faster than cmark-gfm, ~1.42x slower than md4c.**
 
 #### GFM Extensions
 
@@ -438,14 +438,22 @@ Each extension benchmark runs the corresponding parser with that extension enabl
 
 | Extension | Markus vs cmark-gfm | Markus vs md4c |
 |-----------|---------------------|----------------|
-| Autolink | 1.11x slower | 2.49x slower |
-| Strikethrough | 1.05x faster | 3.65x slower |
-| Task list | 1.25x slower | 4.42x slower |
-| Tag filter | 1.23x slower | 3.77x slower |
+| Autolink | 2.22x faster | 1.01x slower |
+| Strikethrough | 2.29x faster | 1.70x slower |
+| Task list | 1.49x faster | 2.15x slower |
+| Tag filter | 1.34x faster | 2.27x slower |
 
-**Average: ~1.14x vs cmark-gfm, ~3.58x slower than md4c.**
+**Average: ~1.74x faster than cmark-gfm, ~1.78x slower than md4c.**
 
-The gap is most pronounced on nested block structures (block quotes, lists) and the GFM extension paths, where recursive descent parsing carries more overhead than cmark-gfm's optimized C implementation and md4c's lean table-driven core. Markus remains competitive with cmark-gfm overall and is faster than it on macOS.
+#### LaTeX Math
+
+md4c runs with `MD_FLAG_LATEXMATHSPANS`; cmark-gfm has no math extension, so it parses the same input in plain mode. Values are averaged across Ubuntu, Windows, and macOS.
+
+| Extension | Markus vs cmark-gfm | Markus vs md4c |
+|-----------|---------------------|----------------|
+| LaTeX math | 2.01x faster | 2.14x slower |
+
+Markus is now faster than cmark-gfm on every platform and in every extension benchmark except tag filter on Windows (1.04x slower). The remaining gap to md4c is most pronounced on nested block structures (nested block quotes and lists) and the task list / tag filter paths, where recursive descent parsing carries more overhead than md4c's lean table-driven core.
 
 ## Unicode Support
 

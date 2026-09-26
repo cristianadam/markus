@@ -33,6 +33,10 @@ namespace markus {
 // (std::pmr::get_default_resource(), i.e. new/delete). Every allocation is
 // owned by the Document (or the returned std::pmr::string) and is freed when
 // that object is destroyed - memory does not accumulate across Parse() calls.
+// The one exception is transient parse state (container contents re-parsed by
+// nested parsers, their line tables, paragraph text awaiting inline parsing):
+// Parse() bump-allocates it from a std::pmr::monotonic_buffer_resource that is
+// released before Parse() returns; nothing in the Document refers to it.
 //
 // A Document is self-contained: every string_view it exposes (Text and
 // HtmlInline nodes, decoded entities) refers to storage owned by the Document
@@ -487,7 +491,10 @@ struct Document {
   // Using deque to avoid reference invalidation on growth
   std::deque<std::pmr::string> string_storage;
 
-  // Node pools for compact storage - nodes are referenced by ID (index)
+  // Node pools for compact storage - nodes are referenced by ID (index).
+  // inline_nodes may also hold a few unreferenced slots (nodes dropped while
+  // resolving emphasis, links and math); walk the tree from the block nodes
+  // rather than iterating the pool.
   std::pmr::vector<InlineNode> inline_nodes;
   std::pmr::vector<BlockNode> block_nodes;
 
@@ -555,65 +562,35 @@ inline constexpr auto kEscapeLens = MakeEscapeLens();
 // =============================================================================
 
 // Writes escaped HTML directly to output buffer - eliminates temp string
-// allocation. Uses uint64_t loads for 8-wide scanning.
+// allocation. Scans 8 bytes at a time with a SWAR test for the four special
+// characters ('&', '<', '>', '"'), then locates the exact byte with a short
+// loop (endian-independent).
 inline void EscapeHtmlTo(std::string_view text, std::pmr::string& out) {
   const size_t len = text.size();
   if (len == 0) return;
   const char* data = text.data();
+  constexpr uint64_t kOnes = 0x0101010101010101ULL;
+  constexpr uint64_t kHighs = 0x8080808080808080ULL;
+  auto has_byte = [](uint64_t word, char c) {
+    uint64_t v = word ^ (kOnes * static_cast<unsigned char>(c));
+    return (v - kOnes) & ~v & kHighs;
+  };
   size_t i = 0;
 
   while (i < len) {
     size_t start = i;
-    // Find next special char using 8-wide uint64_t scan
+    // Skip whole 8-byte words that contain no special character
     while (i + 8 <= len) {
-      uint64_t chunk;
-      std::memcpy(&chunk, data + i, 8);
-      // Build a bitmask of which bytes are special
-      uint64_t mask = 0;
-      if (kEscapeTableV2[chunk & 0xFF]) mask |= 1;
-      if (kEscapeTableV2[(chunk >> 8) & 0xFF]) mask |= 2;
-      if (kEscapeTableV2[(chunk >> 16) & 0xFF]) mask |= 4;
-      if (kEscapeTableV2[(chunk >> 24) & 0xFF]) mask |= 8;
-      if (kEscapeTableV2[(chunk >> 32) & 0xFF]) mask |= 16;
-      if (kEscapeTableV2[(chunk >> 40) & 0xFF]) mask |= 32;
-      if (kEscapeTableV2[(chunk >> 48) & 0xFF]) mask |= 64;
-      if (kEscapeTableV2[(chunk >> 56) & 0xFF]) mask |= 128;
-      if (mask == 0) {
-        i += 8;
-        continue;
-      }
-      // Find which byte in this group is special
-      if (mask & 1) break;
-      if (mask & 2) {
-        i += 1;
+      uint64_t word;
+      std::memcpy(&word, data + i, sizeof(word));
+      if (has_byte(word, '&') | has_byte(word, '<') | has_byte(word, '>') |
+          has_byte(word, '"')) {
         break;
       }
-      if (mask & 4) {
-        i += 2;
-        break;
-      }
-      if (mask & 8) {
-        i += 3;
-        break;
-      }
-      if (mask & 16) {
-        i += 4;
-        break;
-      }
-      if (mask & 32) {
-        i += 5;
-        break;
-      }
-      if (mask & 64) {
-        i += 6;
-        break;
-      }
-      i += 7;
-      break;
+      i += 8;
     }
-    // Scalar fallback for remaining < 8 bytes
-    while (i < len) {
-      if (kEscapeTableV2[static_cast<unsigned char>(data[i])]) break;
+    // Locate the special character (within the flagged word, or in the tail)
+    while (i < len && !kEscapeTableV2[static_cast<unsigned char>(data[i])]) {
       ++i;
     }
 
@@ -1501,36 +1478,39 @@ inline uint32_t UnicodeCaseFold(uint32_t cp) {
 // Normalize a link label (case-fold and collapse whitespace)
 // Uses Unicode-aware case folding for CommonMark compliance
 // C++20: optimized with fast path for ASCII-only labels using ranges::any_of
-inline std::pmr::string NormalizeLinkLabel(std::string_view label) {
+// Writes the normalized label into `result` (replacing its contents), so
+// callers can reuse one buffer across lookups.
+inline void NormalizeLinkLabelInto(std::string_view label,
+                                   std::pmr::string& result) {
   // Fast path: check if label is ASCII-only (common case) using ranges::any_of
   bool all_ascii =
       !std::ranges::any_of(label, [](unsigned char c) { return c >= 0x80; });
 
-  std::pmr::string result;
-  result.reserve(label.size());
+  result.clear();
 
   if (all_ascii) {
-    // Fast ASCII-only path: simple lowercase + whitespace collapse
+    // Fast ASCII-only path: simple lowercase + whitespace collapse, written
+    // straight into a buffer sized for the worst case (no collapsing).
+    result.resize(label.size());
+    char* out = result.data();
+    size_t n = 0;
     bool in_whitespace = false;
     bool first = true;
     for (char c : label) {
       if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
         if (!first && !in_whitespace) {
-          result += ' ';
+          out[n++] = ' ';
           in_whitespace = true;
         }
       } else {
-        // ASCII lowercase: 'A'-'Z' (0x41-0x5A) -> 'a'-'z' (0x61-0x7A)
-        if (c >= 'A' && c <= 'Z') {
-          result += static_cast<char>(c + 32);
-        } else {
-          result += c;
-        }
+        out[n++] = static_cast<char>(CaseFold(static_cast<uint8_t>(c)));
         in_whitespace = false;
         first = false;
       }
     }
+    result.resize(n);
   } else {
+    result.reserve(label.size());
     // Slow path: full Unicode handling
     bool in_whitespace = false;
     bool first = true;
@@ -1576,7 +1556,29 @@ inline std::pmr::string NormalizeLinkLabel(std::string_view label) {
   if (!result.empty() && result.back() == ' ') {
     result.pop_back();
   }
+}
 
+// True when NormalizeLinkLabel(label) == label, i.e. the label is ASCII with
+// no uppercase letters, no whitespace other than single interior spaces.
+// Lets lookups use the label as-is (the common case) without copying it.
+inline bool IsNormalizedLinkLabel(std::string_view label) {
+  if (label.empty()) return true;
+  if (label.front() == ' ' || label.back() == ' ') return false;
+  char prev = 0;
+  for (char c : label) {
+    unsigned char u = static_cast<unsigned char>(c);
+    if (u >= 0x80 || (u >= 'A' && u <= 'Z') || c == '\t' || c == '\n' ||
+        c == '\r' || c == '\f' || (c == ' ' && prev == ' ')) {
+      return false;
+    }
+    prev = c;
+  }
+  return true;
+}
+
+inline std::pmr::string NormalizeLinkLabel(std::string_view label) {
+  std::pmr::string result;
+  NormalizeLinkLabelInto(label, result);
   return result;
 }
 
@@ -1625,8 +1627,8 @@ inline bool StartsWithInsensitive(std::string_view str,
                                   std::string_view prefix) {
   if (str.size() < prefix.size()) return false;
   for (size_t i = 0; i < prefix.size(); ++i) {
-    if (std::tolower(static_cast<unsigned char>(str[i])) !=
-        std::tolower(static_cast<unsigned char>(prefix[i]))) {
+    if (detail::CaseFold(static_cast<unsigned char>(str[i])) !=
+        detail::CaseFold(static_cast<unsigned char>(prefix[i]))) {
       return false;
     }
   }
@@ -1638,18 +1640,18 @@ inline bool StringContainsInsensitive(std::string_view str,
                                       std::string_view substr) {
   if (substr.empty() || str.size() < substr.size()) return false;
   // Fast path: find first character of substr in str
-  char first =
-      static_cast<char>(std::tolower(static_cast<unsigned char>(substr[0])));
+  char first = static_cast<char>(
+      detail::CaseFold(static_cast<unsigned char>(substr[0])));
   for (size_t i = 0; i <= str.size() - substr.size(); ++i) {
-    if (static_cast<char>(std::tolower(static_cast<unsigned char>(str[i]))) !=
-        first)
+    if (static_cast<char>(
+            detail::CaseFold(static_cast<unsigned char>(str[i]))) != first)
       continue;
     bool match = true;
     for (size_t j = 1; j < substr.size(); ++j) {
       if (static_cast<char>(
-              std::tolower(static_cast<unsigned char>(str[i + j]))) !=
+              detail::CaseFold(static_cast<unsigned char>(str[i + j]))) !=
           static_cast<char>(
-              std::tolower(static_cast<unsigned char>(substr[j])))) {
+              detail::CaseFold(static_cast<unsigned char>(substr[j])))) {
         match = false;
         break;
       }
@@ -2355,10 +2357,10 @@ inline bool IsTableRowLine(std::string_view line) {
   // List item
   if (t.starts_with("- ") || t.starts_with("+ ") || t.starts_with("* "))
     return false;
-  if (std::isdigit(static_cast<unsigned char>(t[0]))) {
+  if (detail::IsDigit(static_cast<unsigned char>(t[0]))) {
     size_t num_end = 0;
     while (num_end < t.size() &&
-           std::isdigit(static_cast<unsigned char>(t[num_end])))
+           detail::IsDigit(static_cast<unsigned char>(t[num_end])))
       ++num_end;
     if (num_end + 1 < t.size() && (t[num_end] == '.' || t[num_end] == ')') &&
         (t[num_end + 1] == ' ' || t[num_end + 1] == '\t')) {
@@ -2418,7 +2420,7 @@ inline bool IsTableRowLine(std::string_view line) {
     size_t tag_start = is_closing ? 2 : 1;
     size_t tag_end = tag_start;
     while (tag_end < t.size() &&
-           (std::isalnum(static_cast<unsigned char>(t[tag_end])) ||
+           (detail::IsAlnum(static_cast<unsigned char>(t[tag_end])) ||
             t[tag_end] == '-')) {
       ++tag_end;
     }
@@ -2449,8 +2451,9 @@ inline constexpr auto MakeInlineSpecialTable() {
   // Characters that trigger special inline parsing logic:
   // backslash (escape), ampersand (entity), backtick (code span),
   // less-than (autolink/HTML), asterisk/underscore (emphasis),
-  // brackets (links), exclamation (image), space (hard break),
-  // newline (soft break)
+  // brackets (links), exclamation (image), newline (soft/hard break).
+  // Space is deliberately not special (it would stop the scan at every
+  // word); a hard break's trailing spaces are found from the newline.
   table['\\'] = 1;  // Escape character
   table['&'] = 1;   // Entity reference
   table['`'] = 1;   // Code span
@@ -2462,7 +2465,6 @@ inline constexpr auto MakeInlineSpecialTable() {
   table['['] = 1;   // Link open
   table[']'] = 1;   // Link close
   table['!'] = 1;   // Image prefix
-  table[' '] = 1;   // Hard break (2+ spaces before newline)
   table['\n'] = 1;  // Soft break
   return table;
 }
@@ -2520,99 +2522,68 @@ class LineBuffer {
  public:
   LineBuffer() = default;
 
+  // Empty buffer whose storage comes from `resource`.
+  explicit LineBuffer(std::pmr::memory_resource* resource)
+      : line_offsets_(resource), buffer_(resource) {}
+
   explicit LineBuffer(std::string_view input, bool no_nulls = false) {
+    Reset(input, no_nulls);
+  }
+
+  // Not copyable. Moves re-point data_ptr_ when it refers to buffer_, whose
+  // characters may live in the object itself (SSO) and so move with it.
+  LineBuffer(const LineBuffer&) = delete;
+  LineBuffer& operator=(const LineBuffer&) = delete;
+  LineBuffer(LineBuffer&& other) { *this = std::move(other); }
+  LineBuffer& operator=(LineBuffer&& other) {
+    if (this != &other) {
+      bool owns = other.data_ptr_ != nullptr &&
+                  other.data_ptr_ == other.buffer_.data();
+      line_offsets_ = std::move(other.line_offsets_);
+      buffer_ = std::move(other.buffer_);
+      data_ptr_ = owns ? buffer_.data() : other.data_ptr_;
+      other.data_ptr_ = nullptr;
+    }
+    return *this;
+  }
+
+  // Split `input` into lines, replacing any previous contents.
+  void Reset(std::string_view input, bool no_nulls = false) {
+    line_offsets_.clear();
+    buffer_.clear();
+    data_ptr_ = nullptr;
     if (input.empty()) [[unlikely]] {
       return;
     }
 
-    if (no_nulls) [[unlikely]] {
-      // Fast path for content we built ourselves (guaranteed null-free, e.g.
-      // nested blockquote/list buffers). Build the offsets in a single pass,
-      // skipping the separate null-detection / line-count pass.
-      data_ptr_ = input.data();
-      line_offsets_.reserve(16);
-      size_t line_start = 0;
-      for (size_t i = 0; i < input.size(); ++i) {
-        char c = input[i];
-        if (c == '\n') {
-          line_offsets_.emplace_back(line_start, i - line_start);
-          line_start = i + 1;
-        } else if (c == '\r') {
-          line_offsets_.emplace_back(line_start, i - line_start);
-          if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
-          line_start = i + 1;
+    // Single pass: split on line terminators, scanning 8 bytes at a time.
+    // A NUL (which must be replaced) sends us to the copying slow path;
+    // `no_nulls` marks content we built ourselves (guaranteed NUL-free, e.g.
+    // nested blockquote/list buffers), for which NULs need no handling.
+    const char* data = input.data();
+    const size_t len = input.size();
+    line_offsets_.reserve(len / 32 + 4);
+    size_t line_start = 0;
+    size_t i = 0;
+    while ((i = FindLineBreakOrNul(data, i, len)) < len) {
+      char c = data[i];
+      if (c == '\0') [[unlikely]] {
+        if (!no_nulls) {
+          BuildReplacingNulls(input);
+          return;
         }
+        ++i;
+        continue;
       }
-      if (input.size() > line_start ||
-          (input.back() == '\n' || input.back() == '\r')) {
-        line_offsets_.emplace_back(line_start, input.size() - line_start);
-      }
-      return;
+      line_offsets_.emplace_back(line_start, i - line_start);
+      if (c == '\r' && i + 1 < len && data[i + 1] == '\n') ++i;
+      line_start = ++i;
     }
-
-    // First pass: check for nulls and count lines
-    bool has_nulls = false;
-    size_t line_count = 1;
-    for (size_t i = 0; i < input.size(); ++i) {
-      if (input[i] == '\0') has_nulls = true;
-      if (input[i] == '\n')
-        ++line_count;
-      else if (input[i] == '\r') {
-        ++line_count;
-        if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
-      }
+    // Add final line
+    if (len > line_start || (input.back() == '\n' || input.back() == '\r')) {
+      line_offsets_.emplace_back(line_start, len - line_start);
     }
-
-    // Reserve space for line offsets (cache-friendly contiguous array)
-    line_offsets_.reserve(line_count + 1);
-
-    if (has_nulls) [[unlikely]] {
-      // Slow path: copy and replace nulls
-      buffer_.reserve(input.size() +
-                      line_count);  // Extra for replacement chars
-      size_t line_start = 0;
-      for (size_t i = 0; i < input.size(); ++i) {
-        char c = input[i];
-        if (c == '\n') {
-          line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
-          line_start = buffer_.size();
-        } else if (c == '\r') {
-          line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
-          if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
-          line_start = buffer_.size();
-        } else if (c == '\0') {
-          buffer_ += "\xEF\xBF\xBD";  // UTF-8 replacement character
-        } else {
-          buffer_ += c;
-        }
-      }
-      // Add final line
-      if (buffer_.size() > line_start ||
-          (input.back() == '\n' || input.back() == '\r')) {
-        line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
-      }
-      data_ptr_ = buffer_.data();
-    } else {
-      // Fast path: just store offsets into original input (zero-copy)
-      data_ptr_ = input.data();
-      size_t line_start = 0;
-      for (size_t i = 0; i < input.size(); ++i) {
-        char c = input[i];
-        if (c == '\n') {
-          line_offsets_.emplace_back(line_start, i - line_start);
-          line_start = i + 1;
-        } else if (c == '\r') {
-          line_offsets_.emplace_back(line_start, i - line_start);
-          if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
-          line_start = i + 1;
-        }
-      }
-      // Add final line
-      if (input.size() > line_start ||
-          (input.back() == '\n' || input.back() == '\r')) {
-        line_offsets_.emplace_back(line_start, input.size() - line_start);
-      }
-    }
+    data_ptr_ = data;
   }
 
   size_t size() const { return line_offsets_.size(); }
@@ -2627,6 +2598,56 @@ class LineBuffer {
   size_t OffsetOf(size_t idx) const { return line_offsets_[idx].offset; }
 
  private:
+  // Index of the first '\n', '\r' or NUL in data[i, len), or len. Checks a
+  // word at a time with the classic SWAR "has zero byte" test, falling back
+  // to a byte loop to locate the exact match (endian-independent).
+  static size_t FindLineBreakOrNul(const char* data, size_t i, size_t len) {
+    constexpr uint64_t kOnes = 0x0101010101010101ULL;
+    constexpr uint64_t kHighs = 0x8080808080808080ULL;
+    auto has_zero = [](uint64_t v) { return (v - kOnes) & ~v & kHighs; };
+    for (; i + 8 <= len; i += 8) {
+      uint64_t word;
+      std::memcpy(&word, data + i, sizeof(word));
+      if (has_zero(word) | has_zero(word ^ (kOnes * '\n')) |
+          has_zero(word ^ (kOnes * '\r'))) {
+        break;
+      }
+    }
+    for (; i < len; ++i) {
+      char c = data[i];
+      if (c == '\n' || c == '\r' || c == '\0') return i;
+    }
+    return len;
+  }
+
+  // Slow path: copy the input, replacing each NUL with U+FFFD.
+  void BuildReplacingNulls(std::string_view input) {
+    line_offsets_.clear();
+    buffer_.reserve(input.size() + 16);
+    size_t line_start = 0;
+    for (size_t i = 0; i < input.size(); ++i) {
+      char c = input[i];
+      if (c == '\n') {
+        line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
+        line_start = buffer_.size();
+      } else if (c == '\r') {
+        line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
+        if (i + 1 < input.size() && input[i + 1] == '\n') ++i;
+        line_start = buffer_.size();
+      } else if (c == '\0') {
+        buffer_ += "\xEF\xBF\xBD";  // UTF-8 replacement character
+      } else {
+        buffer_ += c;
+      }
+    }
+    // Add final line
+    if (buffer_.size() > line_start ||
+        (input.back() == '\n' || input.back() == '\r')) {
+      line_offsets_.emplace_back(line_start, buffer_.size() - line_start);
+    }
+    data_ptr_ = buffer_.data();
+  }
+
   struct LineOffset {
     size_t offset;
     size_t length;
@@ -2808,12 +2829,12 @@ inline std::pmr::string DecodeEscapesAndEntities(std::string_view text) {
         size_t num_end = num_start;
         if (is_hex) {
           while (num_end < text.size() &&
-                 std::isxdigit(static_cast<unsigned char>(text[num_end]))) {
+                 detail::IsXDigit(static_cast<unsigned char>(text[num_end]))) {
             ++num_end;
           }
         } else {
           while (num_end < text.size() &&
-                 std::isdigit(static_cast<unsigned char>(text[num_end]))) {
+                 detail::IsDigit(static_cast<unsigned char>(text[num_end]))) {
             ++num_end;
           }
         }
@@ -2832,7 +2853,7 @@ inline std::pmr::string DecodeEscapesAndEntities(std::string_view text) {
         // Named entity
         size_t name_end = start;
         while (name_end < text.size() &&
-               std::isalnum(static_cast<unsigned char>(text[name_end]))) {
+               detail::IsAlnum(static_cast<unsigned char>(text[name_end]))) {
           ++name_end;
         }
 
@@ -3002,7 +3023,7 @@ inline std::pair<int, std::string_view> ClassifyHtmlBlock(
 
     size_t tag_end = tag_start;
     while (tag_end < trimmed.size() &&
-           (std::isalnum(static_cast<unsigned char>(trimmed[tag_end])) ||
+           (detail::IsAlnum(static_cast<unsigned char>(trimmed[tag_end])) ||
             trimmed[tag_end] == '-')) {
       ++tag_end;
     }
@@ -3034,10 +3055,10 @@ inline std::pair<int, std::string_view> ClassifyHtmlBlock(
     size_t tag_start = is_closing ? 2 : 1;
 
     if (tag_start < trimmed.size() &&
-        std::isalpha(static_cast<unsigned char>(trimmed[tag_start]))) {
+        detail::IsAlpha(static_cast<unsigned char>(trimmed[tag_start]))) {
       size_t tag_end = tag_start + 1;
       while (tag_end < trimmed.size() &&
-             (std::isalnum(static_cast<unsigned char>(trimmed[tag_end])) ||
+             (detail::IsAlnum(static_cast<unsigned char>(trimmed[tag_end])) ||
               trimmed[tag_end] == '-')) {
         ++tag_end;
       }
@@ -3086,13 +3107,15 @@ inline std::pair<int, std::string_view> ClassifyHtmlBlock(
               ++search_pos;
               need_whitespace = false;
             } else if (!need_whitespace &&
-                       (std::isalpha(static_cast<unsigned char>(c)) || c == '_' ||
-                        c == ':')) {
+                       (detail::IsAlpha(static_cast<unsigned char>(c)) ||
+                        c == '_' || c == ':')) {
               ++search_pos;
-              while (search_pos < trimmed.size() &&
-                     (std::isalnum(static_cast<unsigned char>(trimmed[search_pos])) ||
-                      trimmed[search_pos] == '_' || trimmed[search_pos] == ':' ||
-                      trimmed[search_pos] == '.' || trimmed[search_pos] == '-')) {
+              while (
+                  search_pos < trimmed.size() &&
+                  (detail::IsAlnum(
+                       static_cast<unsigned char>(trimmed[search_pos])) ||
+                   trimmed[search_pos] == '_' || trimmed[search_pos] == ':' ||
+                   trimmed[search_pos] == '.' || trimmed[search_pos] == '-')) {
                 ++search_pos;
               }
               while (search_pos < trimmed.size() &&
@@ -3192,6 +3215,25 @@ class InlineParser {
     return ParseInlines();
   }
 
+  // Copy `s` into Document-owned storage and return a stable view of it.
+  // Strings are packed into chunks (each one a string_storage entry that is
+  // never appended past its reserved capacity, so it never reallocates and
+  // earlier views stay valid) instead of one string_storage entry apiece.
+  std::string_view StoreString(std::string_view s) {
+    if (!chunk_ || chunk_->capacity() - chunk_->size() < s.size()) {
+      ReserveStorage(s.size() > kMinStorageChunk ? s.size() : kMinStorageChunk);
+    }
+    size_t offset = chunk_->size();
+    chunk_->append(s);
+    return std::string_view(chunk_->data() + offset, s.size());
+  }
+
+  // Start a new storage chunk able to hold at least `n` bytes.
+  void ReserveStorage(size_t n) {
+    string_storage_->emplace_back().reserve(n);
+    chunk_ = &string_storage_->back();
+  }
+
   // GFM `autolink` extension. When true, www/url/email autolinks are recognised
   // in plain text (in addition to the CommonMark `<...>` autolinks, which are
   // always recognised). Off by default for plain CommonMark behaviour.
@@ -3213,6 +3255,8 @@ class InlineParser {
   size_t pos_ = 0;
   const LinkRefMap* link_references_ = nullptr;
   std::deque<std::pmr::string>* string_storage_ = nullptr;
+  std::pmr::string* chunk_ = nullptr;  // Current StoreString() chunk
+  static constexpr size_t kMinStorageChunk = 1024;
   std::pmr::vector<InlineNode>* inline_pool_ = nullptr;
 
   // Backtick position cache (cmark optimization): caches positions of closing
@@ -3225,30 +3269,74 @@ class InlineParser {
   };
   std::pmr::vector<BacktickCache> backtick_cache_;
 
-  // Store a string in persistent storage and return a view into it
-  std::string_view StoreString(std::pmr::string s) {
-    string_storage_->push_back(std::move(s));
-    return string_storage_->back();
-  }
-
   // Add a node to the pool and return its ID
   InlineNodeId AddToPool(InlineNode node) {
+    if (!free_ids_.empty()) {
+      InlineNodeId id = free_ids_.back();
+      free_ids_.pop_back();
+      Node(id) = std::move(node);
+      return id;
+    }
     InlineNodeId id = static_cast<InlineNodeId>(inline_pool_->size());
     inline_pool_->push_back(std::move(node));
     return id;
   }
 
-  // Convert a vector of nodes to IDs by adding them all to the pool.
-  std::pmr::vector<InlineNodeId> NodesToIds(
-      std::pmr::vector<InlineNode>& nodes) {
-    std::pmr::vector<InlineNodeId> ids;
-    ids.reserve(nodes.size());
-    for (auto& node : nodes) {
-      ids.push_back(AddToPool(std::move(node)));
+  // Access a pool node by ID. The reference is invalidated by the next pool
+  // insertion.
+  InlineNode& Node(InlineNodeId id) { return (*inline_pool_)[id]; }
+
+  // Construct a node directly in the pool and append its ID to `ids`. Nodes
+  // are created in the pool up front and the parser then works on 4-byte IDs,
+  // so wrapping content in emphasis/links never moves the (large) nodes.
+  template <typename T, typename... Args>
+  void Emit(std::pmr::vector<InlineNodeId>& ids, Args&&... args) {
+    InlineNodeId id;
+    if (!free_ids_.empty()) {
+      id = free_ids_.back();
+      free_ids_.pop_back();
+      Node(id).template emplace<T>(std::forward<Args>(args)...);
+    } else {
+      id = static_cast<InlineNodeId>(inline_pool_->size());
+      inline_pool_->emplace_back(std::in_place_type<T>,
+                                 std::forward<Args>(args)...);
     }
-    nodes.clear();
-    return ids;
+    ids.push_back(id);
   }
+
+  // Mark a node that is no longer referenced (e.g. the verbatim content of a
+  // math span, a consumed delimiter) and, recursively, its children as free
+  // so Emit()/AddToPool() reuse their slots instead of growing the pool.
+  void Release(InlineNodeId id) {
+    InlineNode& node = Node(id);
+    std::visit(
+        [this](auto& n) {
+          if constexpr (requires { n.children; }) {
+            for (InlineNodeId child : n.children) Release(child);
+          }
+        },
+        node);
+    node = Text();
+    free_ids_.push_back(id);
+  }
+
+  // Copy ids[begin, end) into a new child list.
+  static std::pmr::vector<InlineNodeId> Slice(
+      const std::pmr::vector<InlineNodeId>& ids, size_t begin, size_t end) {
+    return std::pmr::vector<InlineNodeId>(ids.begin() + begin,
+                                          ids.begin() + end);
+  }
+
+  // Scratch buffers reused across Parse() calls so each inline container does
+  // not pay for fresh allocations. ParseInlines() does not recurse, and link
+  // content is fully consumed before the next link can form, so one buffer of
+  // each kind suffices.
+  std::pmr::vector<InlineNodeId> result_scratch_;
+  std::pmr::vector<InlineNodeId> link_scratch_;
+  std::pmr::vector<InlineNodeId> autolink_scratch_;
+  // Pool slots of released (unreferenced) nodes, reused before the pool grows.
+  std::pmr::vector<InlineNodeId> free_ids_;
+  std::pmr::string label_scratch_;
 
   struct DelimiterNode {
     size_t pos;       // Index in result vector
@@ -3259,6 +3347,8 @@ class InlineParser {
     bool can_close;
     bool active;
   };
+  std::pmr::vector<DelimiterNode> delimiter_scratch_;
+  std::pmr::vector<DelimiterNode> link_delimiter_scratch_;
 
   // `latexmath` extension: a `$` run can be a math span opener only when it is
   // not preceded by an alphanumeric character (i.e. it is at the start of the
@@ -3303,10 +3393,11 @@ class InlineParser {
   std::pmr::vector<InlineNodeId> ParseInlines() {
     // Use vector for cache locality - for typical document sizes the O(n)
     // shift cost is negligible compared to list's pointer-chasing overhead.
-    std::pmr::vector<InlineNode> result;
-    result.reserve(32);
+    std::pmr::vector<InlineNodeId>& result = result_scratch_;
+    result.clear();
 
-    std::pmr::vector<DelimiterNode> delimiter_stack;
+    std::pmr::vector<DelimiterNode>& delimiter_stack = delimiter_scratch_;
+    delimiter_stack.clear();
 
     // Track spans instead of accumulating text
     size_t text_start = 0;
@@ -3314,8 +3405,7 @@ class InlineParser {
 
     auto flush_text = [&]() {
       if (in_span && text_start < pos_) {
-        result.emplace_back(std::in_place_type<Text>,
-                            text_.substr(text_start, pos_ - text_start));
+        Emit<Text>(result, text_.substr(text_start, pos_ - text_start));
         in_span = false;
       }
     };
@@ -3328,8 +3418,7 @@ class InlineParser {
           --end;
         }
         if (end > text_start) {
-          result.emplace_back(std::in_place_type<Text>,
-                              text_.substr(text_start, end - text_start));
+          Emit<Text>(result, text_.substr(text_start, end - text_start));
         }
         in_span = false;
       }
@@ -3350,13 +3439,12 @@ class InlineParser {
         char next = text_[pos_ + 1];
         if (detail::IsAsciiPunctuation(next)) {
           flush_text();
-          result.emplace_back(std::in_place_type<Text>,
-                              text_.substr(pos_ + 1, 1));
+          Emit<Text>(result, text_.substr(pos_ + 1, 1));
           pos_ += 2;
           continue;
         } else if (next == '\n') {
           flush_text();
-          result.emplace_back(std::in_place_type<HardBreak>);
+          Emit<HardBreak>(result);
           pos_ += 2;
           continue;
         }
@@ -3367,8 +3455,7 @@ class InlineParser {
         flush_text();
         auto entity_result = TryParseEntity();
         if (entity_result) {
-          result.emplace_back(std::in_place_type<Text>,
-                              StoreString(std::move(*entity_result)));
+          Emit<Text>(result, StoreString(*entity_result));
           continue;
         }
         start_span();
@@ -3381,8 +3468,7 @@ class InlineParser {
         flush_text();
         auto code_span = TryParseCodeSpan();
         if (code_span) {
-          result.emplace_back(std::in_place_type<Code>,
-                              std::move(code_span->content));
+          Emit<Code>(result, std::move(code_span->content));
           continue;
         }
         // Code span didn't match - include backticks in current text span
@@ -3403,14 +3489,14 @@ class InlineParser {
         flush_text();
         auto autolink = TryParseAutolink();
         if (autolink) {
-          result.emplace_back(std::in_place_type<Link>, std::move(*autolink));
+          Emit<Link>(result, std::move(*autolink));
           continue;
         }
 
         // Check for HTML tag
         auto html = TryParseHtmlInline();
         if (html) {
-          result.emplace_back(std::in_place_type<HtmlInline>, html->content);
+          Emit<HtmlInline>(result, html->content);
           continue;
         }
         // Neither autolink nor HTML - treat '<' as regular text
@@ -3447,8 +3533,7 @@ class InlineParser {
         flush_text();
 
         // Add the delimiter characters as text - view into input
-        result.emplace_back(std::in_place_type<Text>,
-                            text_.substr(pos_, run_length));
+        Emit<Text>(result, text_.substr(pos_, run_length));
 
         // Add delimiter to stack
         delimiter_stack.emplace_back(result.size() - 1, pos_, run_length, c,
@@ -3476,8 +3561,7 @@ class InlineParser {
         flush_text();
 
         // Add the tilde run as text - view into input
-        result.emplace_back(std::in_place_type<Text>,
-                            text_.substr(pos_, run_length));
+        Emit<Text>(result, text_.substr(pos_, run_length));
 
         if (run_length <= 2) {
           bool left_flanking = IsLeftFlanking(run_start, run_length);
@@ -3509,8 +3593,7 @@ class InlineParser {
         flush_text();
 
         // Add the dollar run as text - view into input
-        result.emplace_back(std::in_place_type<Text>,
-                            text_.substr(pos_, run_length));
+        Emit<Text>(result, text_.substr(pos_, run_length));
 
         if (run_length <= 2) {
           bool can_open = MathCanOpen(run_start);
@@ -3534,14 +3617,12 @@ class InlineParser {
         size_t bracket_text_pos = pos_;  // Position in original text
 
         if (is_image) {
-          result.emplace_back(std::in_place_type<Text>,
-                              text_.substr(pos_, 2));  // "!["
+          Emit<Text>(result, text_.substr(pos_, 2));  // "!["
           delimiter_stack.emplace_back(result.size() - 1, bracket_text_pos, 1,
                                        '!', true, false, true);
           pos_ += 2;
         } else {
-          result.emplace_back(std::in_place_type<Text>,
-                              text_.substr(pos_, 1));  // "["
+          Emit<Text>(result, text_.substr(pos_, 1));  // "["
           delimiter_stack.emplace_back(result.size() - 1, bracket_text_pos, 1,
                                        '[', true, false, true);
           pos_ += 1;
@@ -3585,17 +3666,17 @@ class InlineParser {
 
             // Extract inline content between opener and end
             size_t opener_idx = opener->pos;
-            std::pmr::vector<InlineNode> link_content;
-            link_content.reserve(original_result_size - opener_idx - 1);
-            for (size_t i = opener_idx + 1; i < original_result_size; ++i) {
-              link_content.push_back(std::move(result[i]));
-            }
+            std::pmr::vector<InlineNodeId>& link_content = link_scratch_;
+            link_content.assign(result.begin() + opener_idx + 1,
+                                result.begin() + original_result_size);
             result.resize(opener_idx + 1);
 
             // Extract delimiters that belong to link content and process
             // emphasis
             size_t content_offset = opener->pos + 1;
-            std::pmr::vector<DelimiterNode> link_delimiters;
+            std::pmr::vector<DelimiterNode>& link_delimiters =
+                link_delimiter_scratch_;
+            link_delimiters.clear();
             for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
               if (it->pos > opener->pos && it->pos < original_result_size) {
                 DelimiterNode d = *it;
@@ -3617,20 +3698,22 @@ class InlineParser {
             }
 
             // Remove opener
+            Release(result[opener_idx]);
             result.resize(opener_idx);
 
             if (is_image) {
               Image img;
               img.destination = std::move(link_result->first);
               img.title = std::move(link_result->second);
-              img.alt_text = GetAltText(link_content);
-              result.push_back(std::move(img));
+              img.alt_text = GetAltTextFromIds(link_content);
+              for (InlineNodeId id : link_content) Release(id);
+              Emit<Image>(result, std::move(img));
             } else {
               Link link;
               link.destination = std::move(link_result->first);
               link.title = std::move(link_result->second);
-              link.children = NodesToIds(link_content);
-              result.push_back(std::move(link));
+              link.children = Slice(link_content, 0, link_content.size());
+              Emit<Link>(result, std::move(link));
             }
 
             // Deactivate openers - when a link (not image) is formed,
@@ -3663,8 +3746,7 @@ class InlineParser {
             // Full reference was attempted but failed - don't try shortcut
             pos_ = saved_pos;
             opener->active = false;
-            result.emplace_back(std::in_place_type<Text>,
-                                text_.substr(pos_, 1));  // "]"
+            Emit<Text>(result, text_.substr(pos_, 1));  // "]"
             ++pos_;
             continue;
           }
@@ -3693,17 +3775,17 @@ class InlineParser {
 
             // Extract inline content between opener and end
             size_t opener_idx = opener->pos;
-            std::pmr::vector<InlineNode> link_content;
-            link_content.reserve(original_result_size - opener_idx - 1);
-            for (size_t i = opener_idx + 1; i < original_result_size; ++i) {
-              link_content.push_back(std::move(result[i]));
-            }
+            std::pmr::vector<InlineNodeId>& link_content = link_scratch_;
+            link_content.assign(result.begin() + opener_idx + 1,
+                                result.begin() + original_result_size);
             result.resize(opener_idx + 1);
 
             // Extract delimiters that belong to link content and process
             // emphasis
             size_t content_offset = opener->pos + 1;
-            std::pmr::vector<DelimiterNode> link_delimiters;
+            std::pmr::vector<DelimiterNode>& link_delimiters =
+                link_delimiter_scratch_;
+            link_delimiters.clear();
             for (auto it = opener + 1; it != delimiter_stack.end(); ++it) {
               if (it->pos > opener->pos && it->pos < original_result_size) {
                 DelimiterNode d = *it;
@@ -3725,20 +3807,22 @@ class InlineParser {
             }
 
             // Remove opener
+            Release(result[opener_idx]);
             result.resize(opener_idx);
 
             if (is_image) {
               Image img;
               img.destination = std::move(ref_result->first);
               img.title = std::move(ref_result->second);
-              img.alt_text = GetAltText(link_content);
-              result.push_back(std::move(img));
+              img.alt_text = GetAltTextFromIds(link_content);
+              for (InlineNodeId id : link_content) Release(id);
+              Emit<Image>(result, std::move(img));
             } else {
               Link link;
               link.destination = std::move(ref_result->first);
               link.title = std::move(ref_result->second);
-              link.children = NodesToIds(link_content);
-              result.push_back(std::move(link));
+              link.children = Slice(link_content, 0, link_content.size());
+              Emit<Link>(result, std::move(link));
             }
 
             // Deactivate openers - when a link (not image) is formed,
@@ -3759,35 +3843,26 @@ class InlineParser {
           opener->active = false;
         }
 
-        result.emplace_back(std::in_place_type<Text>,
-                            text_.substr(pos_, 1));  // "]"
+        Emit<Text>(result, text_.substr(pos_, 1));  // "]"
         ++pos_;
         continue;
       }
 
-      // Check for hard break (two spaces at end of line)
-      if (c == ' ') {
+      // Line break: a hard break when the line ends in two or more spaces,
+      // otherwise a soft break. Those trailing spaces are always the tail of
+      // the current text span (every inline construct ends in a non-space
+      // character), so they are dropped by the trimmed flush either way.
+      if (c == '\n') {
         size_t space_count = 0;
-        while (pos_ + space_count < text_.size() &&
-               text_[pos_ + space_count] == ' ') {
+        while (space_count < pos_ && text_[pos_ - 1 - space_count] == ' ') {
           ++space_count;
         }
-        if (pos_ + space_count < text_.size() &&
-            text_[pos_ + space_count] == '\n') {
-          if (space_count >= 2) {
-            flush_text();
-            result.emplace_back(std::in_place_type<HardBreak>);
-            pos_ += space_count + 1;
-            continue;
-          }
-        }
-      }
-
-      // Check for soft break
-      if (c == '\n') {
-        // Trim trailing spaces from text span
         flush_text_trimmed();
-        result.emplace_back(std::in_place_type<SoftBreak>);
+        if (space_count >= 2) {
+          Emit<HardBreak>(result);
+        } else {
+          Emit<SoftBreak>(result);
+        }
         ++pos_;
         continue;
       }
@@ -3813,8 +3888,7 @@ class InlineParser {
       PostprocessAutolinks(result);
     }
 
-    // Convert local nodes to pool IDs
-    return NodesToIds(result);
+    return Slice(result, 0, result.size());
   }
 
   // Find the start position of the UTF-8 character before the given position
@@ -3976,12 +4050,12 @@ class InlineParser {
 
     // Check for URI autolink: [a-zA-Z][a-zA-Z0-9+.-]{1,31}:
     // Manual parsing replaces std::regex for massive speedup
-    if (std::isalpha(static_cast<unsigned char>(content[0]))) {
+    if (detail::IsAlpha(static_cast<unsigned char>(content[0]))) {
       size_t i = 1;
       // Consume 1-31 chars of [a-zA-Z0-9+.-]
       while (i < content.size() && i - 1 < 32) {
         unsigned char c = static_cast<unsigned char>(content[i]);
-        if (std::isalnum(c) || c == '+' || c == '.' || c == '-') {
+        if (detail::IsAlnum(c) || c == '+' || c == '.' || c == '-') {
           ++i;
         } else {
           break;
@@ -4037,23 +4111,23 @@ class InlineParser {
         size_t d = at_pos + 1;
         bool valid_domain = true;
         if (d < content.size() &&
-            std::isalnum(static_cast<unsigned char>(content[d]))) {
+            detail::IsAlnum(static_cast<unsigned char>(content[d]))) {
           while (d < content.size()) {
             // Label start
             size_t label_start = d;
-            if (!std::isalnum(static_cast<unsigned char>(content[d]))) {
+            if (!detail::IsAlnum(static_cast<unsigned char>(content[d]))) {
               valid_domain = false;
               break;
             }
             ++d;
             while (d < content.size() &&
-                   (std::isalnum(static_cast<unsigned char>(content[d])) ||
+                   (detail::IsAlnum(static_cast<unsigned char>(content[d])) ||
                     content[d] == '-')) {
               ++d;
             }
             // Label end must be alphanumeric
             if (d > label_start + 1 &&
-                !std::isalnum(static_cast<unsigned char>(content[d - 1]))) {
+                !detail::IsAlnum(static_cast<unsigned char>(content[d - 1]))) {
               valid_domain = false;
               break;
             }
@@ -4066,7 +4140,7 @@ class InlineParser {
               ++d;
               // Next label must start with alnum
               if (d >= content.size() ||
-                  !std::isalnum(static_cast<unsigned char>(content[d]))) {
+                  !detail::IsAlnum(static_cast<unsigned char>(content[d]))) {
                 valid_domain = false;
                 break;
               }
@@ -4109,12 +4183,12 @@ class InlineParser {
       size_t num_end = num_start;
       if (is_hex) {
         while (num_end < text_.size() &&
-               std::isxdigit(static_cast<unsigned char>(text_[num_end]))) {
+               detail::IsXDigit(static_cast<unsigned char>(text_[num_end]))) {
           ++num_end;
         }
       } else {
         while (num_end < text_.size() &&
-               std::isdigit(static_cast<unsigned char>(text_[num_end]))) {
+               detail::IsDigit(static_cast<unsigned char>(text_[num_end]))) {
           ++num_end;
         }
       }
@@ -4133,7 +4207,7 @@ class InlineParser {
       // Named entity
       size_t name_end = start;
       while (name_end < text_.size() &&
-             std::isalnum(static_cast<unsigned char>(text_[name_end]))) {
+             detail::IsAlnum(static_cast<unsigned char>(text_[name_end]))) {
         ++name_end;
       }
 
@@ -4167,7 +4241,7 @@ class InlineParser {
 
     // Check for valid tag name start
     if (end >= text_.size() ||
-        !std::isalpha(static_cast<unsigned char>(text_[end]))) {
+        !detail::IsAlpha(static_cast<unsigned char>(text_[end]))) {
       // Check for comment, CDATA, processing instruction, or declaration
       if (text_.substr(pos_).starts_with("<!--")) {
         // Per CommonMark spec: <!--> and <!---> are valid (immediately closed)
@@ -4222,7 +4296,7 @@ class InlineParser {
 
     // Parse tag name
     while (end < text_.size() &&
-           (std::isalnum(static_cast<unsigned char>(text_[end])) ||
+           (detail::IsAlnum(static_cast<unsigned char>(text_[end])) ||
             text_[end] == '-')) {
       ++end;
     }
@@ -4254,14 +4328,14 @@ class InlineParser {
         seen_whitespace = true;
         ++end;
       } else if (seen_whitespace &&
-                 (std::isalpha(static_cast<unsigned char>(c)) || c == '_' ||
+                 (detail::IsAlpha(static_cast<unsigned char>(c)) || c == '_' ||
                   c == ':')) {
         // Start of attribute name (must be preceded by whitespace)
         seen_whitespace = false;  // Reset - need whitespace before next attr
         ++end;
         while (end < text_.size()) {
           char ac = text_[end];
-          if (std::isalnum(static_cast<unsigned char>(ac)) || ac == '_' ||
+          if (detail::IsAlnum(static_cast<unsigned char>(ac)) || ac == '_' ||
               ac == ':' || ac == '.' || ac == '-') {
             ++end;
           } else {
@@ -4430,10 +4504,13 @@ class InlineParser {
 
   Result<std::pair<std::pmr::string, std::pmr::string>> LookupReference(
       std::string_view label) {
-    if (!link_references_) [[unlikely]]
-      return {};
+    if (!link_references_ || link_references_->empty()) return {};
 
-    std::pmr::string normalized = detail::NormalizeLinkLabel(label);
+    std::string_view normalized = label;
+    if (!detail::IsNormalizedLinkLabel(label)) {
+      detail::NormalizeLinkLabelInto(label, label_scratch_);
+      normalized = label_scratch_;
+    }
     auto it =
         std::lower_bound(link_references_->begin(), link_references_->end(),
                          normalized, LinkRefComparator{});
@@ -4488,42 +4565,20 @@ class InlineParser {
     return result;
   }
 
-  // Get alt text from a vector of local InlineNodes (not yet in pool)
-  template <typename Container>
-  std::pmr::string GetAltText(const Container& nodes) {
-    std::pmr::string result;
-    for (const auto& node : nodes) {
-      std::visit(
-          [&result, this](auto&& arg) {
-            using T = std::decay_t<decltype(arg)>;
-            if constexpr (std::is_same_v<T, Text>) {
-              result += arg.content;
-            } else if constexpr (std::is_same_v<T, Code>) {
-              result += arg.content;
-            } else if constexpr (std::is_same_v<T, SoftBreak>) {
-              result += ' ';
-            } else if constexpr (std::is_same_v<T, HardBreak>) {
-              result += ' ';
-            } else if constexpr (std::is_same_v<T, Emphasis>) {
-              result += GetAltTextFromIds(arg.children);
-            } else if constexpr (std::is_same_v<T, Strong>) {
-              result += GetAltTextFromIds(arg.children);
-            } else if constexpr (std::is_same_v<T, Strikethrough>) {
-              result += GetAltTextFromIds(arg.children);
-            } else if constexpr (std::is_same_v<T, Math>) {
-              result += arg.content;
-            } else if constexpr (std::is_same_v<T, Link>) {
-              result += GetAltTextFromIds(arg.children);
-            } else if constexpr (std::is_same_v<T, Image>) {
-              result += arg.alt_text;
-            }
-          },
-          node);
+  // Add `node` to the pool and replace ids[begin, end) with its ID (one tail
+  // shift instead of an erase followed by an insert).
+  void ReplaceRange(std::pmr::vector<InlineNodeId>& ids, size_t begin,
+                    size_t end, InlineNode&& node) {
+    InlineNodeId id = AddToPool(std::move(node));
+    if (begin == end) {
+      ids.insert(ids.begin() + begin, id);
+      return;
     }
-    return result;
+    ids[begin] = id;
+    ids.erase(ids.begin() + begin + 1, ids.begin() + end);
   }
 
-  void ProcessEmphasis(std::pmr::vector<InlineNode>& nodes,
+  void ProcessEmphasis(std::pmr::vector<InlineNodeId>& nodes,
                        std::pmr::vector<DelimiterNode>& delimiters) {
     if (delimiters.empty()) [[unlikely]]
       return;
@@ -4566,17 +4621,18 @@ class InlineParser {
 
           Math math(std::move(content), closer.count == 2);
 
-          nodes[opener_pos] = Text("");
+          Node(nodes[opener_pos]) = Text("");
           opener.active = false;
-          nodes[closer_pos] = Text("");
+          Node(nodes[closer_pos]) = Text("");
           closer.active = false;
 
           // Remove the content nodes and insert the math node after the
           // (now empty) opener text node.
           size_t content_count = closer_pos - opener_pos - 1;
-          nodes.erase(nodes.begin() + opener_pos + 1,
-                      nodes.begin() + closer_pos);
-          nodes.insert(nodes.begin() + opener_pos + 1, std::move(math));
+          for (size_t i = opener_pos + 1; i < closer_pos; ++i) {
+            Release(nodes[i]);
+          }
+          ReplaceRange(nodes, opener_pos + 1, closer_pos, std::move(math));
 
           // Adjust positions in the delimiter stack (same as strikethrough).
           int64_t net_shift = 1 - static_cast<int64_t>(content_count);
@@ -4638,29 +4694,19 @@ class InlineParser {
         // later closers can no longer match against them.
         if (closer.delimiter == '~') {
           if (opener.count == closer.count) {
-            // Collect content nodes between opener and closer
-            std::pmr::vector<InlineNode> content;
-            size_t content_size = closer_pos - opener_pos - 1;
-            content.reserve(content_size);
-            for (size_t i = opener_pos + 1; i < closer_pos; ++i) {
-              content.push_back(std::move(nodes[i]));
-            }
-
             Strikethrough strike;
-            strike.children = NodesToIds(content);
+            strike.children = Slice(nodes, opener_pos + 1, closer_pos);
 
             // Consume both whole runs (the tildes are replaced by the node).
-            nodes[opener_pos] = Text("");
+            Node(nodes[opener_pos]) = Text("");
             opener.active = false;
-            nodes[closer_pos] = Text("");
+            Node(nodes[closer_pos]) = Text("");
             closer.active = false;
 
             // Remove the content nodes and insert the strikethrough node after
             // the (now empty) opener text node.
             size_t content_count = closer_pos - opener_pos - 1;
-            nodes.erase(nodes.begin() + opener_pos + 1,
-                        nodes.begin() + closer_pos);
-            nodes.insert(nodes.begin() + opener_pos + 1, std::move(strike));
+            ReplaceRange(nodes, opener_pos + 1, closer_pos, std::move(strike));
 
             // Adjust positions in the delimiter stack (same as emphasis).
             int64_t net_shift = 1 - static_cast<int64_t>(content_count);
@@ -4689,51 +4735,45 @@ class InlineParser {
         bool is_strong = opener.count >= 2 && closer.count >= 2;
         size_t delim_count = is_strong ? 2 : 1;
 
-        // Collect content nodes between opener and closer
-        std::pmr::vector<InlineNode> content;
-        size_t content_size = closer_pos - opener_pos - 1;
-        content.reserve(content_size);
-        for (size_t i = opener_pos + 1; i < closer_pos; ++i) {
-          content.push_back(std::move(nodes[i]));
-        }
-
-        // Create emphasis node - convert children to pool IDs
+        // Create emphasis node - move the content nodes between opener and
+        // closer straight into the pool
         InlineNode emph_node;
         if (is_strong) {
           Strong strong;
-          strong.children = NodesToIds(content);
+          strong.children = Slice(nodes, opener_pos + 1, closer_pos);
           emph_node = std::move(strong);
         } else {
           Emphasis em;
-          em.children = NodesToIds(content);
+          em.children = Slice(nodes, opener_pos + 1, closer_pos);
           emph_node = std::move(em);
         }
 
         // Update opener text - delimiters consumed from the END of opener run
         if (opener.count > delim_count) {
-          auto& opener_content = std::get<Text>(nodes[opener_pos]).content;
+          auto& opener_content =
+              std::get<Text>(Node(nodes[opener_pos])).content;
           opener_content = opener_content.substr(0, opener.count - delim_count);
           opener.count -= delim_count;
         } else {
-          nodes[opener_pos] = Text("");
+          Node(nodes[opener_pos]) = Text("");
           opener.active = false;
         }
 
         // Update closer text - delimiters consumed from the BEGINNING of closer
         if (closer.count > delim_count) {
-          auto& closer_content = std::get<Text>(nodes[closer_pos]).content;
+          auto& closer_content =
+              std::get<Text>(Node(nodes[closer_pos])).content;
           closer_content = closer_content.substr(delim_count);
           closer.count -= delim_count;
         } else {
-          nodes[closer_pos] = Text("");
+          Node(nodes[closer_pos]) = Text("");
           closer.active = false;
         }
 
         // Remove the content nodes (opener/closer text nodes stay in place)
         // and insert the emphasis node after the opener.
         size_t content_count = closer_pos - opener_pos - 1;
-        nodes.erase(nodes.begin() + opener_pos + 1, nodes.begin() + closer_pos);
-        nodes.insert(nodes.begin() + opener_pos + 1, std::move(emph_node));
+        ReplaceRange(nodes, opener_pos + 1, closer_pos, std::move(emph_node));
 
         // Adjust positions in delimiter stack:
         // - delimiters inside (opener_pos, closer_pos) are now wrapped
@@ -4760,14 +4800,13 @@ class InlineParser {
     // Remove empty text nodes in-place (compact)
     size_t write = 0;
     for (size_t read = 0; read < nodes.size(); ++read) {
-      if (std::holds_alternative<Text>(nodes[read]) &&
-          std::get<Text>(nodes[read]).content.empty()) {
+      const InlineNode& node = Node(nodes[read]);
+      if (std::holds_alternative<Text>(node) &&
+          std::get<Text>(node).content.empty()) {
+        Release(nodes[read]);
         continue;
       }
-      if (write != read) {
-        nodes[write] = std::move(nodes[read]);
-      }
-      ++write;
+      nodes[write++] = nodes[read];
     }
     nodes.resize(write);
   }
@@ -4807,7 +4846,7 @@ class InlineParser {
 
   // A character allowed in the local part of an email address.
   static bool IsEmailLocalPartChar(char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '.' ||
+    return detail::IsAlnum(static_cast<unsigned char>(c)) || c == '.' ||
            c == '-' || c == '_' || c == '+';
   }
 
@@ -4818,7 +4857,7 @@ class InlineParser {
       size_t n = std::char_traits<char>::length(scheme);
       if (pos + n > text.size()) return false;
       for (size_t i = 0; i < n; ++i) {
-        if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
+        if (detail::CaseFold(static_cast<unsigned char>(text[pos + i])) !=
             scheme[i]) {
           return false;
         }
@@ -4911,7 +4950,7 @@ class InlineParser {
         case ';': {
           size_t rel_end = link_end - base;
           size_t new_end = (rel_end >= 2) ? rel_end - 2 : 0;
-          while (new_end > 0 && std::isalpha(static_cast<unsigned char>(
+          while (new_end > 0 && detail::IsAlpha(static_cast<unsigned char>(
                                     text[base + new_end]))) {
             --new_end;
           }
@@ -4959,7 +4998,7 @@ class InlineParser {
   size_t TryMatchUrl(std::string_view text, size_t pos) const {
     // The scheme must not be preceded by an alphanumeric, otherwise it is part
     // of a longer word (e.g. `xhttp://`).
-    if (pos > 0 && std::isalnum(static_cast<unsigned char>(text[pos - 1]))) {
+    if (pos > 0 && detail::IsAlnum(static_cast<unsigned char>(text[pos - 1]))) {
       return 0;
     }
     size_t scheme_len = MatchScheme(text, pos);
@@ -4993,12 +5032,12 @@ class InlineParser {
     int np = 0;
     while (d < text.size()) {
       unsigned char c = static_cast<unsigned char>(text[d]);
-      if (std::isalnum(c)) {
+      if (detail::IsAlnum(c)) {
         ++d;
       } else if (c == '@') {
         return 0;  // a second '@' cannot appear in an email address
       } else if (c == '.' && d + 1 < text.size() &&
-                 std::isalnum(static_cast<unsigned char>(text[d + 1]))) {
+                 detail::IsAlnum(static_cast<unsigned char>(text[d + 1]))) {
         ++np;
         ++d;
       } else if (c == '-' || c == '_') {
@@ -5010,7 +5049,7 @@ class InlineParser {
     size_t domain_len = d - (at + 1);
     if (domain_len < 2 || np == 0) return 0;
     char last = text[d - 1];
-    if (!(std::isalpha(static_cast<unsigned char>(last)) || last == '.')) {
+    if (!(detail::IsAlpha(static_cast<unsigned char>(last)) || last == '.')) {
       return 0;
     }
     size_t link_end = AutolinkDelim(text, at, d);
@@ -5036,7 +5075,7 @@ class InlineParser {
         return len;
       }
     }
-    if (std::isalnum(c)) {
+    if (detail::IsAlnum(c)) {
       // An email autolink can only begin at the start of a local-part run.
       bool run_start = (pos == 0) || !IsEmailLocalPartChar(text[pos - 1]);
       if (run_start) {
@@ -5065,14 +5104,16 @@ class InlineParser {
   // Splits a single text span into Text/Link nodes, replacing any extended
   // autolinks with Link nodes (the matched text becomes the link label and the
   // scheme-appropriate URI becomes the destination).
-  void SplitAutolinks(std::string_view text,
-                      std::pmr::vector<InlineNode>& out) {
+  // `id` is a Text node; when it contains no autolink it is kept as is.
+  void SplitAutolinks(InlineNodeId id, std::pmr::vector<InlineNodeId>& out) {
+    std::string_view text = std::get<Text>(Node(id)).content;
+    if (text.empty()) return;
     size_t text_start = 0;
     size_t pos = 0;
+    bool matched_any = false;
     auto flush = [&](size_t upto) {
       if (text_start < upto) {
-        out.emplace_back(std::in_place_type<Text>,
-                         text.substr(text_start, upto - text_start));
+        Emit<Text>(out, text.substr(text_start, upto - text_start));
       }
       text_start = upto;
     };
@@ -5085,17 +5126,23 @@ class InlineParser {
         Link link;
         link.destination = MakeAutolinkDestination(matched, kind);
         link.children.push_back(AddToPool(Text(matched)));
-        out.push_back(std::move(link));
+        Emit<Link>(out, std::move(link));
         pos += match;
         text_start = pos;
+        matched_any = true;
       } else {
         ++pos;
       }
     }
+    if (!matched_any) {
+      out.push_back(id);
+      return;
+    }
     flush(text.size());
+    Release(id);
   }
 
-  void PostprocessAutolinks(std::pmr::vector<InlineNode>& nodes) {
+  void PostprocessAutolinks(std::pmr::vector<InlineNodeId>& nodes) {
     // First consolidate adjacent text nodes. The inline parser splits text at
     // special characters (e.g. `_` emphasis markers that do not form emphasis),
     // which can fragment an autolink such as `a.b-c_d@a.b`. Merging the runs
@@ -5103,38 +5150,37 @@ class InlineParser {
     // are normally contiguous slices of the input, so the common case is a
     // cheap view extension; a persistent copy is only needed for the rare
     // non-contiguous run.
-    std::pmr::vector<InlineNode> consolidated;
-    consolidated.reserve(nodes.size());
-    for (auto& node : nodes) {
-      if (std::holds_alternative<Text>(node) && !consolidated.empty() &&
-          std::holds_alternative<Text>(consolidated.back())) {
-        auto& last_view = std::get<Text>(consolidated.back()).content;
-        std::string_view cur = std::get<Text>(node).content;
+    std::pmr::vector<InlineNodeId>& consolidated = autolink_scratch_;
+    consolidated.clear();
+    for (InlineNodeId id : nodes) {
+      if (std::holds_alternative<Text>(Node(id)) && !consolidated.empty() &&
+          std::holds_alternative<Text>(Node(consolidated.back()))) {
+        auto& last_view = std::get<Text>(Node(consolidated.back())).content;
+        std::string_view cur = std::get<Text>(Node(id)).content;
         if (cur.data() == last_view.data() + last_view.size()) {
           last_view =
               std::string_view(last_view.data(), last_view.size() + cur.size());
         } else {
           std::pmr::string merged(last_view);
           merged.append(cur);
-          std::get<Text>(consolidated.back()).content =
-              StoreString(std::move(merged));
+          std::get<Text>(Node(consolidated.back())).content =
+              StoreString(merged);
         }
+        Release(id);  // Merged into the previous text node
       } else {
-        consolidated.push_back(std::move(node));
+        consolidated.push_back(id);
       }
     }
 
     // Then split any text nodes that contain extended autolinks.
-    std::pmr::vector<InlineNode> out;
-    out.reserve(consolidated.size());
-    for (auto& node : consolidated) {
-      if (std::holds_alternative<Text>(node)) {
-        SplitAutolinks(std::get<Text>(node).content, out);
+    nodes.clear();
+    for (InlineNodeId id : consolidated) {
+      if (std::holds_alternative<Text>(Node(id))) {
+        SplitAutolinks(id, nodes);
       } else {
-        out.push_back(std::move(node));
+        nodes.push_back(id);
       }
     }
-    nodes = std::move(out);
   }
 };
 
@@ -5177,19 +5223,29 @@ class BlockParser {
   size_t last_top_block_end_line = 0;    // exclusive
   bool last_top_block_terminated = true;  // cannot absorb a further line
 
+  BlockParser() = default;
+
+  // Parser whose transient buffers (line offsets, paragraph line lists) come
+  // from `scratch`; used for the nested parsers of container blocks so they
+  // share the enclosing Parse()'s scratch arena.
+  explicit BlockParser(std::pmr::memory_resource* scratch)
+      : lines_(OrDefault(scratch)),
+        para_lines_(OrDefault(scratch)),
+        scratch_(scratch) {}
+
   Document Parse(std::string_view input) {
+    // Transient parse buffers (container contents re-parsed by nested
+    // parsers, their line tables, paragraph text awaiting inline parsing) are
+    // bump-allocated from an arena released when the parse ends. Declared
+    // before `doc` so it outlives the Document if an exception unwinds.
+    std::pmr::monotonic_buffer_resource arena(input.size() / 2 + 1024);
+    ScratchScope scratch_scope(this, &arena);
     Document doc;
     std::pmr::vector<BlockNode> top_blocks;
     ParseBlocksInto(input, doc, top_blocks);
     doc.children = std::move(top_blocks);
 
-    // Third pass: parse inlines
-    InlineParser inline_parser(&doc.link_references, &doc.string_storage,
-                               &doc.inline_nodes);
-    inline_parser.enable_autolink = enable_autolink;
-    inline_parser.enable_strikethrough = enable_strikethrough;
-    inline_parser.enable_latex_math = enable_latex_math;
-    ParseInlines(doc.children, inline_parser);
+    ParseAllInlines(doc, input.size());
 
     return doc;
   }
@@ -5199,6 +5255,9 @@ class BlockParser {
   // chunk). Already-defined labels win over later duplicates (first definition
   // wins), so seeding preserves document order across chunks.
   Document Parse(std::string_view input, const LinkRefMap& initial_refs) {
+    // See Parse(std::string_view) for the scratch arena.
+    std::pmr::monotonic_buffer_resource arena(input.size() / 2 + 1024);
+    ScratchScope scratch_scope(this, &arena);
     Document doc;
     if (!initial_refs.empty()) {
       doc.link_references.insert(doc.link_references.end(),
@@ -5208,22 +5267,79 @@ class BlockParser {
     ParseBlocksInto(input, doc, top_blocks);
     doc.children = std::move(top_blocks);
 
-    // Third pass: parse inlines
+    ParseAllInlines(doc, input.size());
+
+    return doc;
+  }
+
+  // Third pass: parse the inline content of every paragraph, heading and
+  // table cell.
+  void ParseAllInlines(Document& doc, size_t input_size) {
+    // Pre-size the node pool from the input length (inline-heavy text yields
+    // roughly one node per 10 bytes) so it rarely has to grow, as every growth
+    // step moves each node.
+    doc.inline_nodes.reserve(input_size / 10 + 16);
     InlineParser inline_parser(&doc.link_references, &doc.string_storage,
                                &doc.inline_nodes);
     inline_parser.enable_autolink = enable_autolink;
     inline_parser.enable_strikethrough = enable_strikethrough;
     inline_parser.enable_latex_math = enable_latex_math;
+
+    // Inline nodes view their text in Document-owned storage. Size the first
+    // storage chunk to hold all block text at once (every block lives in
+    // either doc.children or doc.block_nodes).
+    size_t total = 0;
+    auto count = [&total](const BlockNode& block) {
+      if (auto* para = std::get_if<Paragraph>(&block)) {
+        total += para->raw_content.size();
+      } else if (auto* heading = std::get_if<Heading>(&block)) {
+        total += heading->raw_content.size();
+      } else if (auto* table = std::get_if<Table>(&block)) {
+        for (const auto& row : table->rows) {
+          for (const auto& cell : row.cells) total += cell.raw_content.size();
+        }
+      }
+    };
+    for (const auto& block : doc.children) count(block);
+    for (const auto& block : doc.block_nodes) count(block);
+    if (total > 0) inline_parser.ReserveStorage(total);
+
     ParseInlines(doc.children, inline_parser);
 
-    return doc;
+    // No string in the returned Document may refer to the scratch arena,
+    // which dies with the Parse() call (every raw_content reached above has
+    // already been reset; this catches any that were not).
+    if (scratch_) {
+      auto release = [this](BlockNode& block) {
+        std::pmr::string* raw = nullptr;
+        if (auto* para = std::get_if<Paragraph>(&block)) {
+          raw = &para->raw_content;
+        } else if (auto* heading = std::get_if<Heading>(&block)) {
+          raw = &heading->raw_content;
+        }
+        if (raw && raw->get_allocator().resource() == scratch_) {
+          ResetString(*raw);
+        }
+      };
+      for (auto& block : doc.children) release(block);
+      for (auto& block : doc.block_nodes) release(block);
+    }
+  }
+
+  // Copy a block's raw text into Document storage and release the original
+  // (raw_content is only needed until inlines are parsed).
+  static std::string_view StableText(std::pmr::string& raw,
+                                     InlineParser& parser) {
+    std::string_view stable = parser.StoreString(raw);
+    ResetString(raw);
+    return stable;
   }
 
   // Extract only the link reference definitions from `input` into `out`,
   // without building blocks or inlines. First definition wins for duplicates.
   void ExtractLinkRefs(std::string_view input, LinkRefMap& out) {
     if (input.find('[') == std::string_view::npos) return;
-    lines_ = std::make_unique<detail::LineBuffer>(input);
+    lines_.Reset(input);
     line_idx_ = 0;
     ExtractLinkReferences(out);
   }
@@ -5232,13 +5348,21 @@ class BlockParser {
                        std::pmr::vector<BlockNode>& blocks,
                        bool input_no_nulls = false) {
     doc_ = &doc;
-    lines_ = std::make_unique<detail::LineBuffer>(input, input_no_nulls);
+    lines_.Reset(input, input_no_nulls);
     line_idx_ = 0;
     parent_link_refs_ = &doc.link_references;
 
+    // The top-level parse reaches this point before any nested parser, so
+    // size the pools for nested blocks and top-level blocks from its line
+    // count (every growth step moves each block).
+    if (doc.block_nodes.capacity() == 0) {
+      doc.block_nodes.reserve(lines_.size() / 4 + 8);
+      blocks.reserve(blocks.size() + lines_.size() / 8 + 8);
+    }
+
     // Number of real lines: LineBuffer appends one empty artifact line when
     // the input ends with a line terminator; that artifact is not content.
-    real_line_count_ = lines_->size();
+    real_line_count_ = lines_.size();
     if (!input.empty() && (input.back() == '\n' || input.back() == '\r')) {
       --real_line_count_;
     }
@@ -5259,7 +5383,7 @@ class BlockParser {
  private:
   // LineBuffer provides cache-friendly storage: contiguous offset array
   // pointing into single buffer, vs vector<string> with many allocations
-  std::unique_ptr<detail::LineBuffer> lines_;
+  detail::LineBuffer lines_;
   size_t line_idx_ = 0;
   LinkRefMap* parent_link_refs_ = nullptr;
   Document* doc_ = nullptr;
@@ -5271,6 +5395,50 @@ class BlockParser {
   bool last_fence_found_closing_ = true;
   bool last_html_end_condition_found_ = true;
   size_t last_table_start_line_ = 0;
+
+  // Scratch line list reused by ParseParagraph.
+  std::pmr::vector<std::string_view> para_lines_;
+
+  // Arena for transient parse buffers (see Parse()); null when parsing
+  // through ParseBlocksInto() directly, in which case the default resource
+  // is used.
+  std::pmr::memory_resource* scratch_ = nullptr;
+
+  static std::pmr::memory_resource* OrDefault(
+      std::pmr::memory_resource* resource) {
+    return resource ? resource : std::pmr::get_default_resource();
+  }
+
+  std::pmr::memory_resource* Scratch() const { return OrDefault(scratch_); }
+
+  // Installs `arena` as the scratch resource for the duration of a Parse().
+  struct ScratchScope {
+    ScratchScope(BlockParser* parser, std::pmr::memory_resource* arena)
+        : parser_(parser), saved_(parser->scratch_) {
+      parser->scratch_ = arena;
+    }
+    ~ScratchScope() { parser_->scratch_ = saved_; }
+    ScratchScope(const ScratchScope&) = delete;
+    ScratchScope& operator=(const ScratchScope&) = delete;
+    BlockParser* parser_;
+    std::pmr::memory_resource* saved_;
+  };
+
+  // Replace `s` with an empty string on the default resource (plain
+  // assignment would keep an arena allocator, as polymorphic_allocator does
+  // not propagate on assignment).
+  static void ResetString(std::pmr::string& s) {
+    std::destroy_at(&s);
+    std::construct_at(&s);
+  }
+
+  // Set a block's raw_content to `lines` joined, allocated from the scratch
+  // arena (it is only needed until inlines are parsed).
+  void SetRawContent(std::pmr::string& raw,
+                     const std::pmr::vector<std::string_view>& lines) {
+    std::destroy_at(&raw);
+    std::construct_at(&raw, JoinLines(lines, Scratch()));
+  }
 
   // Record the block just pushed onto `blocks` as the last top-level block.
   // `iter_start_line` is the line on which the producing loop iteration began;
@@ -5325,11 +5493,11 @@ class BlockParser {
     has_last_top_block = true;
   }
 
-  bool AtEnd() const { return !lines_ || line_idx_ >= lines_->size(); }
+  bool AtEnd() const { return line_idx_ >= lines_.size(); }
 
   std::string_view CurrentLine() const {
     if (AtEnd()) return "";
-    return (*lines_)[line_idx_];
+    return lines_[line_idx_];
   }
 
   void Advance() {
@@ -6288,7 +6456,7 @@ class BlockParser {
     // structure (headings, emphasis, ...) is preserved, like the section body.
     std::pmr::vector<BlockNodeId> summary;
     if (!summary_raw.empty()) {
-      BlockParser summary_parser;
+      BlockParser summary_parser(scratch_);
       summary_parser.enable_tables = enable_tables;
       summary_parser.enable_tasklist = enable_tasklist;
       std::pmr::vector<BlockNode> summary_blocks;
@@ -6308,7 +6476,7 @@ class BlockParser {
     // (paragraphs, code blocks, lists, ...) is preserved.
     std::pmr::vector<BlockNodeId> children;
     if (!content.empty()) {
-      BlockParser body_parser;
+      BlockParser body_parser(scratch_);
       body_parser.enable_tables = enable_tables;
       body_parser.enable_tasklist = enable_tasklist;
       std::pmr::vector<BlockNode> body_blocks;
@@ -6388,7 +6556,7 @@ class BlockParser {
       return false;
 
     // Build a single contiguous buffer for nested content
-    std::pmr::string nested_buf;
+    std::pmr::string nested_buf(Scratch());
     // Reserve a reasonable amount to reduce reallocations
     nested_buf.reserve(256);
 
@@ -6509,7 +6677,7 @@ class BlockParser {
               bq_trimmed.starts_with("- ") || bq_trimmed.starts_with("* ") ||
               bq_trimmed.starts_with("+ ") || bq_trimmed.starts_with(">") ||
               (bq_trimmed.size() >= 2 &&
-               std::isdigit(static_cast<unsigned char>(bq_trimmed[0])))) {
+               detail::IsDigit(static_cast<unsigned char>(bq_trimmed[0])))) {
             is_continuation = false;
           }
         }
@@ -6540,9 +6708,9 @@ class BlockParser {
     if (nested_buf.empty()) [[unlikely]]
       return false;
 
-    BlockParser nested_parser;
+    BlockParser nested_parser(scratch_);
     nested_parser.enable_tables = enable_tables;
-    std::pmr::vector<BlockNode> nested_blocks;
+    std::pmr::vector<BlockNode> nested_blocks(Scratch());
     nested_parser.ParseBlocksInto(std::string_view(nested_buf), *doc_,
                                   nested_blocks, /*input_no_nulls=*/true);
 
@@ -6580,12 +6748,12 @@ class BlockParser {
       } else {
         return false;  // Not a list marker
       }
-    } else if (std::isdigit(static_cast<unsigned char>(trimmed[0]))) {
+    } else if (detail::IsDigit(static_cast<unsigned char>(trimmed[0]))) {
       // Ordered list
       is_ordered = true;
       size_t num_end = 0;
       while (num_end < trimmed.size() &&
-             std::isdigit(static_cast<unsigned char>(trimmed[num_end]))) {
+             detail::IsDigit(static_cast<unsigned char>(trimmed[num_end]))) {
         ++num_end;
       }
       if (num_end == 0 || num_end > 9) [[unlikely]]
@@ -6616,6 +6784,7 @@ class BlockParser {
 
     // Parse list items
     List list;
+    list.items.reserve(4);  // Most lists are short
     list.is_ordered = is_ordered;
     list.start = start;
     list.delimiter = delimiter;
@@ -6662,11 +6831,11 @@ class BlockParser {
       bool is_new_item = false;
       if (is_ordered) {
         if (item_indent < 4 && !item_trimmed.empty() &&
-            std::isdigit(static_cast<unsigned char>(item_trimmed[0]))) {
+            detail::IsDigit(static_cast<unsigned char>(item_trimmed[0]))) {
           size_t num_end = 0;
-          while (
-              num_end < item_trimmed.size() &&
-              std::isdigit(static_cast<unsigned char>(item_trimmed[num_end]))) {
+          while (num_end < item_trimmed.size() &&
+                 detail::IsDigit(
+                     static_cast<unsigned char>(item_trimmed[num_end]))) {
             ++num_end;
           }
           if (num_end > 0 && num_end <= 9 && num_end < item_trimmed.size() &&
@@ -6704,7 +6873,7 @@ class BlockParser {
 
         ListItem item;
         // Build a single contiguous buffer for item content
-        std::pmr::string item_buf;
+        std::pmr::string item_buf(Scratch());
 
         // Get first line content with proper tab handling. Only materialize an
         // expanded copy when the line actually contains a tab; otherwise reuse
@@ -6730,7 +6899,7 @@ class BlockParser {
         size_t marker_end = 0;
         if (is_ordered) {
           while (marker_end < expanded_trimmed.size() &&
-                 std::isdigit(static_cast<unsigned char>(
+                 detail::IsDigit(static_cast<unsigned char>(
                      expanded_trimmed[marker_end]))) {
             ++marker_end;
           }
@@ -6767,8 +6936,7 @@ class BlockParser {
           skip = content_pos;  // Skip to actual content
         }
 
-        std::pmr::string first_content =
-            std::pmr::string(expanded_trimmed.substr(skip));
+        std::string_view first_content = expanded_trimmed.substr(skip);
 
         // GFM `tasklist` extension: if the first line of the item begins with a
         // `[ ]`, `[x]` or `[X]` marker followed by a space or tab, it is a task
@@ -6792,7 +6960,7 @@ class BlockParser {
                   first_content[content_after_marker] == '\t')) {
             ++content_after_marker;
           }
-          first_content.erase(0, content_after_marker);
+          first_content.remove_prefix(content_after_marker);
         }
 
         item_buf += first_content;
@@ -6869,10 +7037,10 @@ class BlockParser {
           bool is_another_item = false;
           if (cont_indent < required_indent && cont_indent < 4) {
             if (is_ordered && !cont_trimmed.empty() &&
-                std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {
+                detail::IsDigit(static_cast<unsigned char>(cont_trimmed[0]))) {
               size_t num_end = 0;
               while (num_end < cont_trimmed.size() &&
-                     std::isdigit(
+                     detail::IsDigit(
                          static_cast<unsigned char>(cont_trimmed[num_end]))) {
                 ++num_end;
               }
@@ -6911,10 +7079,11 @@ class BlockParser {
                 }
               }
               if (!cont_trimmed.empty() &&
-                  std::isdigit(static_cast<unsigned char>(cont_trimmed[0]))) {
+                  detail::IsDigit(
+                      static_cast<unsigned char>(cont_trimmed[0]))) {
                 size_t ne = 0;
                 while (ne < cont_trimmed.size() &&
-                       std::isdigit(
+                       detail::IsDigit(
                            static_cast<unsigned char>(cont_trimmed[ne]))) {
                   ++ne;
                 }
@@ -7023,10 +7192,10 @@ class BlockParser {
                     dedented_trimmed[1] == ' ' || dedented_trimmed[1] == '\t') {
                   has_nested_list = true;
                 }
-              } else if (std::isdigit(static_cast<unsigned char>(fc))) {
+              } else if (detail::IsDigit(static_cast<unsigned char>(fc))) {
                 size_t ne = 0;
                 while (ne < dedented_trimmed.size() &&
-                       std::isdigit(
+                       detail::IsDigit(
                            static_cast<unsigned char>(dedented_trimmed[ne]))) {
                   ++ne;
                 }
@@ -7065,13 +7234,14 @@ class BlockParser {
 
         // Parse item content
         if (!item_buf.empty()) {
-          BlockParser item_parser;
+          BlockParser item_parser(scratch_);
           item_parser.enable_tables = enable_tables;
           item_parser.enable_tasklist = enable_tasklist;
-          std::pmr::vector<BlockNode> item_blocks;
+          std::pmr::vector<BlockNode> item_blocks(Scratch());
           item_parser.ParseBlocksInto(std::string_view(item_buf), *doc_,
                                       item_blocks, /*input_no_nulls=*/true);
 
+          item.children.reserve(item_blocks.size());
           for (auto& node : item_blocks) {
             item.children.push_back(doc_->AddBlock(std::move(node)));
           }
@@ -7154,8 +7324,8 @@ class BlockParser {
     // Table (which may be pushed after a leading Paragraph) reports its real
     // start line.
     last_table_start_line_ = line_idx_;
-    if (line_idx_ + 1 >= lines_->size()) return false;
-    std::string_view next_raw = (*lines_)[line_idx_ + 1];
+    if (line_idx_ + 1 >= lines_.size()) return false;
+    std::string_view next_raw = lines_[line_idx_ + 1];
     std::string_view next_line = detail::TrimLeft(next_raw);
 
     // A setext underline following a one-line paragraph is a heading, not a
@@ -7221,11 +7391,29 @@ class BlockParser {
     return true;
   }
 
+  // Join `lines` with '\n' into a single string sized up front.
+  static std::pmr::string JoinLines(
+      const std::pmr::vector<std::string_view>& lines,
+      std::pmr::memory_resource* resource) {
+    size_t total = lines.empty() ? 0 : lines.size() - 1;
+    for (std::string_view l : lines) total += l.size();
+    std::pmr::string out(resource);
+    out.reserve(total);
+    for (size_t j = 0; j < lines.size(); ++j) {
+      if (j > 0) out += '\n';
+      out += lines[j];
+    }
+    return out;
+  }
+
   void ParseParagraph(std::pmr::vector<BlockNode>& blocks) {
     // Store non-owning views into the LineBuffer (which stays valid for the
     // duration of this call) instead of copying each line into its own
     // string. The single join into raw_content at the end is the only copy.
-    std::pmr::vector<std::string_view> para_lines;
+    // The vector is a member so its capacity is reused across paragraphs
+    // (ParseParagraph never re-enters itself on the same parser).
+    std::pmr::vector<std::string_view>& para_lines = para_lines_;
+    para_lines.clear();
 
     while (!AtEnd()) {
       std::string_view line = CurrentLine();
@@ -7262,13 +7450,8 @@ class BlockParser {
               Heading heading;
               heading.level = (underline_char == '=') ? 1 : 2;
 
-              std::pmr::string heading_content;
-              for (size_t j = 0; j < para_lines.size(); ++j) {
-                if (j > 0) heading_content += '\n';
-                heading_content += para_lines[j];
-              }
-              heading.raw_content = std::move(heading_content);
-              blocks.push_back(heading);
+              SetRawContent(heading.raw_content, para_lines);
+              blocks.push_back(std::move(heading));
               return;
             }
           }
@@ -7338,15 +7521,16 @@ class BlockParser {
         if ((trimmed.starts_with("- ") || trimmed.starts_with("+ ") ||
              trimmed.starts_with("* ")) ||
             (trimmed.size() >= 2 &&
-             std::isdigit(static_cast<unsigned char>(trimmed[0])))) {
+             detail::IsDigit(static_cast<unsigned char>(trimmed[0])))) {
           if (trimmed.starts_with("- ") || trimmed.starts_with("+ ") ||
               trimmed.starts_with("* ")) {
             break;
           }
           // Check for ordered list
           size_t num_end = 0;
-          while (num_end < trimmed.size() &&
-                 std::isdigit(static_cast<unsigned char>(trimmed[num_end]))) {
+          while (
+              num_end < trimmed.size() &&
+              detail::IsDigit(static_cast<unsigned char>(trimmed[num_end]))) {
             ++num_end;
           }
           if (num_end > 0 && num_end < trimmed.size() &&
@@ -7417,9 +7601,10 @@ class BlockParser {
           bool is_closing = (trimmed.size() >= 2 && trimmed[1] == '/');
           size_t tag_start = is_closing ? 2 : 1;
           size_t tag_end = tag_start;
-          while (tag_end < trimmed.size() &&
-                 (std::isalnum(static_cast<unsigned char>(trimmed[tag_end])) ||
-                  trimmed[tag_end] == '-')) {
+          while (
+              tag_end < trimmed.size() &&
+              (detail::IsAlnum(static_cast<unsigned char>(trimmed[tag_end])) ||
+               trimmed[tag_end] == '-')) {
             ++tag_end;
           }
           if (tag_end > tag_start) {
@@ -7452,12 +7637,7 @@ class BlockParser {
         if (TryBuildTable(trimmed, &table)) {
           if (!para_lines.empty()) {
             Paragraph leading;
-            std::pmr::string leading_content;
-            for (size_t j = 0; j < para_lines.size(); ++j) {
-              if (j > 0) leading_content += '\n';
-              leading_content += para_lines[j];
-            }
-            leading.raw_content = std::move(leading_content);
+            SetRawContent(leading.raw_content, para_lines);
             blocks.push_back(std::move(leading));
           }
           blocks.push_back(std::move(table));
@@ -7475,12 +7655,7 @@ class BlockParser {
     }
 
     Paragraph para;
-    std::pmr::string para_content;
-    for (size_t j = 0; j < para_lines.size(); ++j) {
-      if (j > 0) para_content += '\n';
-      para_content += para_lines[j];
-    }
-    para.raw_content = std::move(para_content);
+    SetRawContent(para.raw_content, para_lines);
     blocks.push_back(std::move(para));
   }
 
@@ -7490,18 +7665,11 @@ class BlockParser {
           [&parser, this](auto&& node) {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, Paragraph>) {
-              // Store raw_content in string_storage so string_views survive
-              // moves (SSO strings have data inside the object, which becomes
-              // invalid after move)
-              doc_->string_storage.push_back(std::move(node.raw_content));
-              std::string_view stable_content = doc_->string_storage.back();
-              node.children = parser.Parse(stable_content);
+              node.children =
+                  parser.Parse(StableText(node.raw_content, parser));
             } else if constexpr (std::is_same_v<T, Heading>) {
-              // Store raw_content in string_storage so string_views survive
-              // moves
-              doc_->string_storage.push_back(std::move(node.raw_content));
-              std::string_view stable_content = doc_->string_storage.back();
-              node.children = parser.Parse(stable_content);
+              node.children =
+                  parser.Parse(StableText(node.raw_content, parser));
             } else if constexpr (std::is_same_v<T, DetailsBlock>) {
               ParseInlines(node.summary, parser);
               ParseInlines(node.children, parser);
@@ -7514,9 +7682,8 @@ class BlockParser {
             } else if constexpr (std::is_same_v<T, Table>) {
               for (auto& row : node.rows) {
                 for (auto& cell : row.cells) {
-                  doc_->string_storage.push_back(std::move(cell.raw_content));
-                  std::string_view stable_content = doc_->string_storage.back();
-                  cell.children = parser.Parse(stable_content);
+                  cell.children =
+                      parser.Parse(StableText(cell.raw_content, parser));
                 }
               }
             }
@@ -7533,13 +7700,11 @@ class BlockParser {
           [&parser, this](auto&& node) {
             using T = std::decay_t<decltype(node)>;
             if constexpr (std::is_same_v<T, Paragraph>) {
-              doc_->string_storage.push_back(std::move(node.raw_content));
-              std::string_view stable_content = doc_->string_storage.back();
-              node.children = parser.Parse(stable_content);
+              node.children =
+                  parser.Parse(StableText(node.raw_content, parser));
             } else if constexpr (std::is_same_v<T, Heading>) {
-              doc_->string_storage.push_back(std::move(node.raw_content));
-              std::string_view stable_content = doc_->string_storage.back();
-              node.children = parser.Parse(stable_content);
+              node.children =
+                  parser.Parse(StableText(node.raw_content, parser));
             } else if constexpr (std::is_same_v<T, DetailsBlock>) {
               ParseInlines(node.summary, parser);
               ParseInlines(node.children, parser);
@@ -7552,9 +7717,8 @@ class BlockParser {
             } else if constexpr (std::is_same_v<T, Table>) {
               for (auto& row : node.rows) {
                 for (auto& cell : row.cells) {
-                  doc_->string_storage.push_back(std::move(cell.raw_content));
-                  std::string_view stable_content = doc_->string_storage.back();
-                  cell.children = parser.Parse(stable_content);
+                  cell.children =
+                      parser.Parse(StableText(cell.raw_content, parser));
                 }
               }
             }
@@ -7578,8 +7742,14 @@ class HtmlRenderer {
   std::pmr::string Render(const Document& doc) {
     doc_ = &doc;
     std::pmr::string result;
-    // Pre-allocate based on block count heuristic (~100 chars per block)
-    result.reserve(doc.children.size() * 100 + 256);
+    // Pre-allocate from the inline text size plus markup per block, so the
+    // output rarely has to grow (each growth step copies everything so far).
+    size_t text_size = 0;
+    for (const auto& s : doc.string_storage) text_size += s.size();
+    size_t block_count = doc.children.size() + doc.block_nodes.size();
+    size_t estimate = text_size + text_size / 8 + block_count * 16 + 256;
+    size_t legacy_estimate = doc.children.size() * 100 + 256;
+    result.reserve(estimate > legacy_estimate ? estimate : legacy_estimate);
     RenderBlocks(doc.children, result, false);
     return result;
   }

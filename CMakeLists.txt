@@ -78,6 +78,10 @@ if(BUILD_TESTING)
   # Test executable using gtest to wrap the Python spec test runner
   add_executable(test_markus tests/test_markus.cc)
   target_link_libraries(test_markus PRIVATE markus GTest::gtest_main)
+  # The spec suite instantiates many tests; MSVC needs /bigobj to fit them.
+  if(MSVC)
+    target_compile_options(test_markus PRIVATE /bigobj)
+  endif()
   set_target_properties(test_markus PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
   )

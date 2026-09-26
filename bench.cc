@@ -116,6 +116,14 @@ std::map<std::string, std::vector<double>> g_markus_tagfilter_times;
 std::map<std::string, std::vector<double>> g_cmark_gfm_tagfilter_times;
 std::map<std::string, std::vector<double>> g_md4c_tagfilter_times;
 
+// Timing data for the `latexmath` extension benchmarks (each parser with the
+// LaTeX math extension enabled, on math-heavy input). cmark-gfm has no math
+// extension in the version benchmarked here, so it runs in plain CommonMark
+// mode on the same input; md4c runs with MD_FLAG_LATEXMATHSPANS.
+std::map<std::string, std::vector<double>> g_markus_latexmath_times;
+std::map<std::string, std::vector<double>> g_cmark_gfm_latexmath_times;
+std::map<std::string, std::vector<double>> g_md4c_latexmath_times;
+
 void RecordTiming(const std::string& name, double time_ms,
                   std::map<std::string, std::vector<double>>& map) {
   std::lock_guard<std::mutex> lock(g_timing_mutex);
@@ -198,6 +206,8 @@ void PrintSummary() {
                      g_cmark_gfm_tasklist_times, g_md4c_tasklist_times);
   PrintSummaryTable("GFM Tagfilter Extension", g_markus_tagfilter_times,
                      g_cmark_gfm_tagfilter_times, g_md4c_tagfilter_times);
+  PrintSummaryTable("LaTeX Math Extension", g_markus_latexmath_times,
+                    g_cmark_gfm_latexmath_times, g_md4c_latexmath_times);
 }
 
 class SummaryReporter : public benchmark::BenchmarkReporter {
@@ -564,6 +574,138 @@ std::string GenerateTagfilterSample(int lines = 4000) {
   return out;
 }
 
+// Build a synthetic document that is heavy in LaTeX math spans (a mix of
+// inline `$...$`, display `$$...$$`, and literal dollars, with some math
+// nested in emphasis and lists) so the latexmath extension code paths are
+// actually exercised by the benchmark. Each entry is its own paragraph
+// (blank-line separated) so the document is representative of real Markdown
+// and every parser runs in linear time.
+std::string GenerateLatexMathSample(int lines = 4000) {
+  static const char* kFormulas[] = {
+      "\\frac{a}{b} + \\frac{c}{d}",
+      "e^{i\\pi} + 1 = 0",
+      "\\int_a^b f(x)\\,dx",
+      "\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6}",
+      "x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}",
+      "\\nabla \\cdot \\vec{E} = \\frac{\\rho}{\\varepsilon_0}",
+  };
+  std::string out;
+  out.reserve(static_cast<size_t>(lines) * 80);
+  out += "# LaTeX Math Extension Benchmark\n\n";
+  for (int i = 0; i < lines; ++i) {
+    const std::string n = std::to_string(i);
+    const std::string f =
+        kFormulas[i % (sizeof(kFormulas) / sizeof(kFormulas[0]))];
+    switch (i % 8) {
+      case 0:
+        out += "Inline formula $" + f + " $ here " + n + ".\n\n";
+        break;
+      case 1:
+        out += "Display formula: $$" + f + "$$ ends it " + n + ".\n\n";
+        break;
+      case 2:
+        out += "Two formulas $" + f + " $ and $\\alpha_" + n +
+               " + \\beta_" + n + " $ total.\n\n";
+        break;
+      case 3:
+        out += "**Emphasized $" + f + " $ formula** " + n + ".\n\n";
+        break;
+      case 4:
+        out += "Literal dollars $" + n + " and $" + f +
+               " $ stay text-ish " + n + ".\n\n";
+        break;
+      case 5:
+        out += "- item $" + f + " $ one\n- item $$\\beta_" +
+               n + "$$ two\n\n";
+        break;
+      case 6:
+        out += "Multi-line: $$\\begin{aligned}\n"
+               "\\alpha_" + n + " &= a \\\\\n"
+               "\\beta_" + n + " &= b \\end{aligned}$$ end " + n + ".\n\n";
+        break;
+      case 7:
+        out += "Plain prose line " + n +
+               " with no math at all, just some ordinary text.\n\n";
+        break;
+    }
+  }
+  return out;
+}
+
+void RegisterLatexMathBenchmarks(const std::string& content) {
+  const std::string name = "latexmath-ext";
+
+  benchmark::RegisterBenchmark(
+      (name + "_markus_latexmath").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          markus::Options options;
+          options.enable_latex_math = true;
+          auto result = markus::MarkdownToHtml(content, options);
+          benchmark::DoNotOptimize(result);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_markus_latexmath_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_cmark_gfm_latexmath").c_str(),
+      [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          // cmark-gfm (0.29.x) has no math extension; run in plain CommonMark
+          // mode on the same input for a baseline comparison.
+          cmark_node* doc =
+              cmark_parse_document(content.c_str(), content.size(),
+                                   CMARK_OPT_DEFAULT);
+          char* html = cmark_render_html(doc, CMARK_OPT_DEFAULT, nullptr);
+          benchmark::DoNotOptimize(html);
+          free(html);
+          cmark_node_free(doc);
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_cmark_gfm_latexmath_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+
+  benchmark::RegisterBenchmark(
+      (name + "_md4c_latexmath").c_str(), [content, name](benchmark::State& st) {
+        for (auto _ : st) {
+          auto start = std::chrono::high_resolution_clock::now();
+          std::vector<char> output;
+          output.reserve(4096);
+          md_html(
+              content.c_str(), static_cast<MD_SIZE>(content.size()),
+              [](const char* text, MD_SIZE sz, void* userdata) {
+                auto& vec = *static_cast<std::vector<char>*>(userdata);
+                vec.insert(vec.end(), text, text + sz);
+              },
+              &output, MD_DIALECT_COMMONMARK | MD_FLAG_LATEXMATHSPANS, 0);
+          benchmark::DoNotOptimize(output.data());
+          auto end = std::chrono::high_resolution_clock::now();
+          double seconds = std::chrono::duration<double>(end - start).count();
+          st.SetIterationTime(seconds);
+          RecordTiming(name, seconds * 1000.0, g_md4c_latexmath_times);
+        }
+        if (st.iterations() > 0) {
+          st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) *
+                               content.size());
+        }
+      });
+}
+
 void RegisterAutolinkBenchmarks(const std::string& content) {
   const std::string name = "autolink-ext";
 
@@ -864,16 +1006,20 @@ int main(int argc, char** argv) {
       std::cerr << "  SAMPLES_DIR      Directory with .md files (default: "
                    "cmark-gfm/bench/samples)\n";
       std::cerr << "\nIn addition to the CommonMark comparison, autolink,\n"
-                    "strikethrough, tasklist and tagfilter benchmarks "
-                    "(autolink-ext_*,\n"
-                    "strikethrough-ext_*, tasklist-ext_*, tagfilter-ext_*) "
-                    "run each parser\n"
-                    "with the matching GFM extension enabled on a synthetic "
-                    "extension-heavy\n"
-                    "document. Use --benchmark_filter=autolink, "
-                    "--benchmark_filter=strikethrough,\n"
-                    "--benchmark_filter=tasklist or "
-                    "--benchmark_filter=tagfilter\n"
+                    "strikethrough, tasklist, tagfilter and latexmath "
+                    "benchmarks (autolink-ext_*,\n"
+                    "strikethrough-ext_*, tasklist-ext_*, tagfilter-ext_*, "
+                    "latexmath-ext_*)\n"
+                    "run each parser with the matching extension enabled on "
+                    "a synthetic\n"
+                    "extension-heavy document (cmark-gfm runs in plain "
+                    "CommonMark mode\n"
+                    "for latexmath, which it has no extension for). Use "
+                    "--benchmark_filter=autolink,\n"
+                    "--benchmark_filter=strikethrough, "
+                    "--benchmark_filter=tasklist,\n"
+                    "--benchmark_filter=tagfilter or "
+                    "--benchmark_filter=latexmath\n"
                     "to run only those.\n";
       std::cerr << "\nGoogle Benchmark options:\n";
       std::cerr << "  --benchmark_min_time=N   Minimum time per benchmark run "
@@ -907,13 +1053,15 @@ int main(int argc, char** argv) {
 
   RegisterBenchmarks(inputs);
 
-  // GFM autolink, strikethrough and tasklist extension benchmarks: each parser
-  // with the extension enabled, on a synthetic extension-heavy document.
+  // GFM autolink, strikethrough, tasklist, tagfilter and latexmath extension
+  // benchmarks: each parser with the extension enabled, on a synthetic
+  // extension-heavy document.
   EnsureCmarkGfmExtensions();
   RegisterAutolinkBenchmarks(GenerateAutolinkSample());
   RegisterStrikethroughBenchmarks(GenerateStrikethroughSample());
   RegisterTasklistBenchmarks(GenerateTasklistSample());
   RegisterTagfilterBenchmarks(GenerateTagfilterSample());
+  RegisterLatexMathBenchmarks(GenerateLatexMathSample());
 
   // Add --benchmark_repetitions for our --rounds option
   std::string reps_arg =

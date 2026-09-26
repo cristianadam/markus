@@ -551,6 +551,7 @@ TEST(StreamingMarkdownParser, GfmOptionsMatchRegular) {
       {markus::Options{.enable_tables = true},
        "| a | b |\n|---|---|\n| 1 | 2 |\n"},
       {markus::Options{.enable_strikethrough = true}, "~~gone~~\n"},
+      {markus::Options{.enable_latex_math = true}, "$a$ and $$b$$\n"},
       {markus::Options{.enable_tasklist = true}, "- [x] done\n- [ ] todo\n"},
       {markus::Options{.enable_autolink = true},
        "visit https://example.com now\n"},
@@ -1008,6 +1009,197 @@ TEST(CodeBlock, FenceChar) {
 }
 
 // =============================================================================
+// LatexMath extension (mirrors md4c's MD_FLAG_LATEXMATHSPANS)
+// =============================================================================
+//
+// `$...$` (inline math) and `$$...$$` (display math) spans with verbatim
+// content. An opener must not be preceded by an alphanumeric character, a
+// closer must not be followed by one; opener and closer runs must have the
+// same length (1 or 2), longer runs are plain text, and math spans do not
+// nest (once a span matches, pending openers are discarded). Rendered with
+// the KaTeX-style wrappers used by cmark's math extension and most
+// renderers.
+
+namespace {
+
+const markus::Options& LatexMathOptions() {
+  static const markus::Options options = [] {
+    markus::Options o;
+    o.enable_latex_math = true;
+    return o;
+  }();
+  return options;
+}
+
+}  // namespace
+
+// The basic forms, matching md4c's LaTeX math spec examples.
+TEST(LatexMath, BasicSpans) {
+  EXPECT_EQ("<p><span class=\"math inline\">\\(a+b=c\\)</span> Hello, "
+               "world!</p>\n",
+            Regular("$a+b=c$ Hello, world!\n", LatexMathOptions()));
+  EXPECT_EQ("<p>This is a display equation: <span class=\"math display\">"
+               "\\[\\int_a^b x dx\\]</span>.</p>\n",
+            Regular(std::string("This is a display equation: $$\\int_a^b x dx$$.$\n")
+                        .erase(46, 1),
+                    LatexMathOptions()));
+}
+
+// Multi-line math: line breaks become single spaces, content is otherwise
+// verbatim (matching md4c, which keeps the raw spaces).
+TEST(LatexMath, MultiLineContent) {
+  EXPECT_EQ("<p><span class=\"math display\">\\[ \\int_a^b f(x) dx "
+               "\\]</span></p>\n",
+            Regular("$$\n\\int_a^b\nf(x) dx\n$$\n", LatexMathOptions()));
+  EXPECT_EQ("<p><span class=\"math inline\">\\(a b\\)</span></p>\n",
+            Regular("$a\nb$\n", LatexMathOptions()));
+  EXPECT_EQ("<p><span class=\"math display\">\\[a  b\\]</span></p>\n",
+            Regular("$$a  b$$\n", LatexMathOptions()));
+}
+
+// Opener/closer flank rules: an opener cannot be preceded and a closer
+// cannot be followed by an alphanumeric character (mirrors md4c).
+TEST(LatexMath, FlankRules) {
+  EXPECT_EQ("<p>x$a+b=c$</p>\n",
+            Regular("x$a+b=c$\n", LatexMathOptions()));
+  EXPECT_EQ("<p>$a+b=c$x</p>\n",
+            Regular("$a+b=c$x\n", LatexMathOptions()));
+  EXPECT_EQ("<p>10$20$30</p>\n",
+            Regular("10$20$30\n", LatexMathOptions()));
+  // Punctuation (and whitespace) on either side are fine.
+  EXPECT_EQ("<p>(<span class=\"math inline\">\\(x\\)</span>)</p>\n",
+            Regular("($x$)\n", LatexMathOptions()));
+  EXPECT_EQ("<p>x=<span class=\"math inline\">\\(a\\)</span>=</p>\n",
+            Regular("x=$a$=\n", LatexMathOptions()));
+}
+
+// Longer runs than two dollars, unmatched runs and run-length mismatches are
+// plain text.
+TEST(LatexMath, NonSpansAreLiteral) {
+  EXPECT_EQ("<p>$$$</p>\n", Regular("$$$\n", LatexMathOptions()));
+  EXPECT_EQ("<p>$$$$</p>\n", Regular("$$$$\n", LatexMathOptions()));
+  EXPECT_EQ("<p>$$$a$$$</p>\n", Regular("$$$a$$$\n", LatexMathOptions()));
+  EXPECT_EQ("<p>$$a$</p>\n",  // single closer run cannot match $$ opener
+            Regular("$$a$\n", LatexMathOptions()));
+  EXPECT_EQ("<p>$a$$</p>\n",   // mismatched run lengths
+            Regular("$a$$\n", LatexMathOptions()));
+  // An opener with no closer, and a dollar that is neither opener nor
+  // closer, stay literal.
+  EXPECT_EQ("<p>$ a</p>\n", Regular("$ a\n", LatexMathOptions()));
+  EXPECT_EQ("<p>a $ b</p>\n", Regular("a $ b\n", LatexMathOptions()));
+}
+
+// Math spans do not nest: when a span matches, all pending openers are
+// discarded (mirrors md4c's DOLLAR_OPENERS reset).
+TEST(LatexMath, NoNesting) {
+  EXPECT_EQ("<p>$$foo <span class=\"math inline\">\\(bar\\)</span> baz$$"
+               "</p>\n",
+            Regular("$$foo $bar$ baz$$\n", LatexMathOptions()));
+  // The outer $$ opener wins over the inner single-$ opener: the whole
+  // region is one display span (the single $'s inside are verbatim).
+  EXPECT_EQ("<p><span class=\"math display\">\\[a$ b$ c\\]</span></p>\n",
+            Regular("$$a$ b$ c$$\n", LatexMathOptions()));
+  // The inner single-$ pair matches first and clears the $$ opener, so the
+  // outer region stays literal.
+  EXPECT_EQ("<p>$$a <span class=\"math inline\">\\(b\\)</span> c$$</p>\n",
+            Regular("$$a $b$ c$$\n", LatexMathOptions()));
+  // A pending opener can be skipped by a resolved inner span: the older
+  // opener still matches (no crossing ranges, mirroring md4c).
+  EXPECT_EQ("<p><span class=\"math inline\">\\(*$b10*\\)</span></p>\n",
+            Regular("$*$b10*$\n", LatexMathOptions()));
+}
+
+// The content of a math span is verbatim: no inline parsing (emphasis,
+// code spans, links, entities, ...) happens inside it.
+TEST(LatexMath, VerbatimContent) {
+  EXPECT_EQ("<p><span class=\"math inline\">\\(*a*\\)</span></p>\n",
+            Regular("$*a*$\n", LatexMathOptions()));
+  EXPECT_EQ("<p><span class=\"math inline\">\\([a](/u)\\)</span></p>\n",
+            Regular("$[a](/u)$\n", LatexMathOptions()));
+  EXPECT_EQ("<p><span class=\"math inline\">\\(a &amp;amp; b\\)"
+               "</span></p>\n",
+            Regular("$a &amp; b$\n", LatexMathOptions()));
+  // ...while math inside other inlines still works.
+  EXPECT_EQ("<p><strong><span class=\"math inline\">\\(a\\)"
+               "</span></strong></p>\n",
+            Regular("**$a$**\n", LatexMathOptions()));
+  EXPECT_EQ("<p><em><span class=\"math inline\">\\(a\\)"
+               "</span></em></p>\n",
+            Regular("*$a$*\n", LatexMathOptions()));
+  EXPECT_EQ("<p><a href=\"/u\">link <span class=\"math inline\">\\(x\\)"
+               "</span></a></p>\n",
+            Regular("[link $x$](/u)\n", LatexMathOptions()));
+}
+
+// Code spans and backslash escapes take precedence: a $ inside a code span
+// or an escaped $ never starts a math span.
+TEST(LatexMath, CodeSpansAndEscapesWin) {
+  EXPECT_EQ("<p><code>$code$</code></p>\n",
+            Regular("`$code$`\n", LatexMathOptions()));
+  EXPECT_EQ("<p>a $b$ c</p>\n", Regular("a \\$b$ c\n", LatexMathOptions()));
+  EXPECT_EQ("<p>a$$b</p>\n", Regular("a\\$$b\n", LatexMathOptions()));
+}
+
+// Multiple spans, and spans delimited by whitespace (the spaces are part of
+// the content, matching md4c).
+TEST(LatexMath, MultipleSpans) {
+  EXPECT_EQ("<p><span class=\"math inline\">\\(a\\)</span> <span "
+               "class=\"math inline\">\\(b\\)</span></p>\n",
+            Regular("$a$ $b$\n", LatexMathOptions()));
+  EXPECT_EQ("<p>text <span class=\"math inline\">\\( 1+1 \\)</span> "
+               "more</p>\n",
+            Regular("text $ 1+1 $ more\n", LatexMathOptions()));
+  EXPECT_EQ("<p>a <span class=\"math inline\">\\(b$$c\\)</span> d</p>\n",
+            Regular("a $b$$c$ d\n", LatexMathOptions()));
+}
+
+// The extension works in the other block contexts that parse inlines.
+TEST(LatexMath, InBlockContexts) {
+  markus::Options o = LatexMathOptions();
+  o.enable_tables = true;
+  EXPECT_EQ("<table>\n<thead>\n<tr>\n<th>a</th>\n<th>b</th>\n</tr>\n"
+               "</thead>\n<tbody>\n<tr>\n<td><span class=\"math inline\">"
+               "\\(x\\)</span></td>\n<td><span class=\"math display\">"
+               "\\[y\\]</span></td>\n</tr>\n</tbody>\n</table>\n",
+            Regular("| a | b |\n|---|---|\n| $x$ | $$y$$ |\n", o));
+  EXPECT_EQ("<ul>\n<li><span class=\"math inline\">\\(a\\)</span> "
+               "item</li>\n<li><span class=\"math display\">\\[b\\]"
+               "</span> item</li>\n</ul>\n",
+            Regular("- $a$ item\n- $$b$$ item\n", LatexMathOptions()));
+  EXPECT_EQ("<blockquote>\n<p><span class=\"math inline\">\\(q\\)"
+               "</span> quote</p>\n</blockquote>\n",
+            Regular("> $q$ quote\n", LatexMathOptions()));
+  EXPECT_EQ("<h1><span class=\"math inline\">\\(h\\)</span></h1>\n<p>"
+               "<span class=\"math inline\">\\(x\\)</span></p>\n",
+            Regular("# $h$\n\n$x$\n", LatexMathOptions()));
+}
+
+// Off by default: plain CommonMark behaviour leaves dollars as text.
+TEST(LatexMath, OffByDefault) {
+  EXPECT_EQ("<p>$a+b=c$</p>\n", Regular("$a+b=c$\n"));
+  EXPECT_EQ("<p>$$x$$</p>\n", Regular("$$x$$\n"));
+}
+
+// The streaming parser honours the extension and matches the regular
+// renderer.
+TEST(LatexMath, StreamingMatchesRegular) {
+  const std::vector<std::string> inputs = {
+      "$a+b=c$ Hello, world!\n",
+      "$$\n\\int_a^b\nf(x) dx\n$$\n",
+      "$$foo $bar$ baz$$\n\n*x$y$*\n",
+      "$a$ $b$ and **$c$**\n",
+  };
+  for (const auto& input : inputs) {
+    EXPECT_EQ(Regular(input, LatexMathOptions()),
+              StreamSingleFeed(input, LatexMathOptions()))
+        << "single-feed mismatch for: " << input;
+    EXPECT_EQ(Regular(input, LatexMathOptions()),
+              StreamChunked(input, 1, LatexMathOptions()))
+        << "byte-by-byte mismatch for: " << input;
+  }
+}
+
+// =============================================================================
 // StreamingBlockParser (AST streaming API)
 // =============================================================================
 
@@ -1093,6 +1285,7 @@ TEST(StreamingBlockParser, GfmOptionsMatchRegular) {
       {markus::Options{.enable_tables = true},
        "| a | b |\n|---|---|\n| 1 | 2 |\n"},
       {markus::Options{.enable_strikethrough = true}, "~~gone~~\n"},
+      {markus::Options{.enable_latex_math = true}, "$a$ and $$b$$\n"},
       {markus::Options{.enable_tasklist = true}, "- [x] done\n- [ ] todo\n"},
       {markus::Options{.enable_autolink = true},
        "visit https://example.com now\n"},

@@ -24,7 +24,7 @@ void PrintUsage(const char* program_name) {
   std::cerr << "  --unsafe   Accept (and render) raw HTML (accepted for cmark "
                 "compatibility)\n";
   std::cerr << "  -e <ext>   Enable a GFM extension (table, autolink, "
-                "strikethrough, tasklist, tagfilter)\n";
+                "strikethrough, tasklist, tagfilter, latexmath)\n";
   std::cerr << "  --help     Show this help message\n";
 }
 
@@ -72,6 +72,8 @@ int main(int argc, char* argv[]) {
           options.enable_tasklist = true;
         } else if (ext == "tagfilter") {
           options.enable_tagfilter = true;
+        } else if (ext == "latexmath") {
+          options.enable_latex_math = true;
         }
       }
       ++i;  // Consume the extension name.

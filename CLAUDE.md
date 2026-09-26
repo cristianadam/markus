@@ -1,6 +1,6 @@
 Single header markdown file implemented in markus.h using C++20 with no 
 external dependencies, implemented in GoogleStyle, adhering to CommonMark spec
-plus opt-in GFM extensions (table, autolink, strikethrough, tasklist, tagfilter),
+plus opt-in GFM extensions (table, autolink, strikethrough, tasklist, tagfilter) and an opt-in LaTeX math extension (mirroring md4c's MD_FLAG_LATEXMATHSPANS; inline `$...$` and display `$$...$$` spans with verbatim content),
 streaming APIs (`StreamingMarkdownParser` emitting HTML, `StreamingBlockParser`
 delivering top-level blocks as AST ranges) for progressive rendering of
 incrementally-arriving Markdown,
@@ -86,8 +86,8 @@ dictionary. `fuzz/run_fuzz.sh` wraps the build-and-run commands
 
 ## Key files
 - `markus.h` — single-header C++20 Markdown-to-HTML library (lookup tables, inline optimizations; includes `StreamingMarkdownParser` (HTML) and `StreamingBlockParser` (AST) for incremental/progressive rendering, and `DetailsBlock` for GitHub `<details>` sections)
-- `main.cc` — CLI entry point: reads Markdown from stdin, outputs HTML to stdout (`--ast` flag for AST debug output; `-e <ext>` enables a GFM extension: table, autolink, strikethrough, tasklist, tagfilter; `--unsafe` accepts raw HTML; `--stream` emits HTML as blocks complete, reading stdin in chunks)
-- `bench.cc` — benchmark comparing markus vs cmark-gfm vs md4c performance (plain CommonMark suite plus per-extension GFM benchmarks)
+- `main.cc` — CLI entry point: reads Markdown from stdin, outputs HTML to stdout (`--ast` flag for AST debug output; `-e <ext>` enables a GFM extension: table, autolink, strikethrough, tasklist, tagfilter, latexmath; `--unsafe` accepts raw HTML; `--stream` emits HTML as blocks complete, reading stdin in chunks)
+- `bench.cc` — benchmark comparing markus vs cmark-gfm vs md4c performance (plain CommonMark suite plus per-extension GFM benchmarks and a LaTeX math benchmark; md4c runs with MD_FLAG_LATEXMATHSPANS for the math benchmark, cmark-gfm has no math extension so it runs plain)
 - `tests/test_markus.cc` — gtest-based test suite wrapping the CommonMark spec_tests.py (655 examples, spec from the `commonmark-spec` submodule) plus test suites for `StreamingMarkdownParser`, `StreamingBlockParser`, `DetailsBlock`, and `CodeBlock::fence_char`
 - `tests/test_gfm.cc` — opt-in GFM feature tests (cmark-gfm GFM spec vs markus; `-DMARKUS_BUILD_GFM_TESTS=ON`)
 - `fuzz/fuzz_markus.cc` — fuzzing harness (quadratic amplifier; exercises batch + streaming paths); builds as the libFuzzer target `fuzz_markus` and as the standalone/AFL driver `fuzz_markus_standalone`

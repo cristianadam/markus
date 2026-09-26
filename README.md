@@ -18,7 +18,7 @@ _Vibe coded with Claude Opus 4.5 and Opencode (qwen 3.6 35b)_
 - **Single Header**: Just include `markus.h` - no linking required
 - **Zero Dependencies**: Uses only the C++20 standard library
 - **CommonMark Compliant**: Passes the full CommonMark spec test suite (655 tests)
-- **GitHub Flavored Markdown (GFM)**: Optional extensions for tables, autolinks, strikethrough, task lists, and tag filtering
+- **GitHub Flavored Markdown (GFM)**: Optional extensions for tables, autolinks, strikethrough, task lists, tag filtering, and LaTeX math
 - **High Performance**: Efficient parsing with lookup tables and inline optimizations
 - **Full Unicode Support**: UTF-8 encoding/decoding, case folding, punctuation detection
 - **AST Access**: Parse to an Abstract Syntax Tree for inspection or custom rendering
@@ -102,6 +102,7 @@ Available extensions:
 | Strikethrough | `-e strikethrough` | `enable_strikethrough` | `~~text~~` → `<del>` |
 | Task list | `-e tasklist` | `enable_tasklist` | `- [x]` checkboxes |
 | Tag filter | `-e tagfilter` | `enable_tagfilter` | Drops disallowed raw HTML tags |
+| LaTeX math | `-e latexmath` | `enable_latex_math` | `$...$` / `$$...$$` math spans (md4c-compatible) |
 
 GitHub-style collapsible `<details>` sections are always recognized (no
 option): a type-6 HTML block whose line starts with a `<details>` tag parses
@@ -203,7 +204,8 @@ exceeding it throws `std::length_error`.
 | `markus::StreamMarkdownToHtml(input, callback)` | Convenience: feed whole input, then flush |
 
 `markus::Options` controls GFM extensions (`enable_tables`, `enable_autolink`,
-`enable_strikethrough`, `enable_tasklist`, `enable_tagfilter`).
+`enable_strikethrough`, `enable_tasklist`, `enable_tagfilter`,
+`enable_latex_math`).
 
 ### AST Node Types
 
@@ -397,6 +399,8 @@ CLI `-e` flag:
 - **Strikethrough** (`-e strikethrough`): `~~text~~` renders as `<del>`
 - **Task lists** (`-e tasklist`): `- [x]` / `- [ ]` render as checkboxes
 - **Tag filter** (`-e tagfilter`): disallowed raw HTML tags are stripped
+- **LaTeX math** (`-e latexmath`): `$...$` (inline) and `$$...$$` (display)
+  math spans with verbatim content, mirroring md4c's `MD_FLAG_LATEXMATHSPANS`
 
 ```markdown
 | Col A | Col B |
@@ -416,7 +420,7 @@ Markus is optimized for speed through several techniques:
 
 ### Benchmarks
 
-Benchmarks compare Markus against [cmark-gfm](https://github.com/github/cmark-gfm) and [md4c](https://github.com/mity/md4c) on GitHub Actions runners. cmark-gfm runs in plain CommonMark mode for the baseline suite, and with each GFM extension enabled for the extension benchmarks. md4c has no GFM extensions, so it runs in plain mode for the extension suite as well. A ratio below 1.00x means Markus is faster.
+Benchmarks compare Markus against [cmark-gfm](https://github.com/github/cmark-gfm) and [md4c](https://github.com/mity/md4c) on GitHub Actions runners. cmark-gfm runs in plain CommonMark mode for the baseline suite, and with each GFM extension enabled for the extension benchmarks (except latexmath, which cmark-gfm has no extension for). md4c has no GFM extensions, so it runs in plain mode for the extension suite as well, except for the LaTeX math benchmark, which runs with `MD_FLAG_LATEXMATHSPANS`. A ratio below 1.00x means Markus is faster.
 
 #### CommonMark (plain)
 

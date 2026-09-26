@@ -13,7 +13,7 @@ namespace {
 
 void PrintUsage(const char* program_name) {
   std::cerr << "Usage: " << program_name
-            << " [--ast] [--stream] [--unsafe] [-e <ext> ...]\n";
+            << " [--ast] [--stream] [--safe] [--unsafe] [-e <ext> ...]\n";
   std::cerr << "\n";
   std::cerr << "Reads markdown from stdin and outputs HTML to stdout.\n";
   std::cerr << "\n";
@@ -21,8 +21,10 @@ void PrintUsage(const char* program_name) {
   std::cerr << "  --ast      Print the AST instead of HTML output\n";
   std::cerr << "  --stream   Stream HTML output as blocks are parsed "
                 "(progressive rendering)\n";
-  std::cerr << "  --unsafe   Accept (and render) raw HTML (accepted for cmark "
-                "compatibility)\n";
+  std::cerr << "  --safe     Omit raw HTML and dangerous URLs "
+               "(javascript:, ...), like cmark's default\n";
+  std::cerr << "  --unsafe   Accept (and render) raw HTML (the default; "
+               "accepted for cmark compatibility)\n";
   std::cerr << "  -e <ext>   Enable a GFM extension (table, autolink, "
                 "strikethrough, tasklist, tagfilter, latexmath)\n";
   std::cerr << "  --help     Show this help message\n";
@@ -56,9 +58,12 @@ int main(int argc, char* argv[]) {
       ast_mode = true;
     } else if (arg == "--stream") {
       stream_mode = true;
+    } else if (arg == "--safe") {
+      options.safe = true;
     } else if (arg == "--unsafe") {
-      // Raw HTML is always passed through; the flag is accepted for
-      // cmark/cmark-gfm compatibility.
+      // Raw HTML is passed through by default; the flag is accepted for
+      // cmark/cmark-gfm compatibility (and undoes an earlier --safe).
+      options.safe = false;
     } else if (arg == "-e") {
       if (i + 1 < argc) {
         std::string ext = argv[i + 1];

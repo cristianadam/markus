@@ -86,7 +86,7 @@ dictionary. `fuzz/run_fuzz.sh` wraps the build-and-run commands
 
 ## Key files
 - `markus.h` — single-header C++20 Markdown-to-HTML library (lookup tables, inline optimizations; includes `StreamingMarkdownParser` (HTML) and `StreamingBlockParser` (AST) for incremental/progressive rendering, and `DetailsBlock` for GitHub `<details>` sections)
-- `main.cc` — CLI entry point: reads Markdown from stdin, outputs HTML to stdout (`--ast` flag for AST debug output; `-e <ext>` enables a GFM extension: table, autolink, strikethrough, tasklist, tagfilter, latexmath; `--unsafe` accepts raw HTML; `--stream` emits HTML as blocks complete, reading stdin in chunks)
+- `main.cc` — CLI entry point: reads Markdown from stdin, outputs HTML to stdout (`--ast` flag for AST debug output; `-e <ext>` enables a GFM extension: table, autolink, strikethrough, tasklist, tagfilter, latexmath; `--unsafe` accepts raw HTML (the default); `--safe` enables `Options::safe`, cmark-style omission of raw HTML and `javascript:`/`vbscript:`/`file:`/non-image `data:` URLs; `--stream` emits HTML as blocks complete, reading stdin in chunks)
 - `bench.cc` — benchmark comparing markus vs cmark-gfm vs md4c performance (plain CommonMark suite plus per-extension GFM benchmarks and a LaTeX math benchmark; md4c runs with MD_FLAG_LATEXMATHSPANS for the math benchmark, cmark-gfm has no math extension so it runs plain)
 - `tests/test_markus.cc` — gtest-based test suite wrapping the CommonMark spec_tests.py (655 examples, spec from the `commonmark-spec` submodule) plus test suites for `StreamingMarkdownParser`, `StreamingBlockParser`, `DetailsBlock`, and `CodeBlock::fence_char`
 - `tests/test_gfm.cc` — opt-in GFM feature tests (cmark-gfm GFM spec vs markus; `-DMARKUS_BUILD_GFM_TESTS=ON`)

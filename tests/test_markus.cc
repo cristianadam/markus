@@ -733,17 +733,20 @@ TEST(StreamingMarkdownParser, StreamedLargeOpenBlock) {
 
 // Out-of-range / overflowing numeric character references must produce
 // deterministic output (the ParseUint overflow clamp to UINT32_MAX), never an
-// undefined wrapped code point. The inline path rejects the out-of-range
-// reference and renders it literally; the fenced-code info-string path clamps
-// to U+FFFD.
+// undefined wrapped code point. References with more digits than CommonMark
+// allows are not references at all and render literally, both inline and in
+// the fenced-code info string.
 TEST(Markus, ParseUintOverflow) {
   EXPECT_EQ(std::string("<p>&amp;#99999999999999;</p>\n"),
             Regular("&#99999999999999;"));
   const std::string hex40(40, 'f');
   EXPECT_EQ(std::string("<p>&amp;#x") + hex40 + ";</p>\n",
             Regular("&#x" + hex40 + ";"));
+  // More digits than CommonMark allows (7 decimal / 6 hex): not a character
+  // reference, so it stays literal (as inline, and as in cmark).
   const std::string info_expected =
-      "<pre><code class=\"language-\xEF\xBF\xBD\">code\n</code></pre>\n";
+      "<pre><code class=\"language-&amp;#99999999999999;\">"
+      "code\n</code></pre>\n";
   EXPECT_EQ(info_expected, Regular("```&#99999999999999;\ncode\n```\n"));
 }
 
@@ -1452,6 +1455,239 @@ TEST(StreamingBlockParser, PendingLimit) {
   markus::StreamingBlockParser big;
   big.setPendingLimit(1024);
   EXPECT_NO_THROW(big.Feed(std::string(1024, 'a')));
+}
+
+// =============================================================================
+// Robustness / security regression tests (hostile input must neither crash,
+// hang, nor blow up in time or memory)
+// =============================================================================
+
+std::string Repeat(const std::string& s, size_t n) {
+  std::string out;
+  out.reserve(s.size() * n);
+  for (size_t i = 0; i < n; ++i) out += s;
+  return out;
+}
+
+markus::Options AllExtensions() {
+  markus::Options o;
+  o.enable_tables = true;
+  o.enable_autolink = true;
+  o.enable_strikethrough = true;
+  o.enable_tasklist = true;
+  o.enable_tagfilter = true;
+  o.enable_latex_math = true;
+  return o;
+}
+
+// `<!-->` and `<!--->` start (and immediately end) an HTML block; the block
+// parser used to reject them while the paragraph-interrupt check accepted
+// them, so no line was consumed and parsing looped forever.
+TEST(Robustness, EmptyHtmlCommentTerminates) {
+  EXPECT_EQ("<!-->\n", Regular("<!-->"));
+  EXPECT_EQ("<!--->\n", Regular("<!--->"));
+  EXPECT_EQ("<p>a</p>\n<!-->\n", Regular("a\n<!-->\n"));
+  EXPECT_EQ(
+      "<blockquote>\n<blockquote>\n<p>foo</p>\n<!-->\n</blockquote>\n"
+      "</blockquote>\n",
+      Regular("> > foo\n>><!-->\n"));
+}
+
+// Deeply nested input is parsed, rendered and printed without overflowing
+// the stack (nesting beyond the internal limits is kept as literal text).
+TEST(Robustness, DeepNestingDoesNotOverflowStack) {
+  const markus::Options all = AllExtensions();
+  const std::vector<std::string> inputs = {
+      std::string(100000, '>') + " x\n",
+      Repeat("- ", 50000) + "x\n",
+      Repeat("1. ", 20000) + "x\n",
+      Repeat("> - ", 20000) + "x\n",
+      Repeat("<details>\n\n", 5000) + "x\n",
+      Repeat("**", 50000) + "x" + Repeat("**", 50000),
+      Repeat("*a ", 50000) + "x" + Repeat(" a*", 50000),
+      Repeat("~~a ", 20000) + "x" + Repeat(" a~~", 20000),
+      Repeat("[", 50000) + "x" + Repeat("](u)", 50000),
+      Repeat("![", 50000) + "x" + Repeat("](u)", 50000),
+      "![" + Repeat("*", 20000) + "a" + Repeat("*", 20000) + "](x)",
+      "$" + Repeat("*", 20000) + "a" + Repeat("*", 20000) + "$",
+  };
+  for (const std::string& input : inputs) {
+    markus::Document doc = markus::Parse(input, all);
+    EXPECT_FALSE(markus::RenderHtml(doc, all).empty());
+    EXPECT_FALSE(markus::DebugAst(doc).empty());
+  }
+  // Moderate nesting is still fully structured.
+  EXPECT_EQ(Repeat("<blockquote>\n", 30) + "<p>x</p>\n" +
+                Repeat("</blockquote>\n", 30),
+            Regular(std::string(30, '>') + " x\n"));
+}
+
+// A table with a wide header and many one-cell rows stops padding rows with
+// empty cells once the auto-completion limit is reached.
+TEST(Robustness, TableAutoCompletedCellsAreBounded) {
+  const std::string input = Repeat("|a", 3000) + "|\n" + Repeat("|-", 3000) +
+                            "|\n" + Repeat("x\n", 10000);
+  markus::Options o;
+  o.enable_tables = true;
+  EXPECT_LT(Regular(input, o).size(), 8u * 1024 * 1024);
+}
+
+// Inputs that used to take quadratic (or worse) time; each must finish
+// quickly. The ctest timeout catches a regression.
+TEST(Robustness, PathologicalInputsAreFast) {
+  const markus::Options all = AllExtensions();
+  const std::vector<std::string> inputs = {
+      Repeat("[", 20000) + Repeat("`[` ", 20000) + Repeat("]", 20000),
+      Repeat("[", 50000) + Repeat("]", 50000),
+      Repeat("![", 50000) + Repeat("]", 50000),
+      "a " + Repeat("<!--", 25000),
+      "a " + Repeat("<?", 50000),
+      "a " + Repeat("<a b=\"", 30000),
+      Repeat("[](", 33333),
+      Repeat("[](<", 33333),
+      Repeat("[][", 33333),
+      Repeat("[](x (", 20000),
+      Repeat("*a* ", 25000),
+      Repeat("a* ", 50000),
+      Repeat("\\!a", 70000),
+      "# a" + Repeat(" #", 250000) + "\n",
+  };
+  for (const std::string& input : inputs) {
+    EXPECT_FALSE(Regular(input, all).empty());
+  }
+  std::string refs;
+  for (int n = 80000; n >= 1; --n) {
+    refs += "[" + std::to_string(n) + "]: /u\n\n";
+  }
+  EXPECT_EQ("<p><a href=\"/u\">1</a></p>\n", Regular(refs + "[1]\n"));
+}
+
+TEST(Robustness, AtxHeadingStripsOneClosingSequence) {
+  EXPECT_EQ("<h1>foo #</h1>\n", Regular("# foo # #\n"));
+  EXPECT_EQ("<h2>foo</h2>\n", Regular("## foo ##  \n"));
+  EXPECT_EQ("<h3>foo ###</h3>\n", Regular("### foo \\###\n"));
+  EXPECT_EQ("<h1></h1>\n", Regular("# #\n"));
+}
+
+TEST(Robustness, NumericCharacterReferences) {
+  // Surrogates are not encodable in UTF-8: U+FFFD, like other invalid code
+  // points (as in cmark).
+  EXPECT_EQ("<p>\xEF\xBF\xBD</p>\n", Regular("&#xD800;"));
+  EXPECT_EQ("<p><a href=\"/%EF%BF%BD\">a</a></p>\n", Regular("[a](/&#xDFFF;)"));
+  EXPECT_EQ("<p>\xEF\xBF\xBD</p>\n", Regular("&#9999999;"));
+  // At most 7 decimal / 6 hexadecimal digits.
+  EXPECT_EQ("<p>&amp;#00000065;</p>\n", Regular("&#00000065;"));
+  EXPECT_EQ("<p>&amp;#x0000041;</p>\n", Regular("&#x0000041;"));
+  EXPECT_EQ("<p>A</p>\n", Regular("&#0000065;"));
+}
+
+// The code span backtick cache must not leak between paragraphs.
+TEST(Robustness, BacktickCacheIsPerParagraph) {
+  EXPECT_EQ("<p>aaaaaaaaaaaaaaaaaaaa `</p>\n<p><code>code</code></p>\n",
+            Regular("aaaaaaaaaaaaaaaaaaaa `\n\n`code`\n"));
+}
+
+// Brackets inside code spans are not link brackets.
+TEST(Robustness, CodeSpanBracketDoesNotBlockLink) {
+  EXPECT_EQ("<p><a href=\"/u\">a <code>]</code> b</a></p>\n",
+            Regular("[a `]` b](/u)"));
+}
+
+TEST(Robustness, TasklistInsideBlockQuote) {
+  markus::Options o;
+  o.enable_tasklist = true;
+  EXPECT_EQ(
+      "<blockquote>\n<ul>\n<li><input type=\"checkbox\" checked=\"\" "
+      "disabled=\"\" /> a</li>\n</ul>\n</blockquote>\n",
+      Regular("> - [x] a\n", o));
+}
+
+// A copied Document stays valid after the original is destroyed.
+TEST(Robustness, DocumentCopyIsDeep) {
+  auto original = std::make_unique<markus::Document>(
+      markus::Parse("Hello *world* &amp; <b>x</b> `c` [l](/u)\n"));
+  const std::string expected = ToStd(markus::RenderHtml(*original));
+  markus::Document copy = *original;
+  markus::Document assigned;
+  assigned = *original;
+  original.reset();
+  EXPECT_EQ(expected, ToStd(markus::RenderHtml(copy)));
+  EXPECT_EQ(expected, ToStd(markus::RenderHtml(assigned)));
+}
+
+TEST(Robustness, SafeMode) {
+  markus::Options o;
+  o.safe = true;
+  EXPECT_EQ("<!-- raw HTML omitted -->\n",
+            Regular("<script>alert(1)</script>\n", o));
+  EXPECT_EQ("<p>a <!-- raw HTML omitted --> b</p>\n",
+            Regular("a <img src=x onerror=alert(1)> b", o));
+  EXPECT_EQ("<p><a href=\"\">x</a></p>\n",
+            Regular("[x](javascript:alert(1))", o));
+  EXPECT_EQ("<p><a href=\"\">x</a></p>\n", Regular("[x](VBScript:x)", o));
+  EXPECT_EQ("<p><a href=\"\">JavaScript:alert(1)</a></p>\n",
+            Regular("<JavaScript:alert(1)>", o));
+  EXPECT_EQ("<p><img src=\"\" alt=\"i\" /></p>\n",
+            Regular("![i](data:text/html,x)", o));
+  EXPECT_EQ("<p><img src=\"data:image/png;base64,AA\" alt=\"i\" /></p>\n",
+            Regular("![i](data:image/png;base64,AA)", o));
+  EXPECT_EQ("<p><a href=\"https://x.org\">x</a></p>\n",
+            Regular("[x](https://x.org)", o));
+  EXPECT_EQ(0u, Regular("<details open onclick=\"x()\">\nbody\n</details>\n", o)
+                    .rfind("<details open>", 0));
+  // Off by default (CommonMark passes raw HTML through).
+  EXPECT_EQ("<p><a href=\"javascript:alert(1)\">x</a></p>\n",
+            Regular("[x](javascript:alert(1))"));
+}
+
+// Lowering the pending limit below the buffered size must not wrap the
+// limit check around.
+TEST(Robustness, PendingLimitBelowBufferedSize) {
+  markus::StreamingMarkdownParser parser;
+  parser.Feed("abcdefghijklmnopqrst");
+  parser.setPendingLimit(10);
+  EXPECT_THROW(parser.Feed("x"), std::length_error);
+
+  markus::StreamingBlockParser block_parser;
+  block_parser.Feed("abcdefghijklmnopqrst");
+  block_parser.setPendingLimit(10);
+  EXPECT_THROW(block_parser.Feed("x"), std::length_error);
+}
+
+TEST(Robustness, StreamingHandlesCarriageReturnLineEndings) {
+  std::string out;
+  markus::StreamingMarkdownParser parser;
+  parser.setOutputCallback([&](std::string_view h) { out.append(h); });
+  parser.Feed("# a\r## b\r");
+  EXPECT_EQ("<h1>a</h1>\n", out);  // "## b" may still continue
+  parser.Flush();
+  EXPECT_EQ("<h1>a</h1>\n<h2>b</h2>\n", out);
+  // A "\r\n" pair split across chunks is still one line ending.
+  EXPECT_EQ(Regular("para\r\ncontinued\r\n\r\nnext\r\n"),
+            StreamChunked("para\r\ncontinued\r\n\r\nnext\r\n", 5));
+}
+
+// The output callback may replace itself while it runs.
+TEST(Robustness, StreamingCallbackMayReplaceItself) {
+  std::string out;
+  markus::StreamingMarkdownParser parser;
+  parser.setOutputCallback([&](std::string_view h) {
+    out.append(h);
+    parser.setOutputCallback([&](std::string_view h2) { out.append(h2); });
+  });
+  parser.Feed("# a\n\n# b\n");
+  parser.Flush();
+  EXPECT_EQ("<h1>a</h1>\n<h1>b</h1>\n", out);
+}
+
+// Streaming a long open block in small chunks stays linear (it used to
+// re-parse the whole held-back block on every line), with identical output.
+TEST(Robustness, StreamingLargeOpenBlocksAreLinear) {
+  for (const std::string& input :
+       {Repeat("x\n", 256 * 1024), Repeat("- x\n\n", 64 * 1024),
+        Repeat("> x\n", 128 * 1024)}) {
+    EXPECT_EQ(Regular(input), StreamChunked(input, 256));
+  }
 }
 
 }  // namespace

@@ -43,6 +43,8 @@ constexpr uint32_t kExtAutolink = 1u << 1;
 constexpr uint32_t kExtStrikethrough = 1u << 2;
 constexpr uint32_t kExtTasklist = 1u << 3;
 constexpr uint32_t kExtTagfilter = 1u << 4;
+constexpr uint32_t kExtLatexMath = 1u << 5;
+constexpr uint32_t kSafe = 1u << 6;
 
 // Bound the amplified input so a hostile config cannot OOM the harness, while
 // staying large enough to trigger deep-nesting (stack) and quadratic-time
@@ -65,6 +67,8 @@ markus::Options ToOptions(uint32_t ext) {
   o.enable_strikethrough = (ext & kExtStrikethrough) != 0;
   o.enable_tasklist = (ext & kExtTasklist) != 0;
   o.enable_tagfilter = (ext & kExtTagfilter) != 0;
+  o.enable_latex_math = (ext & kExtLatexMath) != 0;
+  o.safe = (ext & kSafe) != 0;
   return o;
 }
 
